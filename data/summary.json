@@ -1,0 +1,82 @@
+{
+  "report_date_utc": "2026-09-08",
+  "rpc": "https://rpc.mainnet.chain.robinhood.com",
+  "chain_id": 4663,
+  "snapshot_block": 57551461,
+  "snapshot_time_utc": "2026-09-08T08:34:50+00:00",
+  "watchlist_count": 67,
+  "watchlist_window": {
+    "from_block": 56651461,
+    "to_block": 57551461,
+    "from_utc": "2026-09-07T07:21:18+00:00",
+    "to_utc": "2026-09-08T08:34:50+00:00",
+    "unique_logs": 5378,
+    "unique_transaction_hashes": 3083,
+    "addresses_with_transfers": 51,
+    "failed_log_queries": 0,
+    "scope_note": "Transfer-related activity only; includes unsolicited transfers and is not a trade count."
+  },
+  "account_codes": {
+    "0xef0100e6cae83bde06e4c305530e199d7217f42808555b": 62,
+    "0x": 4,
+    "0xef010063c0c19a282a1b52b07dd5a65b58948a07dae32b": 1
+  },
+  "target_window": {
+    "from_block": 51551461,
+    "to_block": 57551461,
+    "from_utc": "2026-09-01T07:45:29+00:00",
+    "to_utc": "2026-09-08T08:34:50+00:00",
+    "transfer_related_transactions": 101,
+    "transactions_with_recognized_swap_events": 36,
+    "failed_log_queries": 0
+  },
+  "representative_sample": {
+    "transactions": 133,
+    "handleOps_transactions": 63,
+    "all_user_operations": 82,
+    "watched_user_operations": 63,
+    "watched_user_operation_senders": 34,
+    "watched_user_operations_using_relay_approval_proxy": 52,
+    "transactions_with_recognized_swap_events": 66,
+    "outer_from_in_watchlist": 7,
+    "sampling_note": "At most two latest Transfer-related transaction hashes for each address and direction; deduplicated. Not a random sample or full trade census."
+  },
+  "feed": {
+    "start_utc": "2026-09-08T08:38:03.952919+00:00",
+    "end_utc": "2026-09-08T08:39:19.172755+00:00",
+    "first_header_age_seconds": 68.19800353050232,
+    "counts": {
+      "messages": 1401,
+      "transactions": 15686,
+      "unsupported_by_existing_parser": 253
+    },
+    "raw_first_byte_counts_legacy_rlp_prefixes_are_not_type_ids": {
+      "0x2": 11208,
+      "0x4": 253,
+      "0xf8": 1038,
+      "0xf9": 3175,
+      "0x1": 12
+    },
+    "watchlist_raw_candidate_hashes": [
+      "0xfb509fac9c67ba660e2bbfe9fbd4b0f4998dd114c367a13c109cfee1d557618f"
+    ]
+  },
+  "receipt_probe": {
+    "samples": 12,
+    "observed_receipts": 11,
+    "first_queries_returning_null": 9,
+    "feed_to_observed_receipt_ms": {
+      "min": 455.20973205566406,
+      "median": 1029.228925704956,
+      "max": 2821.8624591827393
+    },
+    "caveat": "Includes network RTT, cold connections and polling; not an intrinsic feed advantage or trade execution benchmark."
+  },
+  "limitations": [
+    "Blockscout API returned HTTP 403 challenge.",
+    "Historical eth_getTransactionCount returned metadata-is-not-found errors; no historical nonce-derived activity claims.",
+    "debug_traceTransaction is unavailable on the public RPC.",
+    "Transfer-based discovery omits failed transactions, standalone approvals, native-ETH-only transactions and logless state changes.",
+    "No actual trades were submitted; profitability and execution latency were not verified."
+  ]
+}

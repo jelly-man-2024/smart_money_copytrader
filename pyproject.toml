@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-money-copytrader"
+version = "0.1.0"
+description = "Read-only Robinhood Chain smart-wallet trade observer and copy-trading foundation"
+requires-python = ">=3.10"
+dependencies = [
+  "coincurve==21.0.0",
+  "eth-account==0.14.0",
+  "eth-abi==6.0.0",
+  "eth-utils==6.0.0",
+  "rlp==5.0.0",
+  "websockets==15.0.1",
+]
+
+[project.scripts]
+sm-copy = "smart_money.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
