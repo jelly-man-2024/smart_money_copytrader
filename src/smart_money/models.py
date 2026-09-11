@@ -28,16 +28,17 @@ class Transaction:
     timestamp: int | None = None
     received_at: float | None = None
     fresh: bool = False
+    observation_source: str = "unknown"
 
     @classmethod
-    def from_rpc(cls, tx: dict) -> "Transaction":
+    def from_rpc(cls, tx: dict, observation_source: str = "fixture") -> "Transaction":
         return cls(
             hash=tx["hash"].lower(), sender=address(tx["from"]),
             to=address(tx["to"]) if tx.get("to") else None,
             data=bytes.fromhex(tx.get("input", "0x")[2:]),
             value=number(tx.get("value", 0)), chain_id=number(tx.get("chainId", 4663)),
             nonce=number(tx.get("nonce", 0)), tx_type=number(tx.get("type", 0)),
-            timestamp=tx.get("_timestamp"),
+            timestamp=tx.get("_timestamp"), observation_source=observation_source,
         )
 
 
@@ -51,6 +52,9 @@ class Signal:
     contract: str | None
     selector: str
     stage: str = "intent"
+    intent_status: str = "observed"
+    execution_status: str = "pending"
+    canonical_status: str = "unconfirmed"
     userop_index: int | None = None
     userop_nonce: str | None = None
     token_in: str | None = None

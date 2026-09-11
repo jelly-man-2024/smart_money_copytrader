@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import Counter, deque
+from collections import Counter, defaultdict
 import json
 import os
 from pathlib import Path
@@ -27,6 +27,44 @@ def report(event: str, **details):
 def emit(store, signal):
     if store.put(signal):
         print(json.dumps(signal.to_dict(), ensure_ascii=False), flush=True)
+
+
+class LatencySamples:
+    """Bounded in-process timings; values from different processes are not mixed."""
+
+    def __init__(self, limit: int = 10000):
+        self.limit = limit
+        self.values = defaultdict(list)
+
+    def observe(self, name: str, seconds: float) -> None:
+        values = self.values[name]
+        if len(values) < self.limit:
+            values.append(max(0.0, seconds * 1000))
+
+    def summary(self) -> dict:
+        result = {}
+        for name, values in self.values.items():
+            ordered = sorted(values)
+
+            def percentile(p):
+                return round(ordered[max(0, (len(ordered) * p + 99) // 100 - 1)], 3)
+
+            result[name] = {
+                "count": len(ordered), "p50": percentile(50),
+                "p95": percentile(95), "p99": percentile(99),
+            }
+        return result
+
+
+def dispatch_pending(store, queue, stats) -> int:
+    """Move only durable candidates into the bounded in-memory work queue."""
+    available = queue.maxsize - queue.qsize()
+    candidates = store.claim_candidates(available)
+    queued_at = time.monotonic()
+    for tx in candidates:
+        queue.put_nowait((tx, queued_at))
+        stats["candidates_dispatched"] += 1
+    return len(candidates)
 
 
 def replay(args):
@@ -66,9 +104,18 @@ async def monitor(args):
     queue = asyncio.Queue(maxsize=args.queue_size)
     health = FeedHealth()
     stats = Counter()
-    seen = set()
-    recent = deque()
     store = Store(args.db)
+    timings = LatencySamples()
+    wake_dispatcher = asyncio.Event()
+    for name in (
+        "candidates", "candidate_duplicates", "candidates_dispatched", "receipts",
+        "receipt_unavailable", "candidate_retries", "candidate_retry_exhausted",
+        "queue_drops", "worker_errors", "account_code_errors", "reconnections", "frame_errors",
+    ):
+        stats[name] = 0
+    stats["recovered_inflight"] = store.recover_inflight()
+    start_counts = store.candidate_counts()
+    stats["pending_candidates_at_start"] = start_counts["pending"] + start_counts["retry"]
 
     async def account_impl(wallet):
         # Read latest implementation for relevant accounts; historical replay uses
@@ -85,7 +132,9 @@ async def monitor(args):
 
     async def worker():
         while True:
-            tx = await queue.get()
+            tx, queued_at = await queue.get()
+            started = time.monotonic()
+            timings.observe("queue_wait_ms", started - queued_at)
             try:
                 if tx.to == ENTRYPOINT:
                     candidates = [a for a in watchlist if bytes.fromhex(a[2:]) in tx.data]
@@ -98,27 +147,61 @@ async def monitor(args):
                 for signal in signals:
                     signal.fresh = fresh
                     signal.evidence["account_state_source"] = "latest_not_historical"
+                    signal.evidence["observation_source"] = tx.observation_source
                     emit(store, signal)
+                rpc_started = time.monotonic()
                 receipt = await rpc.receipt(tx.hash)
+                timings.observe("receipt_rpc_ms", time.monotonic() - rpc_started)
                 if receipt is None:
                     stats["receipt_unavailable"] += 1
-                    report("receipt_unavailable", tx_hash=tx.hash)
+                    attempts, delay = store.retry_candidate(tx.hash, "receipt_unavailable")
+                    if delay is None:
+                        stats["candidate_retry_exhausted"] += 1
+                    else:
+                        stats["candidate_retries"] += 1
+                    report("receipt_unavailable", tx_hash=tx.hash, attempts=attempts,
+                           retry_in_seconds=delay, retry_exhausted=delay is None)
                 else:
                     for signal in enrich(tx, signals, receipt, watchlist):
                         signal.fresh = bool(tx.timestamp and health.healthy() and time.time() - tx.timestamp <= health.max_age_seconds)
                         signal.evidence["account_state_source"] = "latest_not_historical"
+                        signal.evidence["observation_source"] = tx.observation_source
                         emit(store, signal)
                     stats["receipts"] += 1
+                    store.complete_candidate(tx.hash)
+            except RpcError:
+                stats["worker_errors"] += 1
+                attempts, delay = store.retry_candidate(tx.hash, "rpc_error")
+                if delay is None:
+                    stats["candidate_retry_exhausted"] += 1
+                else:
+                    stats["candidate_retries"] += 1
+                report("candidate_error", tx_hash=tx.hash, error_type="RpcError",
+                       attempts=attempts, retry_in_seconds=delay, retry_exhausted=delay is None)
             except Exception as exc:
                 stats["worker_errors"] += 1
+                store.fail_candidate(tx.hash, type(exc).__name__)
                 report("candidate_error", tx_hash=tx.hash, error_type=type(exc).__name__)
             finally:
+                timings.observe("candidate_processing_ms", time.monotonic() - started)
                 queue.task_done()
+
+    async def dispatcher():
+        while True:
+            wake_dispatcher.clear()
+            if not dispatch_pending(store, queue, stats):
+                try:
+                    await asyncio.wait_for(wake_dispatcher.wait(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                await asyncio.sleep(0)
 
     async def heartbeat():
         while True:
             await asyncio.sleep(5)
-            report("health", healthy=health.healthy(), queued=queue.qsize(), counters=dict(stats))
+            report("health", healthy=health.healthy(), queued=queue.qsize(), counters=dict(stats),
+                   candidate_states=store.candidate_counts(), latency_ms=timings.summary())
 
     async def receive():
         while True:
@@ -138,7 +221,7 @@ async def monitor(args):
                                     stats["stale_transactions_skipped"] += 1
                                     continue
                                 try:
-                                    tx = decode_raw(raw, **metadata)
+                                    tx = decode_raw(raw, observation_source="feed", **metadata)
                                 except DecodeError:
                                     stats["unsupported_or_invalid_transactions"] += 1
                                     continue
@@ -146,18 +229,13 @@ async def monitor(args):
                                 # Raw address matching only widens the candidate set.
                                 # Direct senders are always recovered from signatures.
                                 relevant = tx.sender in watchlist or any(a in tx.data for a in watched_bytes)
-                                if not relevant or tx.hash in seen:
+                                if not relevant:
                                     continue
-                                seen.add(tx.hash)
-                                recent.append(tx.hash)
-                                if len(recent) > 20000:
-                                    seen.remove(recent.popleft())
-                                if queue.full():
-                                    stats["queue_drops"] += 1
-                                    report("queue_overflow", tx_hash=tx.hash)
-                                    continue
-                                queue.put_nowait(tx)
-                                stats["candidates"] += 1
+                                if store.put_candidate(tx):
+                                    stats["candidates"] += 1
+                                    wake_dispatcher.set()
+                                else:
+                                    stats["candidate_duplicates"] += 1
                         except DecodeError:
                             stats["frame_errors"] += 1
                             raise
@@ -168,6 +246,7 @@ async def monitor(args):
                 await asyncio.sleep(1)
 
     workers = [asyncio.create_task(worker()) for _ in range(args.workers)]
+    dispatch_task = asyncio.create_task(dispatcher())
     beat = asyncio.create_task(heartbeat())
     receiver = asyncio.create_task(receive())
     try:
@@ -184,11 +263,13 @@ async def monitor(args):
         except asyncio.TimeoutError:
             report("drain_timeout", unfinished=queue.qsize())
     finally:
-        for task in [receiver, beat, *workers]:
+        for task in [receiver, dispatch_task, beat, *workers]:
             task.cancel()
-        await asyncio.gather(receiver, beat, *workers, return_exceptions=True)
+        await asyncio.gather(receiver, dispatch_task, beat, *workers, return_exceptions=True)
+        candidate_states = store.candidate_counts()
         store.close()
-        report("monitor_finished", counters=dict(stats), live_trading=False)
+        report("monitor_finished", counters=dict(stats), candidate_states=candidate_states,
+               latency_ms=timings.summary(), live_trading=False)
 
 
 def parser():

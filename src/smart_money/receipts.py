@@ -87,6 +87,7 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
         signal.evidence["block_number"] = number(receipt.get("blockNumber", 0))
         signal.evidence["canonicality"] = "not_rechecked_for_reorgs"
         signal.execution_success = succeeded
+        signal.execution_status = "success" if succeeded else "reverted"
         local_logs = logs
         if not succeeded:
             signal.stage = "failed"
@@ -97,9 +98,11 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
             if len(matches) != 1:
                 signal.stage = "needs_review"
                 signal.execution_success = None
+                signal.execution_status = "unknown"
                 signal.reasons.append("user_operation_scope_not_uniquely_proven")
                 continue
             signal.execution_success, local_logs, op_hash = matches[0]
+            signal.execution_status = "success" if signal.execution_success else "reverted"
             signal.evidence["userop_hash"] = op_hash
             if not signal.execution_success:
                 signal.stage = "failed"
@@ -164,6 +167,7 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
                 tx.hash, watched_recipients[0], "third_party", "BULK_DISTRIBUTION", "distribution",
                 tx.to, "0x" + tx.data[:4].hex(), stage="execution_observed", execution_success=True,
                 fresh=tx.fresh, reasons=["passive_distribution_not_evidence_of_a_purchase"],
+                intent_status="not_attributed", execution_status="success",
                 evidence={"recipient_count": len(recipients), "watched_recipients": watched_recipients,
                           "swap_event_count": swap_count, "block_hash": receipt.get("blockHash")},
             ))
@@ -173,6 +177,7 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
                     tx.hash, wallet, "third_party", "EXTERNAL_DELIVERY_CANDIDATE" if swap_count else "INCOMING_TRANSFER",
                     "incoming", tx.to, "0x" + tx.data[:4].hex(), stage="needs_review", fresh=tx.fresh,
                     execution_success=True, reasons=["recipient_is_not_proof_of_order_ownership"],
+                    intent_status="not_attributed", execution_status="success",
                     evidence={"wallet_erc20_deltas_raw": deltas(logs, wallet), "swap_event_count": swap_count,
                               "block_hash": receipt.get("blockHash")},
                 ))

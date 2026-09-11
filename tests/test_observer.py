@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import Counter
 from copy import deepcopy
 from dataclasses import replace
 import json
@@ -15,12 +16,13 @@ from eth_account import Account
 from eth_utils import to_checksum_address
 
 from smart_money import registry as R
+from smart_money.cli import LatencySamples, dispatch_pending
 from smart_money.decode import CALLS, PACKED_OPS, POOL_KEY, Decoder, selector, v3_path
 from smart_money.feed import DecodeError, FeedHealth, decode_raw, envelopes, signed_transactions
 from smart_money.models import Signal, Transaction
 from smart_money.receipts import BEFORE, SWAPS, TRANSFER, USEROP, TRADE_BEHAVIORS, enrich
 from smart_money.rpc import ReadOnlyRpc
-from smart_money.store import Store
+from smart_money.store import MAX_CANDIDATE_ATTEMPTS, Store
 
 ROOT = Path(__file__).resolve().parents[1]
 A = "0x" + "11" * 20
@@ -93,6 +95,8 @@ class DecodeTests(unittest.TestCase):
     def test_direct_v2_buy(self):
         signal = self.decoder.decode(tx(v2_swap(), R.V2_ROUTER))[0]
         self.assertEqual((signal.behavior, signal.amount_in_raw), ("BUY", "100"))
+        self.assertEqual((signal.intent_status, signal.execution_status, signal.canonical_status),
+                         ("observed", "pending", "unconfirmed"))
         self.assertFalse(signal.copy_eligible)
 
     def test_v4_new_layout(self):
@@ -243,12 +247,14 @@ class ReceiptTests(unittest.TestCase):
     def test_failed_outer(self):
         source = tx(v2_swap(), R.V2_ROUTER)
         signals = Decoder({A: {}}).decode(source)
-        self.assertEqual(enrich(source, signals, receipt(success=False), {A: {}})[0].stage, "failed")
+        result = enrich(source, signals, receipt(success=False), {A: {}})[0]
+        self.assertEqual((result.stage, result.execution_status), ("failed", "reverted"))
 
     def test_incoming_transfer_not_buy(self):
         signals = enrich(tx(b"", TOKEN, B), [], receipt([transfer(TOKEN, B, A, 100)]), {A: {}})
         self.assertEqual(signals[0].behavior, "INCOMING_TRANSFER")
         self.assertFalse(signals[0].copy_eligible)
+        self.assertEqual(signals[0].intent_status, "not_attributed")
 
     def test_empty_topics_safe(self):
         source = tx(v2_swap(), R.V2_ROUTER)
@@ -362,6 +368,83 @@ class SafetyTests(unittest.TestCase):
         signal.stage = 'intent'
         self.assertFalse(store.put(signal))
         self.assertEqual(len(list(store.rows())), 1)
+        store.close()
+
+    def test_durable_candidates_survive_queue_pressure(self):
+        store = Store(':memory:')
+        first = tx(b'first')
+        second = replace(tx(b'second'), hash='0x' + 'bb' * 32)
+        self.assertTrue(store.put_candidate(first))
+        self.assertTrue(store.put_candidate(second))
+        self.assertFalse(store.put_candidate(first))
+        queue = asyncio.Queue(maxsize=1)
+        stats = Counter()
+        self.assertEqual(dispatch_pending(store, queue, stats), 1)
+        self.assertEqual(store.candidate_counts()['pending'], 1)
+        queued, queued_at = queue.get_nowait()
+        self.assertEqual(queued.hash, first.hash)
+        self.assertIsInstance(queued_at, float)
+        queue.task_done()
+        store.complete_candidate(first.hash)
+        self.assertEqual(dispatch_pending(store, queue, stats), 1)
+        self.assertEqual(queue.get_nowait()[0].hash, second.hash)
+        self.assertEqual(stats['candidates_dispatched'], 2)
+        store.close()
+
+    def test_inflight_candidate_recovers_after_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'observer.sqlite3'
+            store = Store(path)
+            source = replace(tx(b'payload'), value=123, sequence=9, timestamp=10)
+            store.put_candidate(source)
+            claimed = store.claim_candidates(1, now=100)
+            self.assertEqual(claimed, [source])
+            store.close()
+            reopened = Store(path)
+            self.assertEqual(reopened.candidate_counts()['queued'], 1)
+            self.assertEqual(reopened.recover_inflight(), 1)
+            self.assertEqual(reopened.claim_candidates(1, now=100), [source])
+            reopened.complete_candidate(source.hash)
+            self.assertEqual(reopened.claim_candidates(1, now=100), [])
+            reopened.close()
+
+    def test_candidate_retry_uses_bounded_backoff(self):
+        store = Store(':memory:')
+        source = tx(b'payload')
+        store.put_candidate(source)
+        store.claim_candidates(1, now=100)
+        attempts, delay = store.retry_candidate(source.hash, 'receipt_unavailable', now=100)
+        self.assertEqual((attempts, delay), (1, 2.0))
+        self.assertEqual(store.claim_candidates(1, now=101), [])
+        self.assertEqual(store.claim_candidates(1, now=102), [source])
+        now = 102
+        for expected_attempt in range(2, MAX_CANDIDATE_ATTEMPTS + 1):
+            attempts, delay = store.retry_candidate(source.hash, 'receipt_unavailable', now=now)
+            self.assertEqual(attempts, expected_attempt)
+            if expected_attempt == MAX_CANDIDATE_ATTEMPTS:
+                self.assertIsNone(delay)
+                break
+            now += delay
+            self.assertEqual(store.claim_candidates(1, now=now), [source])
+        self.assertEqual(store.candidate_counts()['failed'], 1)
+        store.close()
+
+    def test_latency_summary_is_bounded_and_uses_percentiles(self):
+        samples = LatencySamples(limit=3)
+        for value in (0.001, 0.002, 0.003, 9.0):
+            samples.observe('queue_wait_ms', value)
+        summary = samples.summary()['queue_wait_ms']
+        self.assertEqual(summary, {'count': 3, 'p50': 2.0, 'p95': 3.0, 'p99': 3.0})
+
+    def test_chain_cursor_is_independent_and_cannot_silently_rewind(self):
+        store = Store(':memory:')
+        self.assertIsNone(store.chain_cursor())
+        store.set_chain_cursor(100, '0x' + 'aa' * 32)
+        self.assertEqual(store.chain_cursor(), (100, '0x' + 'aa' * 32))
+        store.set_chain_cursor(101, '0x' + 'BB' * 32)
+        self.assertEqual(store.chain_cursor(), (101, '0x' + 'bb' * 32))
+        with self.assertRaisesRegex(ValueError, 'explicit reorg handling'):
+            store.set_chain_cursor(99, '0x' + 'cc' * 32)
         store.close()
 
     def test_duplicate_watchlist_rejected(self):

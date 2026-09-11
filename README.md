@@ -30,7 +30,7 @@ python3 -m venv .venv
 离线回放包含 11 笔历史样本、1 笔真实 feed 存款样本和可选的 230 地址批量分发。
 不需要网络、付费 RPC 或私钥。信号输出到 stdout（JSONL），统计输出到 stderr。
 SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信号。
-目前单元测试共 46 项。服务器首次验证顺序为安装、单元测试、离线回放，
+目前单元测试共 51 项。服务器首次验证顺序为安装、单元测试、离线回放，
 再执行下面的 60 秒实时只读监听；完整历史验证记录见 [VALIDATION](docs/VALIDATION.md)。
 
 ## 实时只读监听
@@ -55,12 +55,15 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 `execution_success` 只表示外层或对应 UserOperation 成功，不保证可失败子调用成功。
 `swap_evidenced` 是有限的回执级对应证据，不是最终性或实盘许可。
 所有信号的 `copy_eligible` 都是 false。
+`intent_status`、`execution_status` 和 `canonical_status` 分开保存；重组只能纠正执行/规范链
+证据，不能删除已观察到的 Feed 意向。第三方入账的 intent_status 为 not_attributed。
 
 ## 当前覆盖与未完成项
 
 已实现 legacy/type 1/2/4 交易解析，两类已知 7702 账户、4337 handleOps、Relay 外包装与
 存款、部分 V2/V3 方法、Universal Router 的 V2/V3 与新版 V4 单跳、领奖和转账识别。
-包含消息新鲜度、重连、序列缺口告警、容量限制、回执核对和 SQLite 事件去重。
+包含消息新鲜度、重连、序列缺口告警、容量限制、回执核对、SQLite 事件去重，以及
+先落盘后入队的持久候选和有界回执重试。健康日志会报告候选状态及进程内阶段延迟分位数。
 
 **尚未实现**：完整聚合器覆盖、V4 多跳/完整结算接收人、V2/V3 factory 归属校验、
 ETH 净流与 trace、规范链重组处理、断线补洞、完整 Solver 订单关联、模拟报价/PnL、
