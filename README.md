@@ -5,6 +5,7 @@ Robinhood Chain 聪明钱跟单工程，独立于同级 `fomo_sniper`。
 
 - [完整跟单方案](docs/COPYTRADING_PLAN.md)
 - [继续开发交接](docs/HANDOFF.md)
+- [新服务器测试与开发交付](docs/SERVER_HANDOFF.md)
 - [数据与代码来源](docs/PROVENANCE.md)
 
 ## 快速开始
