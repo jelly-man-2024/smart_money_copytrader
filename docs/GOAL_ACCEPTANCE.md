@@ -18,6 +18,7 @@
 | nonce、余额、allowance、Gas、报价、滑点、额度预检 | 已验证 | `ExecutionPreparer`、`OfflineExecutionSigner`、pre-broadcast reviewer 回归 | 尚无实际广播瞬间的原子检查 |
 | proposal/plan/nonce 幂等与重启恢复 | 已验证 | SQLite 唯一键/事务；prepared 复用；signed bytes 确定性恢复 | 外部广播方崩溃窗口仍需集成演练 |
 | 公开执行生命周期与重组处理 | 部分验证 | pending/confirmed/reverted/replaced/orphaned 模拟；attempt audit；`execution-track` 磁盘重启/错误链 CLI 回归 | 服务器无现成本地 EVM 节点，缺真实广播、重组和 replacement 演练 |
+| 运行账本迁移到业务 MySQL | 已验证 | 20 张 InnoDB 表、最小 DML、幂等迁移、真实 BUY+SELL/PnL/reorg/execution 演练；60 秒 MySQL monitor 持久化 5 个保守信号/候选和 570 个规范块 | 旧文件均为具名测试 SQLite，无唯一生产源，保留归档；新业务 MySQL 从本次主网只读游标开始 |
 | 广播前最终复核 | 部分验证 | 内存 raw hash/sender/字段、关系、额度、报价、RPC 全量重查 | reviewer 与真实发送尚未形成原子边界 |
 | `copy_eligible=false` 且禁止主网签名/广播 | 已验证 | 所有 replay；RPC allowlist；mainnet gate 无条件拒绝 | 无 |
 | 操作员验收 | 待外部确认 | `OPERATOR_RUNBOOK.md` 已提供步骤 | 需确认钱包、额度、Gas、滑点、停止/恢复流程 |

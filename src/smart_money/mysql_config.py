@@ -20,7 +20,8 @@ MYSQL_ENV_KEYS = (
     "SMART_MONEY_MYSQL_ADMIN_USER", "SMART_MONEY_MYSQL_ADMIN_PASSWORD",
     "SMART_MONEY_MYSQL_DATABASE", "SMART_MONEY_MYSQL_SSL_CA",
 )
-def mysql_connection(write: bool = False):
+def mysql_connection(write: bool = False, *, dict_rows: bool = True,
+                     autocommit: bool = False):
     user_key = "SMART_MONEY_MYSQL_ADMIN_USER" if write else "SMART_MONEY_MYSQL_USER"
     password_key = (
         "SMART_MONEY_MYSQL_ADMIN_PASSWORD" if write else "SMART_MONEY_MYSQL_PASSWORD")
@@ -48,8 +49,9 @@ def mysql_connection(write: bool = False):
             password=os.environ.get(
                 password_key, "local-paper-only" if write else "local-runtime-only"),
             database=os.environ.get("SMART_MONEY_MYSQL_DATABASE", "smart_money"),
-            charset="utf8mb4", autocommit=False,
-            cursorclass=pymysql.cursors.DictCursor,
+            charset="utf8mb4", autocommit=autocommit,
+            cursorclass=(pymysql.cursors.DictCursor if dict_rows
+                         else pymysql.cursors.Cursor),
             connect_timeout=5, read_timeout=10, write_timeout=10,
             ssl=ssl,
         )

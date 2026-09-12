@@ -18,8 +18,10 @@ from .decode import Decoder
 from .feed import DecodeError, FeedHealth, decode_raw, envelopes
 from .execution_receipts import ReadOnlyExecutionTracker
 from .key_source import key_record_status
+from .ledger_migration import migrate_sqlite_ledger
 from .models import Transaction, number
 from .mysql_config import import_watchlist_relationships, load_mysql_paper_config
+from .mysql_store import MySqlStore
 from .native_flows import verify_native_flows
 from .paper import PaperEngine, PaperExecutor, PaperValuator, budget_bucket, scope_reason
 from .paper_config import load_paper_config
@@ -45,6 +47,16 @@ def runtime_paper_config(args):
         return load_mysql_paper_config()
     path = getattr(args, "paper_config", None) or getattr(args, "config", None)
     return load_paper_config(path) if path else None
+
+
+def runtime_store(args):
+    """Choose exactly one ledger backend; never dual-write."""
+    return MySqlStore() if getattr(args, "ledger_mysql", False) else Store(args.db)
+
+
+def require_existing_sqlite(args):
+    if not getattr(args, "ledger_mysql", False) and not Path(args.db).is_file():
+        raise ValueError("database does not exist")
 
 
 class LatencySamples:
@@ -108,7 +120,7 @@ def replay(args):
         for path in args.extra_fixture:
             example = json.loads(Path(path).read_text())
             examples.append((Transaction.from_rpc(example["transaction"]), example["receipt"]))
-    store = Store(args.db)
+    store = runtime_store(args)
     counts = Counter()
     try:
         for tx, receipt in examples:
@@ -122,7 +134,7 @@ def replay(args):
 
 def paper_cycle(args):
     config = runtime_paper_config(args)
-    store = Store(args.db)
+    store = runtime_store(args)
     try:
         active = store.active_paper_budget_cycle()
         if args.action == "reuse":
@@ -154,7 +166,7 @@ async def monitor(args):
     queue = asyncio.Queue(maxsize=args.queue_size)
     health = FeedHealth()
     stats = Counter()
-    store = Store(args.db)
+    store = runtime_store(args)
     paper_config = runtime_paper_config(args)
     paper_engines = {}
     paper_executor = None
@@ -536,7 +548,7 @@ async def reconcile_reorg(args):
         "ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"))
     if number(await rpc.call("eth_chainId")) != CHAIN_ID:
         raise ValueError("RPC is connected to the wrong chain")
-    store = Store(args.db)
+    store = runtime_store(args)
     try:
         scanner = BlockScanner(rpc, store, {}, confirmations=0)
         resolution = await scanner.reconcile_reorg(max_depth=args.max_depth)
@@ -556,7 +568,7 @@ async def paper_mark(args):
         "ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"))
     if number(await rpc.call("eth_chainId")) != CHAIN_ID:
         raise ValueError("RPC is connected to the wrong chain")
-    store = Store(args.db)
+    store = runtime_store(args)
     marked = rejected = 0
     try:
         quoter = LiveQuoter(rpc)
@@ -604,7 +616,7 @@ async def execution_track(args):
         "ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"))
     if number(await rpc.call("eth_chainId")) != CHAIN_ID:
         raise ValueError("RPC is connected to the wrong chain")
-    store = Store(args.db)
+    store = runtime_store(args)
     try:
         observation = await ReadOnlyExecutionTracker(store, rpc).observe(
             args.proposal_id, args.tx_hash, args.replaces_tx_hash)
@@ -694,6 +706,17 @@ def parser():
     key_status_parser = commands.add_parser(
         "key-status", help="Read public metadata for one offline key record")
     key_status_parser.add_argument("--wallet", required=True)
+    ledger_migrate_parser = commands.add_parser(
+        "ledger-migrate", help="Migrate a stopped SQLite ledger to business MySQL")
+    ledger_migrate_parser.add_argument("--sqlite", required=True)
+    ledger_migrate_parser.add_argument("--confirm-source-sha256", required=True)
+    for command_parser in (
+            replay_parser, monitor_parser, reconcile_parser, cycle_parser,
+            mark_parser, paper_export_parser, export_parser,
+            execution_audit_parser, execution_track_parser):
+        command_parser.add_argument(
+            "--ledger-mysql", action="store_true",
+            help="Use the business MySQL runtime ledger instead of SQLite")
     return root
 
 
@@ -720,8 +743,7 @@ def main():
                 raise ValueError("paper cycle options require --paper-config or --paper-mysql")
             asyncio.run(monitor(args))
         elif args.command == "reconcile-reorg":
-            if not Path(args.db).is_file():
-                raise ValueError("database does not exist")
+            require_existing_sqlite(args)
             if not 65 <= args.max_depth <= 100000:
                 raise ValueError("max-depth must be between 65 and 100000")
             asyncio.run(reconcile_reorg(args))
@@ -732,44 +754,43 @@ def main():
                 raise ValueError("reuse does not accept --cycle-id or --reason")
             paper_cycle(args)
         elif args.command == "paper-mark":
-            if not Path(args.db).is_file():
-                raise ValueError("database does not exist")
+            require_existing_sqlite(args)
             asyncio.run(paper_mark(args))
         elif args.command == "paper-export":
-            if not Path(args.db).is_file():
-                raise ValueError("database does not exist")
-            store = Store(args.db)
+            require_existing_sqlite(args)
+            store = runtime_store(args)
             try:
                 for row in store.paper_trades():
                     print(json.dumps(row, ensure_ascii=False, sort_keys=True))
             finally:
                 store.close()
         elif args.command == "execution-audit":
-            if not Path(args.db).is_file():
-                raise ValueError("database does not exist")
-            store = Store(args.db)
+            require_existing_sqlite(args)
+            store = runtime_store(args)
             try:
                 print(json.dumps(store.execution_audit(), ensure_ascii=False, sort_keys=True))
             finally:
                 store.close()
         elif args.command == "execution-track":
-            if not Path(args.db).is_file():
-                raise ValueError("database does not exist")
+            require_existing_sqlite(args)
             if args.replaces_tx_hash and not args.tx_hash:
                 raise ValueError("replacement tracking requires --tx-hash")
             asyncio.run(execution_track(args))
         elif args.command == "key-status":
             print(json.dumps(key_record_status(args.wallet), ensure_ascii=False,
                              sort_keys=True))
+        elif args.command == "ledger-migrate":
+            print(json.dumps(migrate_sqlite_ledger(
+                args.sqlite, args.confirm_source_sha256), ensure_ascii=False,
+                sort_keys=True))
         elif args.command == "relationships-import":
             inserted, skipped = import_watchlist_relationships(
                 args.follower_wallet, args.follower_label, args.watchlist, args.template)
             report("relationships_imported", inserted=inserted, skipped_existing=skipped,
                    enabled=False, live_trading=False)
         else:
-            if not Path(args.db).is_file():
-                raise ValueError("database does not exist")
-            store = Store(args.db)
+            require_existing_sqlite(args)
+            store = runtime_store(args)
             try:
                 for row in store.rows():
                     print(json.dumps(row, ensure_ascii=False))

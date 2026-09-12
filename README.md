@@ -146,6 +146,31 @@ export SMART_MONEY_MYSQL_SSL_CA=/etc/ssl/certs/数据库服务端CA.pem
 提案、仓位和跟卖额度恢复按 relationship 隔离。私钥不在 `copy_relationships` 中；当前版本
 仍不读取主网私钥、不签名或广播主网交易。
 
+业务 MySQL 还包含 `003_runtime_ledger.sql` 定义的运行与收益账本。将既有 SQLite 搬入 MySQL 时，
+必须先停止该 SQLite 的写入进程，确认没有非空 `-wal` 文件，再由操作员核对源文件 SHA-256：
+
+```bash
+sha256sum var/observer.sqlite3
+.venv/bin/sm-copy ledger-migrate \
+  --sqlite var/observer.sqlite3 \
+  --confirm-source-sha256 64位小写SHA256
+```
+
+迁移器只接受完整匹配的源哈希，在一个 MySQL 事务中按外键顺序复制 20 张表。目标主键已存在时
+逐列核对：完全相同则视为幂等重跑，任何差异都会回滚整次迁移，不覆盖目标数据。输出逐表
+`source_rows/inserted_rows/existing_identical_rows`；不会迁移私钥。迁移核对完成后，运行命令可加
+`--ledger-mysql`，例如：
+
+```bash
+.venv/bin/sm-copy monitor --seconds 60 --paper-mysql --ledger-mysql \
+  --paper-cycle-action reuse
+.venv/bin/sm-copy paper-export --ledger-mysql
+.venv/bin/sm-copy execution-audit --ledger-mysql
+```
+
+不加该参数仍使用 SQLite；一个进程只选择一个后端，不双写。正式切换前不要删除原 SQLite，
+也不要让 SQLite 和 MySQL 两个 monitor 同时处理同一组钱包。
+
 每条启用关系独立使用该行的策略版本、主/影子触发点、报价风控、协议、资产和精确路由；不同
 关系无需配置成相同值。每行都有自己的配置快照哈希并写入归因记录。
 

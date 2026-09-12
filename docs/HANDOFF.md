@@ -318,4 +318,45 @@ CLI 进程级回归已从磁盘 SQLite 的 signed plan 出发，经 chain ID 检
 已作为 `enabled=0` 的零地址占位模板导入。CLI 的 `relationships-import` 可针对真实跟单钱包
 公开地址导入，`--paper-mysql` 可代替 JSON 加载启用关系。此段为 Goal 启动时记录；当前已有独立
 key MySQL、离线测试签名与实盘前风控，但仍不读取真实私钥、不做主网签名或广播。
+
+2026-09-12 用户决定将 SQLite 运行状态与收益分析账本迁移到业务 MySQL。第一步已新增
+`docker/mysql/init/003_runtime_ledger.sql`：20 张 InnoDB 表覆盖 signals/candidates/chain cursor、
+Solver 证据、paper 额度/提案/订单/成交/持仓/已实现盈亏/估值以及 execution nonce/plan/attempt。
+原始金额和正负 PnL 继续使用十进制字符串列；私钥表不在该 schema。已在本机 MySQL 8.4 实际
+应用并确认 20 张表存在。`smart_money_runtime` 对 `copy_relationships` 仍只有 SELECT，对账本表
+只有 SELECT/INSERT/UPDATE/DELETE。当前应用的 `Store` 尚未切换到 MySQL，本步骤不能称为迁移
+完成；下一步是实现 MySQL Store 事务适配、SQLite→MySQL 可重复迁移及双后端一致性回归。
+
+第二步新增 `ledger-migrate --sqlite ... --confirm-source-sha256 ...`。迁移要求停写、源 SHA-256
+精确匹配且无非空 WAL；目标写入在单一事务内按外键顺序进行。已有主键逐列一致时可安全重跑，
+存在任何字段冲突则整笔回滚且不覆盖。单测覆盖首次插入、幂等重跑和冲突回滚。服务器 `var/`
+存在多个不同阶段的历史 SQLite，而没有唯一名为 `observer.sqlite3` 的生产账本，因此尚未擅自
+选择并合并其中任意一个；需要在运行时切换前明确正式源或把它们按独立归档处理。
+
+第三步新增 `MySqlStore` 与受限 SQL 方言适配。monitor/replay、paper cycle/mark/export、reorg、
+execution audit/track 和普通 export 均可显式传 `--ledger-mysql`；默认仍是 SQLite，且不存在双写
+路径。MySQL 连接日常 autocommit，Store 的 `BEGIN IMMEDIATE` 区段转换为显式事务，事务内 SELECT
+增加 `FOR UPDATE`，SQLite upsert/ignore 和 JSON event-id join 做受限转换。真实 MySQL 演练验证了
+signal/candidate 幂等、候选领取、额度预留、BUY fill、持仓和带聪明钱 relationship 归因的收益
+导出；首次演练发现 JSON/ASCII collation 冲突，修复为显式 ASCII/`ascii_bin` 后通过。每轮 UUID
+测试数据均在 finally 精确删除，复查残留为 0。尚需继续覆盖规范链重组和 execution 生命周期的
+真实 MySQL 写路径，才能完成后端切换验收。
+
+后续真实 MySQL 演练已补齐剩余核心写路径：部分 SELL 从 250 token 归因 lot 卖出 100，按整数
+比例释放原始本金 40，使 invested 从 100 降至 60，并保存 `realized_pnl_raw=19`；固定金额始终是
+十进制字符串。规范链使用 UUID 派生且预查不存在的随机高度，验证 safe-head 信号在回退后变为
+orphaned、candidate 重新可领取。execution 路径验证 nonce=7 持久预留、prepared plan、公开 signed
+hash、observed_pending、confirmed 及 audit end_to_end_evidenced=true；没有密钥、签名或广播。所有
+UUID 行、随机规范块和 canonical cursor 清理后综合残留为 0。接下来只剩正式运行账本源选择、
+实际迁移/新库启用和 60 秒 MySQL monitor 验收，不应再称核心 Store 方法缺失。
+
+随后已完成业务 MySQL 的 60 秒真实主网只读 monitor 切换验收（未启用 paper relationship）：
+1100 feed frames、5233 decoded、4126 stale skipped、569 backfill blocks，发现并完成 5 个 candidate，
+最终 pending/queued/retry/failed 均为 0；RPC、worker、backfill、frame、account code 错误及重连均为
+0。5 个信号全是第三方被动入账，全部保持 needs_review/copy_eligible=false，没有误判 BUY。进程结束
+后直接查询 MySQL：signals=5、copy false=5、needs_review=5、complete candidates=5、canonical cursor
+=60984943、canonical blocks=570、paper fills=0、execution attempts=0。该业务 MySQL 现可作为新的
+运行账本起点；服务器旧 SQLite 均为带测试名称的历史验证库，没有唯一正式生产源，继续原样保留
+为归档而未混入新账本。收益数据可直接通过 `paper-export --ledger-mysql` 查询；当前为 0 是因为尚
+未启用任何真实跟单关系，不是迁移失败。
 依据 [官方 CLI 参考](https://developers.openai.com/codex/cli/reference/) 和本机帮助。

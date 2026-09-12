@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -40,11 +41,13 @@ from smart_money.execution_controls import (
     require_mainnet_broadcast_enabled, require_offline_signing_enabled,
 )
 from smart_money.key_source import OfflineDatabaseSigner, key_record_status
+from smart_money.ledger_migration import migrate_sqlite_ledger, sqlite_sha256
 from smart_money.models import Signal, Transaction
 from smart_money.mysql_config import (
     MySqlRelationshipGate, import_watchlist_relationships, load_mysql_paper_config,
     mysql_connection, rows_to_document,
 )
+from smart_money.mysql_store import MySqlConnectionCompat
 from smart_money.native_flows import verify_native_flows
 from smart_money.pools import verify_signal_pools
 from smart_money.paper import (
@@ -1959,6 +1962,162 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'requires explicit connection settings'):
                 signer._load_account()
             connect.assert_not_called()
+
+    def test_business_mysql_ledger_schema_is_complete_and_secret_free(self):
+        sql = (ROOT / 'docker/mysql/init/003_runtime_ledger.sql').read_text()
+        tables = {
+            'signals', 'candidates', 'chain_cursors', 'canonical_blocks',
+            'candidate_inclusions', 'solver_order_evidence',
+            'paper_budget_cycles', 'paper_budgets', 'paper_proposals',
+            'paper_reservations', 'paper_orders', 'paper_fills',
+            'paper_positions', 'paper_position_reservations',
+            'paper_realized_pnl', 'paper_position_marks', 'paper_decisions',
+            'execution_nonce_reservations', 'execution_plans',
+            'execution_attempts',
+        }
+        for table in tables:
+            self.assertIn(f'CREATE TABLE IF NOT EXISTS {table} (', sql)
+            self.assertIn(
+                f'GRANT SELECT, INSERT, UPDATE, DELETE ON smart_money.{table}',
+                sql)
+        self.assertEqual(sql.count('CREATE TABLE IF NOT EXISTS '), len(tables))
+        self.assertNotIn('wallet_keys', sql)
+        self.assertNotIn('private_key', sql)
+        self.assertIn('amount_in_raw VARCHAR(80)', sql)
+        self.assertIn('realized_pnl_raw VARCHAR(81)', sql)
+        self.assertIn('UNIQUE KEY uq_one_active_paper_budget_cycle', sql)
+
+    def test_mysql_store_translates_only_bounded_store_sql(self):
+        self.assertEqual(
+            MySqlConnectionCompat._sql(
+                "INSERT OR IGNORE INTO candidates(tx_hash,payload) VALUES(?,?)"),
+            "INSERT IGNORE INTO candidates(tx_hash,payload) VALUES(%s,%s)")
+        translated = MySqlConnectionCompat._sql(
+            "INSERT INTO chain_cursors(name,block_number,block_hash) VALUES(?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "block_number=excluded.block_number,block_hash=excluded.block_hash")
+        self.assertIn("ON DUPLICATE KEY UPDATE", translated)
+        self.assertIn("block_number=VALUES(block_number)", translated)
+        self.assertNotIn("excluded.", translated)
+        self.assertTrue(MySqlConnectionCompat._sql(
+            "SELECT limit_raw FROM paper_budgets WHERE cycle_id=?", lock=True
+        ).endswith(" FOR UPDATE"))
+        json_join = MySqlConnectionCompat._sql(
+            "SELECT json_extract(p.attribution_payload,'$.source_event_id')")
+        self.assertIn("USING ascii", json_join)
+        self.assertIn("COLLATE ascii_bin", json_join)
+        parsed = cli_parser().parse_args(['paper-export', '--ledger-mysql'])
+        self.assertTrue(parsed.ledger_mysql)
+
+    def test_sqlite_ledger_migration_is_idempotent_and_conflict_safe(self):
+        class FakeCursor:
+            def __init__(self, connection):
+                self.connection = connection
+                self.result = []
+                self.rowcount = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def execute(self, sql, params=()):
+                if sql.startswith('SHOW COLUMNS'):
+                    table = sql.split('`')[1]
+                    self.result = [{'Field': column}
+                                   for column in self.connection.columns[table]]
+                    return
+                if sql.startswith('SELECT'):
+                    table = sql.split('FROM `', 1)[1].split('`')[0]
+                    key = tuple(params)
+                    found = self.connection.rows[table].get(key)
+                    self.result = [found] if found is not None else []
+                    return
+                if sql.startswith('INSERT'):
+                    table = sql.split('INSERT INTO `', 1)[1].split('`')[0]
+                    column_text = sql[sql.index('(') + 1:sql.index(')')]
+                    columns = tuple(part.strip('`') for part in column_text.split(','))
+                    row = dict(zip(columns, params))
+                    key = tuple(row[column] for column in self.connection.primary_keys[table])
+                    self.connection.rows[table][key] = row
+                    self.rowcount = 1
+                    return
+                raise AssertionError(sql)
+
+            def fetchall(self):
+                return self.result
+
+            def fetchone(self):
+                return self.result[0] if self.result else None
+
+        class FakeConnection:
+            def __init__(self, columns, primary_keys):
+                self.columns = columns
+                self.primary_keys = primary_keys
+                self.rows = {table: {} for table in columns}
+                self.commits = self.rollbacks = 0
+
+            def begin(self):
+                pass
+
+            def cursor(self):
+                return FakeCursor(self)
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                self.rollbacks += 1
+
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ledger.sqlite3'
+            store = Store(path)
+            signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER,
+                            '0x12345678', stage='swap_evidenced')
+            self.assertTrue(store.put(signal))
+            store.close()
+            source = sqlite3.connect(path)
+            tables = [row[0] for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")]
+            columns = {}
+            primary_keys = {}
+            for table in tables:
+                info = source.execute(f'PRAGMA table_info(`{table}`)').fetchall()
+                columns[table] = tuple(row[1] for row in info)
+                primary_keys[table] = tuple(row[1] for row in sorted(
+                    (row for row in info if row[5]), key=lambda row: row[5]))
+            source.close()
+            target = FakeConnection(columns, primary_keys)
+            factory = lambda write=False: target
+            digest = sqlite_sha256(path)
+            first = migrate_sqlite_ledger(path, digest, factory)
+            self.assertEqual(first['source_rows'], 1)
+            self.assertEqual(first['inserted_rows'], 1)
+            self.assertFalse(first['private_key_data_migrated'])
+            second = migrate_sqlite_ledger(path, digest, factory)
+            self.assertEqual(second['inserted_rows'], 0)
+            self.assertEqual(second['existing_identical_rows'], 1)
+            target.rows['signals'][(signal.event_id,)]['payload'] = '{}'
+            with self.assertRaisesRegex(ValueError, 'target row conflicts'):
+                migrate_sqlite_ledger(path, digest, factory)
+            self.assertEqual(target.rollbacks, 1)
+
+            wal = Path(str(path) + '-wal')
+            wal.write_bytes(b'active-writer')
+            with self.assertRaisesRegex(ValueError, 'WAL is non-empty'):
+                migrate_sqlite_ledger(path, digest, factory)
+
+        parsed = cli_parser().parse_args([
+            'ledger-migrate', '--sqlite', 'observer.sqlite3',
+            '--confirm-source-sha256', 'ab' * 32,
+        ])
+        self.assertEqual(parsed.command, 'ledger-migrate')
+        self.assertEqual(parsed.sqlite, 'observer.sqlite3')
+        self.assertEqual(parsed.confirm_source_sha256, 'ab' * 32)
 
     def test_mysql_connection_errors_do_not_leak_remote_credentials(self):
         config_env = {

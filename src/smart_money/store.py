@@ -43,6 +43,7 @@ class Store:
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(str(path))
+        self.integrity_error = sqlite3.IntegrityError
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS signals (
@@ -740,7 +741,7 @@ class Store:
                 ))
             self.connection.commit()
             return True, "reserved"
-        except sqlite3.IntegrityError:
+        except self.integrity_error:
             self.connection.rollback()
             return False, "proposal_source_already_reserved"
         except Exception:
@@ -1142,7 +1143,7 @@ class Store:
                     (proposal["proposal_id"], lot_id, token_amount))
             self.connection.commit()
             return True, "reserved"
-        except sqlite3.IntegrityError:
+        except self.integrity_error:
             self.connection.rollback()
             return False, "proposal_source_already_reserved"
         except Exception:

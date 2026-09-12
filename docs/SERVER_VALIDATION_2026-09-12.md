@@ -387,3 +387,54 @@ CSV 写入口进一步收紧：保留已有 disabled 零 follower 历史行，�
 `96164000` wei。输出明确 `rpc_read_only=true`、`broadcast_performed=false`、
 `copy_eligible=false`，未访问 key MySQL 或任何发送方法。该证据证明已配置付费 RPC 可访问正确
 主网及基础状态，不证明真实签名、广播、成交、revert、replacement 或重组链路已经验收。
+
+用户确认将运行状态和收益分析迁到业务 MySQL 后，新增
+`docker/mysql/init/003_runtime_ledger.sql`。该 schema 在本机 `smart-money-mysql`（MySQL 8.4）
+实际执行成功；使用 `smart_money_runtime` 查询 information_schema 得到目标表数 `20`。
+`SHOW GRANTS` 实测该账号对 `copy_relationships` 仍只有 SELECT，对 20 张运行账本表逐表只有
+SELECT/INSERT/UPDATE/DELETE，没有 schema 管理权限，也没有 key 数据库权限。新增静态回归检查
+所有 20 张表、对应权限、十进制字符串金额列、一周期唯一 active guard，并确认 schema 不含
+`wallet_keys`/`private_key`；定向 1 项测试通过。应用 Store 尚未切换到 MySQL，未迁移任何 SQLite
+数据，也未删除或修改原 SQLite 文件。
+
+新增 SQLite→业务 MySQL 的单向 `ledger-migrate`：要求操作员提供完整源文件 SHA-256、拒绝非空
+WAL，使用 SQLite read-only 一致性事务和 MySQL 单事务，按 20 张表的外键顺序复制。目标主键若
+存在则逐列核对，相同计入幂等结果，冲突则全量回滚且不会覆盖。回归用真实临时 SQLite Store
+与内存 MySQL 协议替身验证首次 1 行插入、第二次 0 插入/1 行 identical、篡改目标 payload 后
+冲突回滚；私钥数据固定不在迁移清单。服务器 `var/` 发现多个带具体测试名称的历史 SQLite，
+没有唯一正式 `observer.sqlite3`，故本轮没有猜测迁移源，也没有改动这些文件或向业务 MySQL
+写入历史账本数据。
+
+新增 `MySqlStore` 运行后端，账本相关 CLI 均可显式使用 `--ledger-mysql`，默认 SQLite 保持兼容且
+没有双写分支。方言层仅转换 Store 已知的占位符、INSERT IGNORE/upsert、JSON event ID，并把
+SQLite `BEGIN IMMEDIATE` 映射为 MySQL 显式事务；事务内 SELECT 使用 `FOR UPDATE`。真实空库
+`execution-audit --ledger-mysql` 返回 healthy=true、plans/attempts=0、end_to_end_evidenced=false。
+
+随后以不可预测 UUID 在实际 MySQL 演练 signal/candidate 幂等、候选领取、100/1000 额度预留、
+BUY fill、持仓与收益归因导出。第一次 `paper_trades` 暴露 JSON_UNQUOTE 返回 utf8mb4 与
+ASCII event_id 的 collation 冲突并失败；finally 完成精确清理。方言层增加显式 ASCII/`ascii_bin`
+转换后原样重跑通过，输出 signal_idempotent、candidate_claimed_once、reservation_atomic、
+buy_fill_attributed、earnings_export_readable 均为 true，且 private_key_accessed=false、
+copy_eligible=false。再次按测试 UUID 查询周期/提案/订单/成交/持仓残留总数为 0。
+
+扩展同一安全演练后，真实 MySQL SELL 路径从归因 lot 的 250 token 中卖出 100，按整数比例释放
+40 原始本金，budget invested 由 100 恢复到 60，保存/读取 `realized_pnl_raw="19"`。规范链测试
+不再使用固定高度：脚本从 UUID 派生随机高位高度，并在游标为空且两个高度均不存在后才写入，
+验证 safe_head_confirmed 信号在 rewind 后变为 orphaned、candidate 重置后再次领取。公开 execution
+状态验证 nonce 7 reservation、prepared plan、signed hash、observed_pending、confirmed 和
+`execution_audit.healthy/end_to_end_evidenced=true`；没有生成签名、读取私钥或广播。最后查询 UUID
+周期/提案/订单/成交/持仓/nonce/plan/信号以及 canonical cursor 的综合残留为 0。
+
+完整 138 项 unittest、pip check、compileall 和 diff check 通过后，实际运行
+`sm-copy monitor --seconds 60 --ledger-mysql`。进程连接付费主网 RPC/feed，未启用 paper 配置；
+最终 counters 为 frames=1100、decoded=5233、stale skipped=4126、backfill blocks=569、
+candidates/dispatched/receipts=5/5/5，receipt unavailable/retry/drop/worker/RPC backfill/account-code/
+frame/reconnection errors 全为 0。队列最终 pending=queued=retry=failed=0、complete=5。
+
+5 个信号均为 `INCOMING_TRANSFER`，有成功 receipt 和钱包 ERC20 正向 delta，但没有 swap event，
+因此全部正确保持 `needs_review`、理由 `recipient_is_not_proof_of_order_ownership`，没有当作买入。
+结束后直接查询业务 MySQL 得到 signals=5、copy_eligible false=5、needs_review=5、complete
+candidates=5、cursor=60984943、canonical_blocks=570、paper_fills=0、execution_attempts=0。最后两个
+为 0 符合本次未启用跟单配置/未广播的边界，不能解释为收益链路测试失败；BUY/SELL/PnL 和公开
+execution lifecycle 已由此前隔离 UUID 演练覆盖。旧具名 SQLite 文件保持未修改，作为历史验证
+归档，不与本次新的业务 MySQL 运行起点混合。
