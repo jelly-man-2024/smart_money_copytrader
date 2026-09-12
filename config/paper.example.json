@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "strategy_version": "paper-v1",
+  "trigger_mode": "swap_evidenced",
+  "shadow_trigger_modes": ["feed_intent", "receipt_success"],
+  "quote_policy": {
+    "max_age_seconds": 2.0,
+    "max_adverse_deviation_bps": 300,
+    "max_price_impact_bps": 500,
+    "max_slippage_bps": 300,
+    "max_gas_cost_wei": "10000000000000000",
+    "min_amount_out_raw": "1"
+  },
+  "allowed_protocols": ["v2", "v3", "v4"],
+  "allowed_assets": [
+    "0x0000000000000000000000000000000000000000",
+    "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+    "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+  ],
+  "allowed_routes": [
+    {
+      "protocol": "v2",
+      "assets": [
+        "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+        "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+      ]
+    },
+    {
+      "protocol": "v3",
+      "assets": [
+        "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+        "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
+      ],
+      "fees": [500]
+    }
+  ],
+  "wallets": [
+    {
+      "wallet": "0x0000000000000000000000000000000000000001",
+      "label": "replace-with-smart-wallet-label",
+      "budget_limits": {
+        "USDG": "100000000",
+        "ETH_WETH": "1000000000000000000"
+      },
+      "buy_rules": {
+        "USDG": {"mode": "fixed", "fixed_amount_raw": "1000000"},
+        "ETH_WETH": {"mode": "proportional", "ratio_ppm": 100000}
+      },
+      "sell_rule": {"mode": "proportional", "ratio_ppm": 100000}
+    }
+  ]
+}

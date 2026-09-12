@@ -12,6 +12,7 @@ dependencies = [
   "eth-account==0.14.0",
   "eth-abi==6.0.0",
   "eth-utils==6.0.0",
+  "PyMySQL==1.1.2",
   "rlp==5.0.0",
   "websockets==15.0.1",
 ]

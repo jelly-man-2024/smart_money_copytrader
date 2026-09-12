@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 ALLOWED_METHODS = frozenset({
     "eth_chainId", "eth_blockNumber", "eth_getCode", "eth_getTransactionByHash",
     "eth_getTransactionReceipt", "eth_getBlockByNumber", "eth_getBalance", "eth_call",
+    "eth_getLogs", "eth_gasPrice", "eth_getTransactionCount",
+    "debug_traceTransaction",
 })
 
 
@@ -53,6 +55,15 @@ class ReadOnlyRpc:
     async def call(self, method: str, params: list | None = None):
         if method not in ALLOWED_METHODS:
             raise PermissionError(f"RPC method not allowed: {method}")
+        if method == "debug_traceTransaction":
+            allowed = (
+                {"tracer": "prestateTracer", "tracerConfig": {"diffMode": True}},
+                {"tracer": "prestateTracer"},
+            )
+            if (not isinstance(params, list) or len(params) != 2
+                    or not isinstance(params[0], str) or len(params[0]) != 66
+                    or params[1] not in allowed):
+                raise PermissionError("only bounded prestateTracer diffMode is allowed")
         async with self.semaphore:
             return await asyncio.to_thread(self._request, method, params or [], next(self.ids))
 

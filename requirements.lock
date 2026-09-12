@@ -19,6 +19,7 @@ py-ecc==8.0.0
 pycryptodome==3.23.0
 pydantic==2.13.5
 pydantic_core==2.46.5
+PyMySQL==1.1.2
 regex==2026.9.3
 rlp==5.0.0
 toolz==1.1.0

@@ -30,7 +30,7 @@ python3 -m venv .venv
 离线回放包含 11 笔历史样本、1 笔真实 feed 存款样本和可选的 230 地址批量分发。
 不需要网络、付费 RPC 或私钥。信号输出到 stdout（JSONL），统计输出到 stderr。
 SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信号。
-目前单元测试共 51 项。服务器首次验证顺序为安装、单元测试、离线回放，
+目前单元测试共 106 项。服务器首次验证顺序为安装、单元测试、离线回放，
 再执行下面的 60 秒实时只读监听；完整历史验证记录见 [VALIDATION](docs/VALIDATION.md)。
 
 ## 实时只读监听
@@ -41,8 +41,30 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 ```
 
 `--seconds 0` 持续运行直到 Ctrl-C。默认仅监听 60 秒，另有启动 RPC 和最多 15 秒排空时间。
-支持环境变量 `ROBINHOOD_RPC_URL`、`ROBINHOOD_FEED_URL`；`.env.example` 不会自动加载。
+支持环境变量 `ROBINHOOD_RPC_URL`、`ROBINHOOD_FEED_URL`，也会从当前目录 `.env` 加载且
+只接受这两个键；钱包和私钥变量会被忽略。
 不要把含 API key 的完整 URL 提交 Git 或贴到日志中。公开端点可能限流。
+
+只读纸面模式使用独立、严格校验且不接受私钥字段的 JSON 配置。示例中的钱包和额度必须先
+替换，再在每次启动时明确选择沿用或重置手动额度周期：
+
+```bash
+.venv/bin/sm-copy monitor --seconds 60 --paper-config config/paper.example.json \
+  --paper-cycle-action reset --paper-cycle-id manual-2026-09-12 --paper-cycle-reason operator_reset
+.venv/bin/sm-copy monitor --seconds 60 --paper-config config/paper.example.json \
+  --paper-cycle-action reuse
+.venv/bin/sm-copy paper-mark --config config/paper.example.json --db var/observer.sqlite3
+.venv/bin/sm-copy paper-export --db var/observer.sqlite3
+.venv/bin/python scripts/validate_paper_readonly.py
+```
+
+默认主触发为 `swap_evidenced`，Feed 和 receipt 只作影子比较且不占额度。主触发通过后会再次
+取得固定区块的实时报价；只有第二次报价仍通过原始 `minOut`、时效、偏离、价格冲击和 Gas
+门控，才写入本地 paper fill。全过程没有签名、广播或真实订单。
+`allowed_routes` 必须逐条列出 V2 资产路径、V3 路径与 fee，或 V4 路径与
+fee/tickSpacing/hook/hookData；
+路径中的所有中间资产也必须出现在 `allowed_assets`。路由方向对称，但换 fee、hook 或中间池
+都会得到不同 key 并被拒绝。
 
 程序会恢复真实发送者、解析已知智能账户/EntryPoint 包装，再按支持的 ABI 识别行为。
 目标只是收款人的大规模等额分发汇总为一条 BULK_DISTRIBUTION，不生成多个买入信号。
@@ -64,9 +86,135 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 存款、部分 V2/V3 方法、Universal Router 的 V2/V3 与新版 V4 单跳、领奖和转账识别。
 包含消息新鲜度、重连、序列缺口告警、容量限制、回执核对、SQLite 事件去重，以及
 先落盘后入队的持久候选和有界回执重试。健康日志会报告候选状态及进程内阶段延迟分位数。
+独立规范区块游标按默认 2 个确认后的 safe head 推进，每轮最多补 20 个完整区块；补抓候选
+标记为 `backfill/fresh=false`。父哈希不连续时停止推进，等待显式重组处理。
+扫描器保存最近的规范区块链条；发生不连续时最多回查 64 块寻找共同祖先，将孤块信号标为
+`canonical_status=orphaned` 并重新核对候选，但永久保留原 Feed 意向。超过自动深度时会停扫，
+由操作员显式运行 `sm-copy reconcile-reorg --db ... --max-depth N`；该命令只用 RPC 逐块核对已
+保存的哈希，找到共同祖先后才回退，不接受未经链上验证的人工哈希。
+补洞还使用单区块 `eth_getLogs`，只查询 ERC-20 Transfer 和观察地址 recipient topic；命中
+仅扩大第三方入账候选，仍须回执核对且不能直接分类为 BUY。
 
-**尚未实现**：完整聚合器覆盖、V4 多跳/完整结算接收人、V2/V3 factory 归属校验、
-ETH 净流与 trace、规范链重组处理、断线补洞、完整 Solver 订单关联、模拟报价/PnL、
+**尚未实现**：完整聚合器覆盖、V3/V4 多跳真实样本验证、bundled/UserOp Gas 付款归属、
+目标链 Solver 交付的独立链上复核、V4 多跳报价的真实链样本、组合 USD 换算、
 实盘风控与订单/仓位执行器。非零 hooks 和未知资产需要单独验证。
 
 不要将观察器部署后直接当作自动交易机器人。后续顺序见完整方案的 M2/M3/M4。
+
+## MySQL 跟单关系配置
+
+可用 MySQL 单表 `copy_relationships` 维护“跟单钱包公开地址 × 聪明钱 × 唯一策略”。本机
+Docker 初始化仅绑定 `127.0.0.1:3308`：
+
+```bash
+docker compose up -d mysql
+.venv/bin/sm-copy relationships-import \
+  --follower-wallet 0x你的公开地址 \
+  --follower-label my-paper-wallet
+```
+
+导入命令读取 `data/fomo_watchlist.csv`，为 67 个聪明钱建立关系，默认全部 `enabled=0`。
+历史数据中的零地址仅作为禁用导入占位；任何启用配置中的零 smart wallet 或零 follower wallet
+都会在加载阶段拒绝。现有旧占位数据继续保留，但新的 `relationships-import` 要求非零 follower 和
+非零 smart wallet。native asset 使用的零地址不受此限制。
+远程数据库连接由进程环境提供：
+
+```bash
+export SMART_MONEY_MYSQL_HOST=db.example.internal
+export SMART_MONEY_MYSQL_PORT=3306
+export SMART_MONEY_MYSQL_USER=smart_money_runtime
+export SMART_MONEY_MYSQL_PASSWORD='由使用者自行维护'
+export SMART_MONEY_MYSQL_DATABASE=smart_money
+export SMART_MONEY_MYSQL_SSL_CA=/etc/ssl/certs/数据库服务端CA.pem
+```
+
+远程 MySQL 必须显式配置 HOST、PORT、USER、PASSWORD、DATABASE、SSL_CA 并校验 TLS；不会把
+本机 Docker 的默认端口或账号密码用于远程连接。只有 `127.0.0.1`/`localhost` 允许使用容器
+自签名证书。
+监听进程账号只需 `SELECT copy_relationships`。批量导入另用
+`SMART_MONEY_MYSQL_ADMIN_USER`/`SMART_MONEY_MYSQL_ADMIN_PASSWORD` 可写账号。
+
+使用 MySQL 配置启动纸面监听：
+
+```bash
+.venv/bin/sm-copy monitor --seconds 60 --paper-mysql \
+  --paper-cycle-action reset --paper-cycle-id manual-2026-09 \
+  --paper-cycle-reason operator_reset --db var/observer.sqlite3
+```
+
+一个 monitor 进程可加载多个跟单钱包，也允许同一个聪明钱分别配置给多个跟单钱包；额度、
+提案、仓位和跟卖额度恢复按 relationship 隔离。私钥不在 `copy_relationships` 中；当前版本
+仍不读取主网私钥、不签名或广播主网交易。
+
+每条启用关系独立使用该行的策略版本、主/影子触发点、报价风控、协议、资产和精确路由；不同
+关系无需配置成相同值。每行都有自己的配置快照哈希并写入归因记录。
+
+可用以下临时数据演练核对多 follower 隔离。脚本只复制一条现有公开配置，使用两个保留测试
+地址，验证后按本次自增 ID 删除并查询确认剩余为零；不连接私钥库或 RPC：
+
+```bash
+.venv/bin/python scripts/validate_mysql_relationship_isolation.py
+```
+
+## 独立私钥数据库（仅离线准备）
+
+用户要求的简单私钥数据源使用另一个 MySQL 实例，与关系配置库分离：
+
+```bash
+docker compose up -d key_mysql
+```
+
+本机绑定 `127.0.0.1:3309`，数据库/表为 `smart_money_keys.wallet_keys`。初始化后为空；项目不会
+自动生成或导入私钥。使用者通过管理账号插入小写公开地址及 `0x` 开头的 32-byte 私钥，并先
+保持 `enabled=0`：
+
+```sql
+INSERT INTO wallet_keys(wallet_address, private_key_hex, enabled)
+VALUES ('0x公开地址', '0x私钥', FALSE);
+```
+
+运行账号只拥有三列的 SELECT 权限。远程连接需设置
+`SMART_MONEY_KEY_MYSQL_HOST/PORT/USER/PASSWORD/DATABASE/SSL_CA`，非本机连接缺少 CA 会拒绝。
+远程 key MySQL 同样要求上述六项全部显式提供，不会回退到本机默认凭据。数据源当前需要同时
+显式设置 `SMART_MONEY_EXECUTION_MODE=offline_test`、
+`SMART_MONEY_SIGNING_MODE=offline_test` 和 `SMART_MONEY_EMERGENCY_STOP=0` 才能访问，并且每次
+签名前检查 `SMART_MONEY_EMERGENCY_STOP_FILE`（默认 `var/EXECUTION_STOP`）不存在。运行期间创建
+该文件即可阻止下一次离线密钥读取/签名。只允许 chain ID 4663 的 type-2 离线签名；这些开关
+不要写进项目 `.env`。主网模式无论环境变量如何组合都固定拒绝，也没有广播入口。完整门槛见
+[LIVE_RISK_CHECKLIST](docs/LIVE_RISK_CHECKLIST.md)。
+
+只检查某个公开钱包在 key DB 中是否存在/启用，而不读取私钥列：
+
+```bash
+SMART_MONEY_EXECUTION_MODE=offline_test \
+SMART_MONEY_SIGNING_MODE=offline_test \
+SMART_MONEY_EMERGENCY_STOP=0 \
+.venv/bin/sm-copy key-status --wallet 0x公开钱包地址
+```
+
+输出只有公开地址、`found`、`enabled`、`read_only` 和固定的 `private_key_read=false`。该命令仍受
+stop file、TLS 和远程连接完整显式配置约束。
+
+如果进程在离线签名后、raw bytes 交给调用方前退出，`recover_signed` 可以在重启后重新执行关系、
+额度、报价和 RPC 预检，再确定性重建同一交易；仅当账本仍是唯一、尚未被 RPC 观察的 `signed`
+attempt 且重建 hash 完全相同时返回。raw bytes 仍不落库，已 pending/confirmed/reverted/replaced/
+orphaned 的 attempt 不允许走该恢复路径。
+
+由独立测试广播方或未来获授权的发送方提供公开 hash 后，可运行只读生命周期跟踪：
+
+```bash
+.venv/bin/sm-copy execution-track --db var/observer.sqlite3 \
+  --proposal-id 公开proposal-id
+
+.venv/bin/sm-copy execution-track --db var/observer.sqlite3 \
+  --proposal-id 公开proposal-id --tx-hash 0x替换交易hash \
+  --replaces-tx-hash 0x被替换交易hash
+```
+
+命令只调用 RPC 查询方法并输出 `broadcast_performed=false`；replacement 仍须通过相同意图、nonce
+和逐级提价验证。它不能发送交易。
+
+启动、重启、紧急停止和状态处置步骤见
+[OPERATOR_RUNBOOK](docs/OPERATOR_RUNBOOK.md)。
+逐项完成度与仍需外部验收的边界见
+[GOAL_ACCEPTANCE](docs/GOAL_ACCEPTANCE.md)。

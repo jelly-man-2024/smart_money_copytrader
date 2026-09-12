@@ -12,7 +12,27 @@
 - `data/bulk_distribution.json`：同日 RPC 查询已保存的 tx/receipt 中提取交易
   0xb81520b047688d7f40db42073fcc3343e87d3815cb909a6a3fef702116d52658。
   230 个等额收款人，其中 32 个在清单。用于批量分发负例测试，不用于验证空投价值。
+- `data/relay_order_evidence_3ccc6f52.json`：2026-09-11 通过 Relay 公开只读
+  `GET /requests/v2` 按链上 orderId 查询后人工裁剪的字段保留样本。保留 requestId、源交易、
+  protocol deposit、destination fill/outTx 和接收者 FT 正向 stateChange；未保存无关费用明细、
+  签名或大段原始 calldata。API key 未使用。该样本证明 Relay API 报告的订单关联，不证明
+  Solana 目标交易已由本项目独立 RPC 复核。
 - 测试中的随机本地账户只用于离线编码/验签，没有资金、不会广播。
+
+纸面报价使用的 V3 Quoter `0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7` 和 V4 Quoter
+`0x8dc178efb8111bb0973dd9d722ebeff267c98f94` 来自 Uniswap 官方 SDK 地址注册表，并在
+2026-09-12 与官方 v4 deployments 页面交叉核对：
+
+- https://github.com/Uniswap/sdks/blob/main/sdks/sdk-core/src/addresses.ts
+- https://developers.uniswap.org/docs/protocols/v4/deployments
+- https://github.com/Uniswap/v4-periphery/blob/main/src/interfaces/IV4Quoter.sol
+- https://github.com/Uniswap/v4-periphery/blob/main/src/libraries/PathKey.sol
+
+后两项是 V4 多跳 `QuoteExactParams` 与 `PathKey[]` ABI 的官方来源；没有依据第三方聚合器猜测
+tuple 布局。
+
+服务器随后通过已配置 RPC 做固定区块的只读 `eth_call` 验证。实时报价不会保存成可在未来
+复用的价格样本，也不能作为盈利证明。
 
 这些不是完整交易历史、随机样本或收益证明。原生币、失败交易、日志之外的状态变化
 不一定被最初 Transfer 抽样覆盖。所有统计必须保留抽样口径。

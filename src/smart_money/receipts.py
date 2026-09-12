@@ -22,6 +22,7 @@ SWAPS = {
     topic("Swap(address,address,int256,int256,uint160,uint128,int24)"): "v3",
     topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"): "v4",
 }
+DEPOSIT_RECORDED = "0x49fed1d0b752ce30eee63c7a81133f3363b532fec5d4d7dd1ccfd005de4555e1"
 TRADE_BEHAVIORS = {"BUY", "SELL", "TOKEN_SWAP"}
 
 
@@ -72,7 +73,9 @@ def operation_scopes(logs: list[dict]) -> dict[tuple[str, int], list[tuple[bool,
     return result
 
 
-def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dict) -> list[Signal]:
+def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dict,
+           pool_checks: dict[str, dict] | None = None,
+           native_checks: dict[str, dict] | None = None) -> list[Signal]:
     if receipt.get("transactionHash", "").lower() != tx.hash:
         raise ValueError("receipt transaction hash mismatch")
     logs = sorted(receipt.get("logs", []), key=lambda log: number(log.get("logIndex", 0)))
@@ -110,40 +113,151 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
                 continue
         signal.evidence["wallet_erc20_deltas_raw"] = deltas(local_logs, signal.wallet)
         signal.stage = "execution_observed"
+        if signal.behavior == "WRAP_NATIVE":
+            received = int(signal.evidence["wallet_erc20_deltas_raw"].get(R.WETH, "0"))
+            signal.evidence["actual_output_credit_raw"] = str(max(received, 0))
+            if received != int(signal.amount_in_raw or "0"):
+                signal.stage = "needs_review"
+                signal.reasons.append("weth_wrap_credit_does_not_match_call_value")
+        elif signal.behavior == "UNWRAP_WETH":
+            spent = -int(signal.evidence["wallet_erc20_deltas_raw"].get(R.WETH, "0"))
+            signal.evidence["actual_input_debit_raw"] = str(max(spent, 0))
+            if spent != int(signal.amount_in_raw or "0"):
+                signal.stage = "needs_review"
+                signal.reasons.append("weth_unwrap_debit_does_not_match_requested_amount")
+        if signal.behavior == "INTENT_DEPOSIT":
+            matches = []
+            for item in local_logs:
+                topics = item.get("topics", [])
+                if (item.get("address", "").lower() != R.DEPOSITORY or not topics
+                        or topics[0] != DEPOSIT_RECORDED or len(item.get("data", "")) != 258):
+                    continue
+                try:
+                    depositor, token, amount, order_id = decode(
+                        ["address", "address", "uint256", "bytes32"], bytes.fromhex(item["data"][2:]))
+                    candidate = (depositor.lower(), token.lower(), str(amount), "0x" + order_id.hex())
+                    expected = (signal.wallet, signal.token_in, signal.amount_in_raw,
+                                signal.evidence.get("order_id"))
+                    if candidate == expected:
+                        matches.append(item)
+                except Exception:
+                    continue
+            signal.evidence["matching_deposit_order_events"] = len(matches)
+            if len(matches) == 1:
+                signal.evidence["solver_order_status"] = "source_deposit_evidenced"
+            else:
+                signal.stage = "needs_review"
+                signal.evidence["solver_order_status"] = "deposit_event_not_uniquely_proven"
+                signal.reasons.append("deposit_order_event_not_uniquely_matched")
         if signal.behavior not in TRADE_BEHAVIORS:
             # Outer/UserOp success does not prove each allow-failure subcall succeeded.
             continue
         swap_logs = [log for log in local_logs if log.get("topics") and log["topics"][0] in SWAPS]
-        matching = [log for log in swap_logs if (
-            signal.protocol == "v4" and log["address"].lower() == R.V4_MANAGER
-            and SWAPS[log["topics"][0]] == "v4" and len(log["topics"]) >= 2
-            and log["topics"][1].lower() == signal.pool_id
-        )]
+        check = (pool_checks or {}).get(signal.event_id)
+        if signal.protocol in ("v2", "v3"):
+            signal.evidence["pool_verification"] = check or {
+                "verified": False, "reason": "historical_pool_verification_unavailable"}
+            expected_pools = [item["address"] for item in (check or {}).get("pools", [])]
+            matching = [log for log in swap_logs if (
+                check and check.get("verified") and SWAPS[log["topics"][0]] == signal.protocol
+                and log.get("address", "").lower() in expected_pools
+            )]
+        else:
+            expected_pools = []
+            expected_v4_ids = ([signal.pool_id] if signal.pool_id else
+                               signal.evidence.get("v4_pool_ids", []))
+            signal.evidence["pool_verification"] = check or {
+                "verified": False, "reason": "historical_pool_verification_unavailable"}
+            matching = [log for log in swap_logs if (
+                signal.protocol == "v4" and check and check.get("verified")
+                and log["address"].lower() == R.V4_MANAGER
+                and SWAPS[log["topics"][0]] == "v4" and len(log["topics"]) >= 2
+                and log["topics"][1].lower() in expected_v4_ids
+            )]
         signal.evidence["swap_event_count_in_scope"] = len(swap_logs)
-        signal.evidence["matching_v4_pool_events"] = len(matching)
+        signal.evidence["matching_pool_events"] = len(matching)
         if not swap_logs:
             signal.stage = "needs_review"
             signal.reasons.append("no_swap_event_in_this_operation")
             continue
         if signal.protocol in ("v2", "v3"):
-            signal.stage = "needs_review"
-            signal.reasons.append("v2_v3_factory_pool_verification_not_implemented")
-            continue
+            if not check or not check.get("verified"):
+                signal.stage = "needs_review"
+                signal.reasons.append("v2_v3_factory_pool_not_verified")
+                continue
+            matched_addresses = Counter(log.get("address", "").lower() for log in matching)
+            if matched_addresses != Counter(expected_pools):
+                signal.stage = "needs_review"
+                signal.reasons.append("verified_pool_swap_events_not_exactly_matched")
+                continue
+        elif signal.protocol == "v4":
+            if not check or not check.get("verified"):
+                signal.stage = "needs_review"
+                signal.reasons.append("v4_pool_or_hook_not_verified")
+                continue
+            if Counter(log["topics"][1].lower() for log in matching) != Counter(expected_v4_ids):
+                signal.stage = "needs_review"
+                signal.reasons.append("verified_v4_pool_swap_events_not_exactly_matched")
+                continue
+            settlement = signal.evidence.get("v4_settlement_actions", [])
+            payers = [item for item in settlement
+                      if item.get("action") in {"SETTLE", "SETTLE_ALL"}
+                      and item.get("currency") == signal.token_in and item.get("payer_is_user")]
+            takes = [item for item in settlement
+                     if item.get("action") in {"TAKE", "TAKE_ALL"}
+                     and item.get("currency") == signal.token_out
+                     and item.get("recipient") == signal.wallet]
+            signal.evidence["v4_settlement_input_matches"] = len(payers)
+            signal.evidence["v4_settlement_output_matches"] = len(takes)
+            if len(payers) != 1 or len(takes) != 1:
+                signal.stage = "needs_review"
+                signal.reasons.append("v4_wallet_settlement_not_uniquely_proven")
+                continue
+            signal.recipient = signal.wallet
+            signal.evidence["recipient_requires_settlement_check"] = False
         group = (signal.wallet, signal.userop_index)
-        if trade_counts[group] != 1 or group in uncertain_groups or len(matching) != 1 or len(swap_logs) != 1:
+        required_swap_events = (len(expected_pools) if signal.protocol in ("v2", "v3")
+                                else len(expected_v4_ids))
+        if (trade_counts[group] != 1 or group in uncertain_groups
+                or len(matching) != required_swap_events or len(swap_logs) != required_swap_events):
             signal.stage = "needs_review"
             signal.reasons.append("swap_attribution_ambiguous")
             continue
         net = signal.evidence["wallet_erc20_deltas_raw"]
-        spent = int(net.get(signal.token_in, "0")) < 0
-        received = int(net.get(signal.token_out, "0")) > 0
+        native = (native_checks or {}).get(signal.event_id)
         if R.NATIVE in (signal.token_in, signal.token_out):
+            signal.evidence["native_flow_verification"] = native or {
+                "verified": False, "reason": "native_state_diff_unavailable"}
+        native_delta = int((native or {}).get("wallet_native_asset_delta_raw", "0"))
+        if (native and native.get("verified") and R.NATIVE in (signal.token_in, signal.token_out)
+                and not native.get("wallet_is_outer_transaction_sender")):
+            pool_delta = None
+            if signal.protocol == "v4" and len(matching) == 1:
+                try:
+                    amount0, amount1, *_ = decode(
+                        ["int128", "int128", "uint160", "uint128", "int24", "uint24"],
+                        bytes.fromhex(matching[0]["data"][2:]))
+                    key = signal.evidence.get("pool_key", [])
+                    if len(key) == 5:
+                        pool_delta = amount0 if key[0] == R.NATIVE else amount1 if key[1] == R.NATIVE else None
+                except Exception:
+                    pool_delta = None
+            native["native_matches_v4_pool_delta"] = (
+                pool_delta is not None and abs(native_delta) == abs(pool_delta))
+            if not native["native_matches_v4_pool_delta"]:
+                native["verified"] = False
+                native["reason"] = "bundled_native_flow_not_separable_from_gas_or_hook"
+        spent = native_delta < 0 if signal.token_in == R.NATIVE else int(net.get(signal.token_in, "0")) < 0
+        received = native_delta > 0 if signal.token_out == R.NATIVE else int(net.get(signal.token_out, "0")) > 0
+        if R.NATIVE in (signal.token_in, signal.token_out) and not (native and native.get("verified")):
             signal.stage = "needs_review"
             signal.reasons.append("native_net_flows_require_trace_or_state_accounting")
         elif spent and received:
             signal.stage = "swap_evidenced"
-            signal.evidence["actual_input_debit_raw"] = str(-int(net[signal.token_in]))
-            signal.evidence["actual_output_credit_raw"] = net[signal.token_out]
+            signal.evidence["actual_input_debit_raw"] = (
+                str(-native_delta) if signal.token_in == R.NATIVE else str(-int(net[signal.token_in])))
+            signal.evidence["actual_output_credit_raw"] = (
+                str(native_delta) if signal.token_out == R.NATIVE else net[signal.token_out])
             signal.reasons.append("receipt_level_evidence_not_finality_or_live_trade_approval")
         else:
             signal.stage = "needs_review"

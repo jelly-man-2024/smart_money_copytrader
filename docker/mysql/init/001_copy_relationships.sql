@@ -1,0 +1,41 @@
+CREATE TABLE IF NOT EXISTS copy_relationships (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    follower_wallet CHAR(42) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    follower_label VARCHAR(100) NOT NULL,
+    smart_wallet CHAR(42) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    smart_wallet_label VARCHAR(100) NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    run_mode VARCHAR(16) NOT NULL DEFAULT 'paper',
+    strategy_version VARCHAR(100) NOT NULL,
+    trigger_mode VARCHAR(32) NOT NULL DEFAULT 'swap_evidenced',
+    shadow_trigger_modes JSON NOT NULL,
+    quote_policy JSON NOT NULL,
+    allowed_protocols JSON NOT NULL,
+    allowed_assets JSON NOT NULL,
+    allowed_routes JSON NOT NULL,
+    usdg_rule_mode VARCHAR(16) NOT NULL,
+    usdg_fixed_amount_raw VARCHAR(80) NULL,
+    usdg_ratio_ppm INT UNSIGNED NULL,
+    usdg_budget_limit_raw VARCHAR(80) NOT NULL,
+    eth_rule_mode VARCHAR(16) NOT NULL,
+    eth_fixed_amount_raw VARCHAR(80) NULL,
+    eth_ratio_ppm INT UNSIGNED NULL,
+    eth_budget_limit_raw VARCHAR(80) NOT NULL,
+    sell_rule_mode VARCHAR(16) NOT NULL DEFAULT 'proportional',
+    sell_fixed_amount_raw VARCHAR(80) NULL,
+    sell_ratio_ppm INT UNSIGNED NULL,
+    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_copy_relationship (follower_wallet, smart_wallet),
+    KEY ix_copy_relationship_enabled_smart (enabled, smart_wallet),
+    CONSTRAINT chk_copy_relationship_mode CHECK (run_mode = 'paper'),
+    CONSTRAINT chk_copy_relationship_trigger CHECK
+      (trigger_mode IN ('feed_intent', 'receipt_success', 'swap_evidenced')),
+    CONSTRAINT chk_copy_relationship_usdg_mode CHECK
+      (usdg_rule_mode IN ('fixed', 'proportional')),
+    CONSTRAINT chk_copy_relationship_eth_mode CHECK
+      (eth_rule_mode IN ('fixed', 'proportional')),
+    CONSTRAINT chk_copy_relationship_sell_mode CHECK
+      (sell_rule_mode IN ('fixed', 'proportional'))
+) ENGINE=InnoDB;

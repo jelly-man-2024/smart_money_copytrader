@@ -11,6 +11,7 @@ PACKED_OPS = "(address,uint256,bytes,bytes,bytes32,uint256,bytes32,bytes,bytes)[
 CALLS = "(address,uint256,bytes)[]"
 RELAY_CALLS = "(address,bool,uint256,bytes)[]"
 POOL_KEY = "(address,address,uint24,int24,address)"
+V4_PATH_KEY = "(address,uint24,int24,address,bytes)"
 
 
 def selector(signature: str) -> bytes:
@@ -25,11 +26,27 @@ def side(token_in: str, token_out: str) -> str:
     return "TOKEN_SWAP"
 
 
-def v3_path(data: bytes, exact_in: bool) -> tuple[str, str]:
+def v3_hops(data: bytes, exact_in: bool) -> list[dict]:
     if len(data) < 43 or (len(data) - 20) % 23:
         raise ValueError("invalid V3 path")
-    start, end = "0x" + data[:20].hex(), "0x" + data[-20:].hex()
-    return (start, end) if exact_in else (end, start)
+    tokens = [address("0x" + data[:20].hex())]
+    fees = []
+    offset = 20
+    while offset < len(data):
+        fees.append(int.from_bytes(data[offset:offset + 3], "big"))
+        tokens.append(address("0x" + data[offset + 3:offset + 23].hex()))
+        offset += 23
+    hops = [{"token_in": a, "token_out": b, "fee": fee}
+            for a, b, fee in zip(tokens, tokens[1:], fees)]
+    if exact_in:
+        return hops
+    return [{"token_in": hop["token_out"], "token_out": hop["token_in"], "fee": hop["fee"]}
+            for hop in reversed(hops)]
+
+
+def v3_path(data: bytes, exact_in: bool) -> tuple[str, str]:
+    hops = v3_hops(data, exact_in)
+    return hops[0]["token_in"], hops[-1]["token_out"]
 
 
 class Decoder:
@@ -136,6 +153,21 @@ class Decoder:
                     emit(wallet, mode, path, to, data, "CLAIM", op, recipient=recipient)
                     return
 
+                if to == R.WETH:
+                    if sel == bytes.fromhex("d0e30db0") and not args and value > 0:
+                        emit(wallet, mode, path, to, data, "WRAP_NATIVE", op,
+                             token_in=R.NATIVE, token_out=R.WETH,
+                             amount_in_raw=str(value), recipient=wallet,
+                             reasons=["wrap_is_asset_conversion_not_purchase"])
+                        return
+                    if sel == bytes.fromhex("2e1a7d4d"):
+                        amount = decode(["uint256"], args)[0]
+                        emit(wallet, mode, path, to, data, "UNWRAP_WETH", op,
+                             token_in=R.WETH, token_out=R.NATIVE,
+                             amount_in_raw=str(amount), recipient=wallet,
+                             reasons=["unwrap_is_asset_conversion_not_sale"])
+                        return
+
                 if to == R.V3_ROUTER and sel in {bytes.fromhex("ac9650d8"), bytes.fromhex("5ae401dc")}:
                     calls = decode(["bytes[]"], args)[0] if sel.hex() == "ac9650d8" else decode(["uint256", "bytes[]"], args)[1]
                     if len(calls) > 256:
@@ -187,8 +219,9 @@ class Decoder:
                     if sel in {bytes.fromhex("b858183f"), bytes.fromhex("09b81346")}:
                         route, recipient, amount, limit = decode(["(bytes,address,uint256,uint256)"], args)[0]
                         exact = sel.hex() == "b858183f"
-                        a, b = v3_path(route, exact)
-                        swap(wallet, mode, path, to, data, op, a, b, amount, limit, recipient, "v3", exact)
+                        hops = v3_hops(route, exact)
+                        swap(wallet, mode, path, to, data, op, hops[0]["token_in"], hops[-1]["token_out"],
+                             amount, limit, recipient, "v3", exact, evidence={"hops": hops})
                         return
 
                 if to == R.UNIVERSAL_ROUTER and sel in {bytes.fromhex("3593564c"), bytes.fromhex("24856bc3")}:
@@ -206,7 +239,8 @@ class Decoder:
                             recipient, amount, limit, route, payer_user = decode(
                                 ["address", "uint256", "uint256", route_type, "bool"], body)
                             if cmd in (0, 1):
-                                a, b = v3_path(route, exact)
+                                hops = v3_hops(route, exact)
+                                a, b = hops[0]["token_in"], hops[-1]["token_out"]
                             else:
                                 if len(route) < 2:
                                     raise ValueError("invalid V2 route")
@@ -217,11 +251,39 @@ class Decoder:
                                 recipient = to
                             swap(wallet, mode, subpath, to, data, op, a, b, amount, limit, recipient,
                                  "v3" if cmd in (0, 1) else "v2", exact,
-                                 evidence={"allow_revert": bool(command & 0x80), "payer_is_user": payer_user})
+                                 evidence={"allow_revert": bool(command & 0x80), "payer_is_user": payer_user,
+                                           **({"hops": hops} if cmd in (0, 1) else {"route": list(route)})})
                         elif cmd == 0x10:
                             actions, params = decode(["bytes", "bytes[]"], body)
                             if len(actions) != len(params) or len(actions) > 256:
                                 raise ValueError("invalid V4 actions")
+                            settlement = []
+                            for settlement_action, settlement_param in zip(actions, params):
+                                if settlement_action == 0x0b:
+                                    currency, amount, payer_user = decode(
+                                        ["address", "uint256", "bool"], settlement_param)
+                                    settlement.append({"action": "SETTLE", "currency": address(currency),
+                                                       "amount_raw": str(amount),
+                                                       "payer_is_user": bool(payer_user)})
+                                elif settlement_action == 0x0c:
+                                    currency, max_amount = decode(["address", "uint256"], settlement_param)
+                                    settlement.append({"action": "SETTLE_ALL", "currency": address(currency),
+                                                       "max_amount_raw": str(max_amount), "payer_is_user": True})
+                                elif settlement_action == 0x0e:
+                                    currency, settlement_recipient, amount = decode(
+                                        ["address", "address", "uint256"], settlement_param)
+                                    if settlement_recipient == "0x" + "0" * 39 + "1":
+                                        settlement_recipient = caller or wallet
+                                    elif settlement_recipient == "0x" + "0" * 39 + "2":
+                                        settlement_recipient = to
+                                    settlement.append({"action": "TAKE", "currency": address(currency),
+                                                       "recipient": address(settlement_recipient),
+                                                       "amount_raw": str(amount)})
+                                elif settlement_action == 0x0f:
+                                    currency, min_amount = decode(["address", "uint256"], settlement_param)
+                                    settlement.append({"action": "TAKE_ALL", "currency": address(currency),
+                                                       "recipient": address(caller or wallet),
+                                                       "min_amount_raw": str(min_amount)})
                             for j, (action, param) in enumerate(zip(actions, params)):
                                 actionpath = subpath + f"/action/{j}"
                                 if action in (6, 8):
@@ -235,9 +297,54 @@ class Decoder:
                                                 pool_id="0x" + keccak(encode([POOL_KEY], [key])).hex(),
                                                 evidence={"pool_key": list(key), "hook_data": "0x" + hook_data.hex(),
                                                           "min_hop_price_x36": str(min_price),
+                                                          "v4_settlement_actions": settlement,
                                                           "recipient_requires_settlement_check": True})
                                     if key[4] != R.NATIVE:
-                                        item.reasons.append("nonzero_hook_requires_review")
+                                        item.reasons.append("nonzero_hook_requires_historical_code_check")
+                                elif action in (7, 9):
+                                    if action == 7:
+                                        currency, path_keys, min_prices, amount, limit = decode(
+                                            ["address", f"{V4_PATH_KEY}[]", "uint256[]", "uint128", "uint128"],
+                                            param)
+                                        current = address(currency)
+                                        hops = []
+                                        for path_key in path_keys:
+                                            output = address(path_key[0])
+                                            currency0, currency1 = sorted((current, output))
+                                            hops.append({"token_in": current, "token_out": output,
+                                                         "pool_key": [currency0, currency1, path_key[1],
+                                                                      path_key[2], address(path_key[3])],
+                                                         "hook_data": "0x" + path_key[4].hex()})
+                                            current = output
+                                        token_in, token_out, exact = address(currency), current, True
+                                    else:
+                                        currency, path_keys, min_prices, amount, limit = decode(
+                                            ["address", f"{V4_PATH_KEY}[]", "uint256[]", "uint128", "uint128"],
+                                            param)
+                                        current = address(currency)
+                                        reverse_hops = []
+                                        for path_key in reversed(path_keys):
+                                            input_currency = address(path_key[0])
+                                            currency0, currency1 = sorted((input_currency, current))
+                                            reverse_hops.append({"token_in": input_currency, "token_out": current,
+                                                                 "pool_key": [currency0, currency1, path_key[1],
+                                                                              path_key[2], address(path_key[3])],
+                                                                 "hook_data": "0x" + path_key[4].hex()})
+                                            current = input_currency
+                                        hops = list(reversed(reverse_hops))
+                                        token_in, token_out, exact = current, address(currency), False
+                                    if not hops or len(min_prices) not in (0, len(hops)):
+                                        raise ValueError("invalid V4 multi-hop path")
+                                    pool_ids = ["0x" + keccak(encode([POOL_KEY], [hop["pool_key"]])).hex()
+                                                for hop in hops]
+                                    item = swap(wallet, mode, actionpath, to, data, op, token_in, token_out,
+                                                amount, limit, None, "v4", exact,
+                                                evidence={"v4_hops": hops, "v4_pool_ids": pool_ids,
+                                                          "min_hop_price_x36": [str(v) for v in min_prices],
+                                                          "v4_settlement_actions": settlement,
+                                                          "recipient_requires_settlement_check": True})
+                                    if any(hop["pool_key"][4] != R.NATIVE for hop in hops):
+                                        item.reasons.append("nonzero_hook_requires_historical_code_check")
                                 elif action not in (0x0b, 0x0c, 0x0e, 0x0f):
                                     emit(wallet, mode, actionpath, to, data, "UNKNOWN", op,
                                          reasons=[f"unsupported_v4_action:{action}"])

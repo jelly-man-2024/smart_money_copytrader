@@ -1,5 +1,10 @@
 # 初版验证记录
 
+本文保留 2026-09-09 初版证据。服务器上的后续 M2 与纸面跟单验证见
+[SERVER_VALIDATION_2026-09-11.md](SERVER_VALIDATION_2026-09-11.md) 和
+[SERVER_VALIDATION_2026-09-12.md](SERVER_VALIDATION_2026-09-12.md)；当前测试数和能力边界以
+后两份记录及实际代码为准。
+
 日期：2026-09-09。Python 3.10.12，Linux x86_64。
 
 ## 离线

@@ -1,0 +1,44 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: smart-money-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: smart_money
+      MYSQL_USER: smart_money
+      MYSQL_PASSWORD: ${SMART_MONEY_MYSQL_PASSWORD:-local-paper-only}
+      MYSQL_ROOT_PASSWORD: ${SMART_MONEY_MYSQL_ROOT_PASSWORD:-local-root-only}
+    ports:
+      - "127.0.0.1:3308:3306"
+    volumes:
+      - smart_money_mysql:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u smart_money -p$${MYSQL_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  key_mysql:
+    image: mysql:8.4
+    container_name: smart-money-key-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: smart_money_keys
+      MYSQL_USER: smart_money_key_admin
+      MYSQL_PASSWORD: ${SMART_MONEY_KEY_MYSQL_ADMIN_PASSWORD:-local-key-admin-only}
+      MYSQL_ROOT_PASSWORD: ${SMART_MONEY_KEY_MYSQL_ROOT_PASSWORD:-local-key-root-only}
+    ports:
+      - "127.0.0.1:3309:3306"
+    volumes:
+      - smart_money_key_mysql:/var/lib/mysql
+      - ./docker/key-mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u smart_money_key_admin -p$${MYSQL_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  smart_money_mysql:
+  smart_money_key_mysql:

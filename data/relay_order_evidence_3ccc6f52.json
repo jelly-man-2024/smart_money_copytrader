@@ -1,0 +1,69 @@
+{
+  "provenance": {
+    "source": "Relay public GET /requests/v2 filtered by orderId",
+    "retrieved_date_utc": "2026-09-11",
+    "url_query": "orderId=0x3ccc6f523a4b8267ff619f83ba05f513f6e1afce40d67451d9e384a80278826f&includeOrderData=true&limit=2",
+    "note": "Compact field-preserving fixture; API response reported success. Destination-chain execution is not independently verified by this fixture."
+  },
+  "requests": [
+    {
+      "id": "0x1788811826f070e4f88d2a60bb1dd8c3514fcce3f4ed9dd0d7526b92af7832c9",
+      "status": "success",
+      "user": "0x0a6ebed0155edb4b21d92ad02897a626cd90119e",
+      "recipient": "2heJbC32Tpfcb3nbUb5ER61K11FGZVfVGtVnDm6LDogF",
+      "data": {
+        "inTxs": [
+          {
+            "hash": "0xffa84ef03c5415c9d6fcd33909b3c25e675a7780b2b0802ce4ffa7617d99f277",
+            "chainId": 4663,
+            "status": "success"
+          }
+        ],
+        "outTxs": [
+          {
+            "hash": "5M8GEDm1BeAgHgP9qYUu7VoCRSKT5JggQ6QJhQqFdd3uxzrk8dQVwNzEsgd5QV7LCwqgUCUSo1No4ffBrRGCLL96",
+            "chainId": 792703809,
+            "status": "success",
+            "stateChanges": [
+              {
+                "address": "2heJbC32Tpfcb3nbUb5ER61K11FGZVfVGtVnDm6LDogF",
+                "change": {
+                  "kind": "token",
+                  "balanceDiff": "173879072",
+                  "data": {
+                    "tokenKind": "ft",
+                    "tokenAddress": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "protocol": {
+        "orderId": "0x3ccc6f523a4b8267ff619f83ba05f513f6e1afce40d67451d9e384a80278826f",
+        "deposit": {
+          "origin": {
+            "amount": "173943711",
+            "chainId": 4663,
+            "currency": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+            "depositor": "0x0a6ebed0155edb4b21d92ad02897a626cd90119e",
+            "depository": "0x4cd00e387622c35bddb9b4c962c136462338bc31",
+            "transactionId": "0xffa84ef03c5415c9d6fcd33909b3c25e675a7780b2b0802ce4ffa7617d99f277"
+          }
+        },
+        "settlement": {
+          "destination": {
+            "fills": [
+              {
+                "chainId": 792703809,
+                "transactionId": "5M8GEDm1BeAgHgP9qYUu7VoCRSKT5JggQ6QJhQqFdd3uxzrk8dQVwNzEsgd5QV7LCwqgUCUSo1No4ffBrRGCLL96"
+              }
+            ],
+            "refunds": []
+          }
+        }
+      }
+    }
+  ]
+}

@@ -3,25 +3,60 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter
+from contextlib import redirect_stdout
 from copy import deepcopy
 from dataclasses import replace
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from eth_abi import encode
+from eth_abi import decode, encode
 from eth_account import Account
 from eth_utils import to_checksum_address
 
 from smart_money import registry as R
-from smart_money.cli import LatencySamples, dispatch_pending
-from smart_money.decode import CALLS, PACKED_OPS, POOL_KEY, Decoder, selector, v3_path
+from smart_money.account_state import prestate_implementations
+from smart_money.backfill import BlockScanner, ReorgDetected
+from smart_money.cli import (
+    LatencySamples, coverage_summary, dispatch_pending, execution_track,
+    parser as cli_parser,
+)
+from smart_money.config import load_endpoint_env
+from smart_money.decode import CALLS, PACKED_OPS, POOL_KEY, V4_PATH_KEY, Decoder, selector, v3_hops, v3_path
 from smart_money.feed import DecodeError, FeedHealth, decode_raw, envelopes, signed_transactions
+from smart_money.execution_prep import (
+    ReadOnlyExecutionPreflight, UnsignedExecutionPlan, build_execution_plan,
+)
+from smart_money.execution_pipeline import (
+    ExecutionPreparer, OfflineExecutionSigner, ReadOnlyPreBroadcastReviewer,
+)
+from smart_money.execution_receipts import ReadOnlyExecutionTracker
+from smart_money.execution_controls import (
+    require_mainnet_broadcast_enabled, require_offline_signing_enabled,
+)
+from smart_money.key_source import OfflineDatabaseSigner, key_record_status
 from smart_money.models import Signal, Transaction
+from smart_money.mysql_config import (
+    MySqlRelationshipGate, import_watchlist_relationships, load_mysql_paper_config,
+    mysql_connection, rows_to_document,
+)
+from smart_money.native_flows import verify_native_flows
+from smart_money.pools import verify_signal_pools
+from smart_money.paper import (
+    AmountRule, PaperEngine, PaperExecutor, PaperValuator, budget_bucket,
+    planned_input_amount, reverse_quote_signal, scope_reason, signal_route_key,
+    trigger_allowed,
+)
+from smart_money.paper_config import load_paper_config
+from smart_money.quotes import LiveQuoter, Quote, QuotePolicy, assess_quote, validate_quote
 from smart_money.receipts import BEFORE, SWAPS, TRANSFER, USEROP, TRADE_BEHAVIORS, enrich
 from smart_money.rpc import ReadOnlyRpc
+from smart_money.solver import relay_delivery_evidence
 from smart_money.store import MAX_CANDIDATE_ATTEMPTS, Store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +64,11 @@ A = "0x" + "11" * 20
 B = "0x" + "22" * 20
 TOKEN = "0x" + "33" * 20
 TXHASH = "0x" + "aa" * 32
+OFFLINE_ENV = {
+    'SMART_MONEY_EMERGENCY_STOP': '0',
+    'SMART_MONEY_EXECUTION_MODE': 'offline_test',
+    'SMART_MONEY_SIGNING_MODE': 'offline_test',
+}
 
 
 def tx(data, to=A, sender=A):
@@ -45,10 +85,41 @@ def v2_swap():
 
 
 def v4_swap():
-    key = (R.USDG, TOKEN, 3000, 60, R.NATIVE)
-    param = encode([f"({POOL_KEY},bool,uint128,uint128,uint256,bytes)"], [(key, True, 100, 90, 0, b"")])
+    key = (TOKEN, R.USDG, 3000, 60, R.NATIVE)
+    param = encode([f"({POOL_KEY},bool,uint128,uint128,uint256,bytes)"], [(key, False, 100, 90, 0, b"")])
     action = encode(["bytes", "bytes[]"], [b"\x06", [param]])
     return bytes.fromhex("3593564c") + encode(["bytes", "bytes[]", "uint256"], [b"\x10", [action], 2000000000])
+
+
+def v4_settled_swap(recipient=A):
+    key = (TOKEN, R.USDG, 3000, 60, R.NATIVE)
+    swap_param = encode([f"({POOL_KEY},bool,uint128,uint128,uint256,bytes)"],
+                        [(key, False, 100, 90, 0, b"")])
+    settle = encode(["address", "uint256", "bool"], [R.USDG, 100, True])
+    take = encode(["address", "address", "uint256"], [TOKEN, recipient, 0])
+    action = encode(["bytes", "bytes[]"], [b"\x06\x0b\x0e", [swap_param, settle, take]])
+    return bytes.fromhex("3593564c") + encode(
+        ["bytes", "bytes[]", "uint256"], [b"\x10", [action], 2000000000])
+
+
+def v4_multihop(exact_in=True):
+    middle = "0x" + "44" * 20
+    if exact_in:
+        path = [(middle, 500, 10, R.NATIVE, b""), (TOKEN, 3000, 60, R.NATIVE, b"")]
+        swap_param = encode(["address", f"{V4_PATH_KEY}[]", "uint256[]", "uint128", "uint128"],
+                            [R.USDG, path, [], 100, 90])
+        action_id = 7
+    else:
+        path = [(R.USDG, 500, 10, R.NATIVE, b""), (middle, 3000, 60, R.NATIVE, b"")]
+        swap_param = encode(["address", f"{V4_PATH_KEY}[]", "uint256[]", "uint128", "uint128"],
+                            [TOKEN, path, [], 90, 100])
+        action_id = 9
+    settle = encode(["address", "uint256"], [R.USDG, 100])
+    take = encode(["address", "uint256"], [TOKEN, 90])
+    action = encode(["bytes", "bytes[]"],
+                    [bytes([action_id, 0x0c, 0x0f]), [swap_param, settle, take]])
+    return bytes.fromhex("3593564c") + encode(
+        ["bytes", "bytes[]", "uint256"], [b"\x10", [action], 2000000000])
 
 
 def batch(calls):
@@ -104,6 +175,25 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(signal.behavior, "BUY")
         self.assertEqual(signal.evidence["min_hop_price_x36"], "0")
 
+    def test_v4_settlement_recipient_is_preserved(self):
+        signal = self.decoder.decode(tx(v4_settled_swap(), R.UNIVERSAL_ROUTER))[0]
+        self.assertEqual(signal.evidence["v4_settlement_actions"][1]["recipient"], A)
+
+    def test_v4_exact_in_multihop_preserves_every_pool(self):
+        signal = self.decoder.decode(tx(v4_multihop(True), R.UNIVERSAL_ROUTER))[0]
+        self.assertEqual((signal.token_in, signal.token_out, signal.exact_in),
+                         (R.USDG, TOKEN, True))
+        self.assertEqual(len(signal.evidence["v4_hops"]), 2)
+        self.assertEqual(len(signal.evidence["v4_pool_ids"]), 2)
+        self.assertEqual(signal.evidence["v4_hops"][0]["token_out"], "0x" + "44" * 20)
+
+    def test_v4_exact_out_multihop_restores_logical_route(self):
+        signal = self.decoder.decode(tx(v4_multihop(False), R.UNIVERSAL_ROUTER))[0]
+        self.assertEqual((signal.token_in, signal.token_out, signal.exact_in),
+                         (R.USDG, TOKEN, False))
+        self.assertEqual([hop["token_in"] for hop in signal.evidence["v4_hops"]],
+                         [R.USDG, "0x" + "44" * 20])
+
     def test_claim_then_swap_preserved(self):
         data = batch([(R.RIPE_CLAIM, 0, claim()), (R.V2_ROUTER, 0, v2_swap())])
         signals = self.decoder.decode(tx(data))
@@ -138,6 +228,18 @@ class DecodeTests(unittest.TestCase):
         body = bytes.fromhex("e8017952") + encode(["address", "address", "uint256", "bytes32"], [A, R.USDG, 123, bytes(32)])
         self.assertEqual(self.decoder.decode(tx(body, R.DEPOSITORY))[0].behavior, "INTENT_DEPOSIT")
 
+    def test_weth_wrap_is_not_buy_and_preserves_raw_value(self):
+        source = replace(tx(bytes.fromhex("d0e30db0"), R.WETH), value=123)
+        signal = self.decoder.decode(source)[0]
+        self.assertEqual((signal.behavior, signal.amount_in_raw), ("WRAP_NATIVE", "123"))
+        self.assertFalse(signal.copy_eligible)
+
+    def test_weth_unwrap_is_not_sell(self):
+        data = bytes.fromhex("2e1a7d4d") + encode(["uint256"], [123])
+        signal = self.decoder.decode(tx(data, R.WETH))[0]
+        self.assertEqual((signal.behavior, signal.amount_in_raw), ("UNWRAP_WETH", "123"))
+        self.assertNotEqual(signal.behavior, "SELL")
+
     def test_metamask_batch(self):
         decoder = Decoder({A: {}}, {A: R.METAMASK_ACCOUNT})
         body = bytes.fromhex("e9ae5c53") + encode(["bytes32", "bytes"], [b"\x01" + bytes(31), encode([CALLS], [[(R.RIPE_CLAIM, 0, claim())]])])
@@ -146,6 +248,17 @@ class DecodeTests(unittest.TestCase):
     def test_exact_out_v3_path_reversed(self):
         raw = bytes.fromhex(TOKEN[2:]) + (3000).to_bytes(3, "big") + bytes.fromhex(R.USDG[2:])
         self.assertEqual(v3_path(raw, False), (R.USDG, TOKEN))
+
+    def test_v3_multihop_preserves_execution_order_and_fees(self):
+        middle = "0x" + "44" * 20
+        raw = (bytes.fromhex(R.USDG[2:]) + (500).to_bytes(3, "big") + bytes.fromhex(middle[2:])
+               + (3000).to_bytes(3, "big") + bytes.fromhex(TOKEN[2:]))
+        self.assertEqual(v3_hops(raw, True), [
+            {"token_in": R.USDG, "token_out": middle, "fee": 500},
+            {"token_in": middle, "token_out": TOKEN, "fee": 3000},
+        ])
+        self.assertEqual(v3_hops(raw, False)[0],
+                         {"token_in": TOKEN, "token_out": middle, "fee": 3000})
 
     def test_wrong_chain(self):
         self.assertEqual(self.decoder.decode(replace(tx(v2_swap(), R.V2_ROUTER), chain_id=1)), [])
@@ -218,6 +331,64 @@ class FeedTests(unittest.TestCase):
 
 
 class ReceiptTests(unittest.TestCase):
+    def test_weth_wrap_requires_exact_wallet_credit(self):
+        source = replace(tx(bytes.fromhex("d0e30db0"), R.WETH), value=123)
+        signal = Decoder({A: {}}).decode(source)[0]
+        result = enrich(source, [signal], receipt([transfer(R.WETH, R.NATIVE, A, 123)]), {A: {}})[0]
+        self.assertEqual((result.behavior, result.stage), ("WRAP_NATIVE", "execution_observed"))
+        self.assertEqual(result.evidence["actual_output_credit_raw"], "123")
+        self.assertFalse(result.copy_eligible)
+
+        signal = Decoder({A: {}}).decode(source)[0]
+        mismatch = enrich(source, [signal], receipt([transfer(R.WETH, R.NATIVE, A, 122)]), {A: {}})[0]
+        self.assertEqual(mismatch.stage, "needs_review")
+
+    def test_native_state_diff_closes_v4_buy_without_counting_gas(self):
+        source = tx(b"", R.UNIVERSAL_ROUTER)
+        pool_id = "0x" + "66" * 32
+        signal = Signal(TXHASH, A, "self", "BUY", "v4/native", R.UNIVERSAL_ROUTER, "0x",
+                        token_in=R.NATIVE, token_out=TOKEN, protocol="v4", pool_id=pool_id,
+                        evidence={"pool_key": [R.NATIVE, TOKEN, 3000, 60, R.NATIVE],
+                                  "v4_settlement_actions": [
+                                      {"action": "SETTLE_ALL", "currency": R.NATIVE,
+                                       "payer_is_user": True},
+                                      {"action": "TAKE_ALL", "currency": TOKEN,
+                                       "recipient": A}]})
+        swap_topic = next(t for t, protocol in SWAPS.items() if protocol == "v4")
+        logs = [log(R.V4_MANAGER, [swap_topic, pool_id, addr_topic(R.UNIVERSAL_ROUTER)]),
+                transfer(TOKEN, R.V4_MANAGER, A, 95)]
+        checks = {signal.event_id: {"verified": True, "pool_id": pool_id}}
+        native = {signal.event_id: {"verified": True, "wallet_is_outer_transaction_sender": True,
+                                    "wallet_native_asset_delta_raw": "-100"}}
+        result = enrich(source, [signal], receipt(logs), {A: {}}, checks, native)[0]
+        self.assertEqual(result.stage, "swap_evidenced")
+        self.assertEqual(result.evidence["actual_input_debit_raw"], "100")
+        self.assertEqual(result.evidence["actual_output_credit_raw"], "95")
+
+    def test_bundled_native_flow_requires_matching_v4_pool_delta(self):
+        source = tx(b"", R.UNIVERSAL_ROUTER, B)
+        pool_id = "0x" + "66" * 32
+        signal = Signal(TXHASH, A, "bundled_account", "BUY", "v4/native", R.UNIVERSAL_ROUTER, "0x",
+                        token_in=R.NATIVE, token_out=TOKEN, protocol="v4", pool_id=pool_id,
+                        evidence={"pool_key": [R.NATIVE, TOKEN, 3000, 60, R.NATIVE],
+                                  "v4_settlement_actions": [
+                                      {"action": "SETTLE_ALL", "currency": R.NATIVE,
+                                       "payer_is_user": True},
+                                      {"action": "TAKE_ALL", "currency": TOKEN, "recipient": A}]})
+        swap_topic = next(t for t, protocol in SWAPS.items() if protocol == "v4")
+        swap_data = "0x" + encode(
+            ["int128", "int128", "uint160", "uint128", "int24", "uint24"],
+            [-100, 95, 1, 1, 0, 0]).hex()
+        logs = [log(R.V4_MANAGER, [swap_topic, pool_id, addr_topic(R.UNIVERSAL_ROUTER)], swap_data),
+                transfer(TOKEN, R.V4_MANAGER, A, 95)]
+        pools = {signal.event_id: {"verified": True, "pool_id": pool_id}}
+        native = {signal.event_id: {"verified": True, "wallet_is_outer_transaction_sender": False,
+                                    "wallet_native_asset_delta_raw": "-101"}}
+        result = enrich(source, [signal], receipt(logs), {A: {}}, pools, native)[0]
+        self.assertEqual(result.stage, "needs_review")
+        self.assertEqual(result.evidence["native_flow_verification"]["reason"],
+                         "bundled_native_flow_not_separable_from_gas_or_hook")
+
     def test_other_user_swap_not_attributed(self):
         decoder = Decoder({A: {}}, {A: R.SIMPLE_ACCOUNT})
         source = bundled([op(B, b""), op(A, batch([(R.V2_ROUTER, 0, v2_swap())]))])
@@ -261,6 +432,168 @@ class ReceiptTests(unittest.TestCase):
         signal = enrich(source, Decoder({A: {}}).decode(source), receipt([log(TOKEN, [])]), {A: {}})[0]
         self.assertEqual(signal.stage, "needs_review")
 
+    def test_verified_v2_pool_still_requires_exact_event_and_wallet_flows(self):
+        source = tx(v2_swap(), R.V2_ROUTER)
+        signals = Decoder({A: {}}).decode(source)
+        signal = signals[0]
+        pool = "0x" + "44" * 20
+        swap_topic = next(t for t, protocol in SWAPS.items() if protocol == "v2")
+        logs = [
+            log(pool, [swap_topic]),
+            transfer(R.USDG, A, pool, 100),
+            transfer(TOKEN, pool, A, 95),
+        ]
+        checks = {signal.event_id: {"verified": True, "factory": R.V2_FACTORY,
+                                    "pools": [{"address": pool}]}}
+        result = enrich(source, signals, receipt(logs), {A: {}}, checks)[0]
+        self.assertEqual(result.stage, "swap_evidenced")
+        self.assertEqual(result.evidence["actual_input_debit_raw"], "100")
+        self.assertEqual(result.evidence["actual_output_credit_raw"], "95")
+        self.assertFalse(result.copy_eligible)
+
+    def test_verified_pool_does_not_accept_other_pool_swap(self):
+        source = tx(v2_swap(), R.V2_ROUTER)
+        signals = Decoder({A: {}}).decode(source)
+        signal = signals[0]
+        pool = "0x" + "44" * 20
+        other_pool = "0x" + "55" * 20
+        swap_topic = next(t for t, protocol in SWAPS.items() if protocol == "v2")
+        checks = {signal.event_id: {"verified": True, "pools": [{"address": pool}]}}
+        result = enrich(source, signals, receipt([log(other_pool, [swap_topic])]), {A: {}}, checks)[0]
+        self.assertEqual(result.stage, "needs_review")
+        self.assertIn("verified_pool_swap_events_not_exactly_matched", result.reasons)
+
+    def test_v4_settlement_and_wallet_flows_close_attribution(self):
+        source = tx(v4_settled_swap(), R.UNIVERSAL_ROUTER)
+        signals = Decoder({A: {}}).decode(source)
+        swap_topic = next(t for t, protocol in SWAPS.items() if protocol == "v4")
+        logs = [
+            log(R.V4_MANAGER, [swap_topic, signals[0].pool_id, addr_topic(R.UNIVERSAL_ROUTER)]),
+            transfer(R.USDG, A, R.V4_MANAGER, 100),
+            transfer(TOKEN, R.V4_MANAGER, A, 95),
+        ]
+        checks = {signals[0].event_id: {"verified": True, "manager": R.V4_MANAGER,
+                                       "pool_id": signals[0].pool_id}}
+        result = enrich(source, signals, receipt(logs), {A: {}}, checks)[0]
+        self.assertEqual(result.stage, "swap_evidenced")
+        self.assertEqual(result.recipient, A)
+        self.assertFalse(result.evidence["recipient_requires_settlement_check"])
+
+    def test_v4_take_for_other_recipient_is_not_attributed(self):
+        source = tx(v4_settled_swap(B), R.UNIVERSAL_ROUTER)
+        signals = Decoder({A: {}}).decode(source)
+        swap_topic = next(t for t, protocol in SWAPS.items() if protocol == "v4")
+        logs = [log(R.V4_MANAGER, [swap_topic, signals[0].pool_id,
+                                   addr_topic(R.UNIVERSAL_ROUTER)])]
+        checks = {signals[0].event_id: {"verified": True, "manager": R.V4_MANAGER,
+                                       "pool_id": signals[0].pool_id}}
+        result = enrich(source, signals, receipt(logs), {A: {}}, checks)[0]
+        self.assertEqual(result.stage, "needs_review")
+        self.assertIn("v4_wallet_settlement_not_uniquely_proven", result.reasons)
+
+    def test_v4_multihop_requires_and_accepts_every_exact_pool_event(self):
+        source = tx(v4_multihop(True), R.UNIVERSAL_ROUTER)
+        signal = Decoder({A: {}}).decode(source)[0]
+        swap_topic = next(t for t, protocol in SWAPS.items() if protocol == "v4")
+        logs = [log(R.V4_MANAGER, [swap_topic, pool_id, addr_topic(R.UNIVERSAL_ROUTER)])
+                for pool_id in signal.evidence["v4_pool_ids"]]
+        logs.extend([transfer(R.USDG, A, R.V4_MANAGER, 100),
+                     transfer(TOKEN, R.V4_MANAGER, A, 95)])
+        pools = {signal.event_id: {"verified": True,
+                                  "pool_ids": signal.evidence["v4_pool_ids"]}}
+        result = enrich(source, [signal], receipt(logs), {A: {}}, pools)[0]
+        self.assertEqual(result.stage, "swap_evidenced")
+        self.assertEqual(result.evidence["matching_pool_events"], 2)
+
+        signal = Decoder({A: {}}).decode(source)[0]
+        missing = enrich(source, [signal], receipt(logs[1:]), {A: {}}, pools)[0]
+        self.assertEqual(missing.stage, "needs_review")
+
+
+class PoolVerificationTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def encoded_address(value):
+        return "0x" + encode(["address"], [value]).hex()
+
+    async def test_v4_pool_key_and_manager_are_verified_at_receipt_block(self):
+        signal = Decoder({A: {}}).decode(tx(v4_swap(), R.UNIVERSAL_ROUTER))[0]
+
+        async def rpc_call(method, params=None):
+            self.assertEqual(method, "eth_getCode")
+            self.assertEqual(params, [R.V4_MANAGER, "0x1"])
+            return "0x01"
+
+        checks = await verify_signal_pools(
+            AsyncMock(call=AsyncMock(side_effect=rpc_call)), [signal], receipt())
+        self.assertTrue(checks[signal.event_id]["verified"])
+        self.assertEqual(checks[signal.event_id]["pool_id"], signal.pool_id)
+
+    async def test_native_state_diff_separates_outer_sender_gas(self):
+        signal = Signal(TXHASH, A, "self", "BUY", "native", R.UNIVERSAL_ROUTER, "0x",
+                        token_in=R.NATIVE, token_out=TOKEN, protocol="v4")
+        trace = {"pre": {A: {"balance": "0x3e8"}},
+                 "post": {A: {"balance": "0x2bc"}}}
+        rpc = AsyncMock(call=AsyncMock(return_value=trace))
+        r = receipt()
+        r.update({"gasUsed": "0xa", "effectiveGasPrice": "0x5"})
+        checks = await verify_native_flows(rpc, tx(b"", R.UNIVERSAL_ROUTER), r, [signal])
+        self.assertEqual(checks[signal.event_id]["wallet_native_delta_including_gas_raw"], "-300")
+        self.assertEqual(checks[signal.event_id]["outer_transaction_gas_adjustment_raw"], "50")
+        self.assertEqual(checks[signal.event_id]["wallet_native_asset_delta_raw"], "-250")
+
+    async def test_transaction_prestate_recovers_only_known_delegation(self):
+        unknown = "0x" + "55" * 20
+        trace = {
+            A: {"code": "0xef0100" + R.SIMPLE_ACCOUNT[2:]},
+            B: {"balance": "0x1"},
+            unknown: {"code": "0x6000"},
+        }
+        implementations, missing = await prestate_implementations(
+            AsyncMock(call=AsyncMock(return_value=trace)), TXHASH, [A, B, unknown])
+        self.assertEqual(implementations, {A: R.SIMPLE_ACCOUNT})
+        self.assertEqual(missing, {unknown})
+
+    async def test_v2_factory_pool_and_tokens_verified_at_receipt_block(self):
+        signal = Decoder({A: {}}).decode(tx(v2_swap(), R.V2_ROUTER))[0]
+        pool = "0x" + "44" * 20
+
+        async def rpc_call(method, params=None):
+            if method == "eth_getCode":
+                return "0x01"
+            target, data = params[0]["to"], params[0]["data"][:10]
+            self.assertEqual(params[1], "0x1")
+            if target == R.V2_ROUTER:
+                return self.encoded_address(R.V2_FACTORY)
+            if target == R.V2_FACTORY:
+                return self.encoded_address(pool)
+            if data == "0x0dfe1681":
+                return self.encoded_address(R.USDG)
+            return self.encoded_address(TOKEN)
+
+        checks = await verify_signal_pools(AsyncMock(call=AsyncMock(side_effect=rpc_call)), [signal], receipt())
+        self.assertTrue(checks[signal.event_id]["verified"])
+        self.assertEqual(checks[signal.event_id]["pools"][0]["address"], pool)
+
+    async def test_forged_pool_token_pair_is_rejected(self):
+        signal = Decoder({A: {}}).decode(tx(v2_swap(), R.V2_ROUTER))[0]
+        pool = "0x" + "44" * 20
+
+        async def rpc_call(method, params=None):
+            if method == "eth_getCode":
+                return "0x01"
+            target, data = params[0]["to"], params[0]["data"][:10]
+            if target == R.V2_ROUTER:
+                return self.encoded_address(R.V2_FACTORY)
+            if target == R.V2_FACTORY:
+                return self.encoded_address(pool)
+            if data == "0x0dfe1681":
+                return self.encoded_address(R.USDG)
+            return self.encoded_address(B)
+
+        checks = await verify_signal_pools(AsyncMock(call=AsyncMock(side_effect=rpc_call)), [signal], receipt())
+        self.assertFalse(checks[signal.event_id]["verified"])
+        self.assertEqual(checks[signal.event_id]["reason"], "pool_token_pair_mismatch")
+
     def test_v4_evidence_requires_wallet_flows(self):
         source = tx(v4_swap(), R.UNIVERSAL_ROUTER)
         signals = Decoder({A: {}}).decode(source)
@@ -293,7 +626,7 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual(len(trades), 1)
         self.assertEqual(trades[0].behavior, 'BUY')
         self.assertEqual(trades[0].amount_in_raw, '260000000000000000')
-        self.assertIn('nonzero_hook_requires_review', trades[0].reasons)
+        self.assertIn('nonzero_hook_requires_historical_code_check', trades[0].reasons)
         self.assertFalse(trades[0].copy_eligible)
 
     def test_real_self_sell(self):
@@ -308,6 +641,50 @@ class FixtureTests(unittest.TestCase):
         self.assertEqual([s.behavior for s in signals], ['APPROVAL', 'INTENT_DEPOSIT'])
         self.assertEqual(signals[1].amount_in_raw, '23420301')
         self.assertTrue(signals[1].execution_success)
+        self.assertEqual(signals[1].evidence['solver_order_status'], 'source_deposit_evidenced')
+        self.assertEqual(signals[1].evidence['matching_deposit_order_events'], 1)
+
+    def test_deposit_order_id_requires_matching_receipt_event(self):
+        signals = self.example('0xffa84e')
+        deposit = next(s for s in signals if s.behavior == 'INTENT_DEPOSIT')
+        self.assertEqual(deposit.evidence['solver_order_status'], 'source_deposit_evidenced')
+        bad_receipt = deepcopy(next(
+            row['receipt'] for row in self.examples['examples']
+            if row['transaction']['hash'].startswith('0xffa84e')))
+        event = next(item for item in bad_receipt['logs'] if item['address'].lower() == R.DEPOSITORY)
+        event['data'] = event['data'][:-2] + ('00' if event['data'][-2:] != '00' else '01')
+        row = next(row for row in self.examples['examples']
+                   if row['transaction']['hash'].startswith('0xffa84e'))
+        source = Transaction.from_rpc(row['transaction'])
+        altered = enrich(source, self.decoder.decode(source), bad_receipt, self.watch)
+        deposit = next(s for s in altered if s.behavior == 'INTENT_DEPOSIT')
+        self.assertEqual(deposit.stage, 'needs_review')
+        self.assertEqual(deposit.evidence['solver_order_status'], 'deposit_event_not_uniquely_proven')
+
+    def test_real_relay_order_maps_distinct_request_and_destination_delivery(self):
+        deposit = next(s for s in self.example('0xffa84e') if s.behavior == 'INTENT_DEPOSIT')
+        document = json.loads((ROOT / 'data/relay_order_evidence_3ccc6f52.json').read_text())
+        evidence = relay_delivery_evidence(document, deposit)[0]
+        self.assertNotEqual(evidence['request_id'], evidence['order_id'])
+        self.assertEqual(evidence['source_tx_hash'], deposit.tx_hash)
+        self.assertEqual(evidence['destination_chain_id'], '792703809')
+        self.assertEqual(evidence['destination_amount_raw'], '173879072')
+        self.assertEqual(evidence['destination_chain_status'],
+                         'api_reported_not_independently_rechecked')
+        store = Store(':memory:')
+        store.put(deposit)
+        self.assertEqual(store.record_solver_delivery(
+            evidence['order_id'], deposit.wallet, evidence['destination_tx_hash'], evidence),
+            'order_delivery_linked')
+        self.assertEqual(len(store.solver_order(evidence['order_id'])), 2)
+        store.close()
+
+    def test_relay_order_id_cannot_be_used_as_request_id(self):
+        deposit = next(s for s in self.example('0xffa84e') if s.behavior == 'INTENT_DEPOSIT')
+        document = json.loads((ROOT / 'data/relay_order_evidence_3ccc6f52.json').read_text())
+        document['requests'][0]['id'] = deposit.evidence['order_id']
+        with self.assertRaisesRegex(ValueError, 'conflated'):
+            relay_delivery_evidence(document, deposit)
 
     def test_real_bulk_distribution_summary(self):
         row = json.loads((ROOT / 'data/bulk_distribution.json').read_text())
@@ -336,11 +713,1885 @@ class FixtureTests(unittest.TestCase):
             self.assertTrue(all(not s.copy_eligible for s in self.example(row['transaction']['hash'])))
 
 
+class QuoteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_quoter_pins_v2_v3_v4_calls_to_observed_block(self):
+        calls = []
+
+        class Rpc:
+            async def call(self, method, params=None):
+                calls.append((method, params))
+                if method == 'eth_getBlockByNumber':
+                    return {'number': '0x64', 'hash': '0x' + 'ab' * 32}
+                target = params[0]['to']
+                if target == R.V2_ROUTER:
+                    return '0x' + encode(['uint256[]'], [[100, 210]]).hex()
+                if target == R.V3_QUOTER:
+                    return '0x' + encode(
+                        ['uint256', 'uint160[]', 'uint32[]', 'uint256'],
+                        [220, [1], [2], 30000]).hex()
+                if target == R.V4_QUOTER:
+                    return '0x' + encode(['uint256', 'uint256'], [230, 40000]).hex()
+                raise AssertionError(target)
+
+        quoter = LiveQuoter(Rpc())
+        base = dict(stage='swap_evidenced', execution_status='success',
+                    token_in=R.USDG, token_out=TOKEN,
+                    evidence={'actual_input_debit_raw': '100',
+                              'actual_output_credit_raw': '200'})
+        v2 = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                    protocol='v2', **deepcopy(base))
+        v2.evidence['route'] = [R.USDG, TOKEN]
+        v3 = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V3_ROUTER, '0x',
+                    protocol='v3', **deepcopy(base))
+        v3.evidence['hops'] = [
+            {'token_in': R.USDG, 'token_out': TOKEN, 'fee': 500}]
+        v4 = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.UNIVERSAL_ROUTER, '0x',
+                    protocol='v4', **deepcopy(base))
+        v4.evidence.update({'pool_key': [TOKEN, R.USDG, 3000, 60, R.NATIVE],
+                            'hook_data': '0x'})
+        middle = '0x' + '44' * 20
+        v4_multi = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.UNIVERSAL_ROUTER, '0x',
+                          protocol='v4', **deepcopy(base))
+        v4_multi.evidence['v4_hops'] = [
+            {'token_in': R.USDG, 'token_out': middle,
+             'pool_key': [middle, R.USDG, 500, 10, R.NATIVE], 'hook_data': '0x12'},
+            {'token_in': middle, 'token_out': TOKEN,
+             'pool_key': [TOKEN, middle, 3000, 60, R.NATIVE], 'hook_data': '0x'},
+        ]
+        with patch('smart_money.quotes.time.time', return_value=1234.5):
+            quotes = [await quoter.quote_exact_input(signal, '100')
+                      for signal in (v2, v3, v4, v4_multi)]
+        self.assertEqual([quote.amount_out_raw for quote in quotes],
+                         ['210', '220', '230', '230'])
+        self.assertEqual(quotes[2].gas_estimate_raw, '40000')
+        self.assertTrue(all(quote.block_number == 100 and quote.observed_at == 1234.5
+                            for quote in quotes))
+        quote_calls = [params for method, params in calls if method == 'eth_call']
+        self.assertTrue(all(params[1] == '0x64' for params in quote_calls))
+        multi_data = bytes.fromhex(quote_calls[-1][0]['data'][2:])
+        signature = 'quoteExactInput((address,(address,uint24,int24,address,bytes)[],uint128))'
+        self.assertEqual(multi_data[:4], selector(signature))
+        decoded = decode(['(address,(address,uint24,int24,address,bytes)[],uint128)'],
+                         multi_data[4:])[0]
+        self.assertEqual((decoded[0], decoded[1][0][0], decoded[1][1][0], decoded[2]),
+                         (R.USDG, middle, TOKEN, 100))
+
+    def test_quote_policy_rejects_expiry_assets_and_adverse_price_move(self):
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                        stage='swap_evidenced', token_in=R.USDG, token_out=TOKEN,
+                        evidence={'actual_input_debit_raw': '100',
+                                  'actual_output_credit_raw': '200'})
+        quote = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                      R.USDG, TOKEN, '100', '190')
+        policy = QuotePolicy(max_age_seconds=2, max_adverse_deviation_bps=400)
+        self.assertEqual(validate_quote(signal, quote, policy, now=101)[1],
+                         'adverse_price_deviation_exceeded')
+        self.assertEqual(validate_quote(signal, quote, QuotePolicy(
+            max_age_seconds=2, max_adverse_deviation_bps=600), now=103)[1],
+                         'quote_missing_or_expired')
+        wrong = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                      R.WETH, TOKEN, '100', '200')
+        self.assertEqual(validate_quote(signal, wrong, policy, now=100)[1],
+                         'quote_asset_mismatch')
+
+    def test_feed_intent_uses_encoded_exact_in_limit_not_future_receipt_price(self):
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                        stage='intent', fresh=True, exact_in=True,
+                        token_in=R.USDG, token_out=TOKEN,
+                        amount_in_raw='1000', amount_limit_raw='1900')
+        good = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                     R.USDG, TOKEN, '100', '191')
+        allowed, reason, evidence = validate_quote(signal, good, QuotePolicy(), now=101)
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
+        self.assertEqual(evidence['source_price_basis'], 'intent_exact_in_minimum')
+        self.assertEqual(evidence['scaled_source_minimum_out_raw'], '190')
+        bad = replace(good, amount_out_raw='189')
+        self.assertEqual(validate_quote(signal, bad, QuotePolicy(), now=101)[1],
+                         'intent_price_limit_not_met')
+
+    async def test_shadow_engine_records_eligibility_without_budget_reservation(self):
+        store = Store(':memory:')
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                        stage='intent', fresh=True, exact_in=True, protocol='v2',
+                        token_in=R.USDG, token_out=TOKEN,
+                        amount_in_raw='1000', amount_limit_raw='1900')
+
+        class Quoter:
+            async def quote_with_reference(self, source, amount):
+                quote = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                              R.USDG, TOKEN, amount, '191')
+                reference = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                                  R.USDG, TOKEN, '1', '2')
+                return quote, reference, '100'
+
+        engine = PaperEngine(store, Quoter(), QuotePolicy(
+            max_gas_cost_wei='30000000'), 'paper-v1', 'feed_intent',
+            frozenset({'v2'}), frozenset({R.USDG, TOKEN}), shadow_only=True)
+        decision = await engine.propose_buy(
+            signal, AmountRule('fixed', fixed_amount_raw='100'), now=101)
+        self.assertTrue(decision.accepted)
+        self.assertIsNone(decision.proposal_id)
+        self.assertTrue(store.paper_decision(decision.decision_id)['payload']['shadow_only'])
+        self.assertEqual(store.connection.execute(
+            'SELECT COUNT(*) FROM paper_proposals').fetchone()[0], 0)
+        store.close()
+
+    def test_quote_assessment_enforces_impact_gas_and_slippage_floor(self):
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                        stage='swap_evidenced', token_in=R.USDG, token_out=TOKEN,
+                        evidence={'actual_input_debit_raw': '100',
+                                  'actual_output_credit_raw': '200'})
+        quote = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                      R.USDG, TOKEN, '100', '190')
+        reference = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                          R.USDG, TOKEN, '10', '20')
+        policy = QuotePolicy(max_adverse_deviation_bps=600, max_price_impact_bps=600,
+                             max_slippage_bps=300, max_gas_cost_wei='30000000')
+        allowed, reason, evidence = assess_quote(
+            signal, quote, reference, policy, '100', now=101)
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
+        self.assertEqual(evidence['estimated_price_impact_bps'], '500')
+        self.assertEqual(evidence['estimated_gas_cost_wei'], '20000000')
+        self.assertEqual(evidence['minimum_amount_out_raw'], '184')
+        too_costly = QuotePolicy(max_adverse_deviation_bps=600,
+                                 max_price_impact_bps=600,
+                                 max_gas_cost_wei='19999999')
+        self.assertEqual(assess_quote(
+            signal, quote, reference, too_costly, '100', now=101)[1],
+            'gas_cost_limit_exceeded')
+
+    async def test_paper_engine_quotes_assesses_and_atomically_reserves(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                        stage='swap_evidenced', execution_status='success',
+                        token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                        evidence={'actual_input_debit_raw': '1000',
+                                  'actual_output_credit_raw': '2000',
+                                  'route': [R.USDG, TOKEN]})
+
+        class Quoter:
+            async def quote_with_reference(self, source, amount):
+                self.amount = amount
+                quote = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                              R.USDG, TOKEN, amount, '198')
+                reference = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                                  R.USDG, TOKEN, '10', '20')
+                return quote, reference, '100'
+
+        quoter = Quoter()
+        engine = PaperEngine(store, quoter, QuotePolicy(
+            max_adverse_deviation_bps=200, max_price_impact_bps=200,
+            max_gas_cost_wei='30000000'), 'paper-v1')
+        decision = await engine.propose_buy(
+            signal, AmountRule('proportional', ratio_ppm=100_000), now=101)
+        self.assertTrue(decision.accepted)
+        self.assertEqual(quoter.amount, '100')
+        self.assertEqual(store.paper_budget(A, 'USDG')['reserved_raw'], '100')
+        persisted = store.paper_decision(decision.decision_id)
+        self.assertTrue(persisted['accepted'])
+        self.assertEqual(persisted['payload']['proposal_id'], decision.proposal_id)
+        duplicate = await engine.propose_buy(
+            signal, AmountRule('proportional', ratio_ppm=100_000), now=101)
+        self.assertTrue(duplicate.accepted)
+        self.assertEqual(store.paper_budget(A, 'USDG')['reserved_raw'], '100')
+        store.close()
+
+    async def test_paper_executor_requotes_and_records_fill_gas_and_lot(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                        stage='swap_evidenced', execution_status='success',
+                        token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                        evidence={'actual_input_debit_raw': '1000',
+                                  'actual_output_credit_raw': '2000',
+                                  'route': [R.USDG, TOKEN]})
+
+        class Quoter:
+            calls = 0
+
+            async def quote_with_reference(self, source, amount):
+                self.calls += 1
+                quote = Quote('v2', R.V2_ROUTER, self.calls, '0x' + 'aa' * 32,
+                              100.0, R.USDG, TOKEN, amount, '198')
+                reference = Quote('v2', R.V2_ROUTER, self.calls, '0x' + 'aa' * 32,
+                                  100.0, R.USDG, TOKEN, '1', '2')
+                return quote, reference, '100'
+
+        quoter = Quoter()
+        policy = QuotePolicy(max_adverse_deviation_bps=200,
+                             max_price_impact_bps=200,
+                             max_gas_cost_wei='30000000')
+        decision = await PaperEngine(
+            store, quoter, policy, 'paper-v1', wallet_labels={A: 'wallet-alpha'},
+            wallet_contexts={A: {'follower_wallet': B, 'relationship_id': '42'}},
+            config_snapshot_hash='ab' * 32,
+        ).propose_buy(signal, AmountRule('fixed', fixed_amount_raw='100'), now=101)
+        execution = await PaperExecutor(store, quoter, policy).execute(
+            signal, decision.proposal_id, now=101)
+        self.assertEqual((quoter.calls, execution.status), (2, 'filled'))
+        fill = store.connection.execute(
+            'SELECT amount_out_raw,gas_cost_wei FROM paper_fills WHERE fill_id=?',
+            (execution.fill_id,)).fetchone()
+        self.assertEqual(fill, ('198', '20000000'))
+        self.assertEqual(store.paper_budget(A, 'USDG')['invested_raw'], '100')
+        trade = store.paper_trades()[0]
+        self.assertEqual(trade['attribution']['smart_wallet_label'], 'wallet-alpha')
+        self.assertEqual(trade['attribution']['follower_wallet'], B)
+        self.assertEqual(trade['attribution']['relationship_id'], '42')
+        self.assertEqual(trade['attribution']['config_snapshot_hash'], 'ab' * 32)
+        self.assertEqual(trade['decision']['follower_wallet'], B)
+        self.assertEqual(trade['source_signal_at_decision']['event_id'], signal.event_id)
+        self.assertEqual(trade['source_signal_at_decision']['evidence'][
+            'actual_input_debit_raw'], '1000')
+        self.assertIsNotNone(trade['decision_created_at'])
+        self.assertIsNotNone(trade['proposal_created_at'])
+        self.assertIsNotNone(store.paper_position(
+            PaperExecutor._id(decision.proposal_id, 'lot')))
+        store.close()
+
+    async def test_paper_position_mark_reverses_route_and_keeps_gas_separate(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        source = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                        stage='swap_evidenced', execution_status='success',
+                        token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                        evidence={'actual_input_debit_raw': '250',
+                                  'actual_output_credit_raw': '5000',
+                                  'route': [R.USDG, TOKEN]})
+        store.put(source)
+        store.reserve_paper_proposal({
+            'proposal_id': 'buy-p', 'source_event_id': source.event_id,
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.USDG, 'output_asset': TOKEN,
+            'budget_bucket': 'USDG', 'amount_in_raw': '250',
+            'attribution': {'smart_wallet': A},
+        })
+        store.fill_paper_buy('buy-p', {
+            'order_id': 'buy-o', 'fill_id': 'buy-f', 'lot_id': 'lot1',
+            'amount_out_raw': '5000', 'fee_asset': R.USDG, 'fee_amount_raw': '0',
+            'gas_cost_wei': '20000000',
+            'quote_observed_at': '2026-09-12T00:00:00Z',
+            'filled_at': '2026-09-12T00:00:01Z',
+        })
+        reversed_signal = reverse_quote_signal(source, R.USDG)
+        self.assertEqual(reversed_signal.evidence['route'], [TOKEN, R.USDG])
+
+        class Quoter:
+            async def quote_with_reference(self, signal, amount):
+                self.signal = signal
+                return (Quote('v2', R.V2_ROUTER, 123, '0x' + 'ab' * 32, 100.0,
+                              TOKEN, R.USDG, amount, '300'),
+                        Quote('v2', R.V2_ROUTER, 123, '0x' + 'ab' * 32, 100.0,
+                              TOKEN, R.USDG, '50', '3'), '100')
+
+        quoter = Quoter()
+        mark = await PaperValuator(store, quoter, QuotePolicy(
+            max_gas_cost_wei='30000000')).mark('lot1', source, now=101)
+        self.assertEqual((mark.gross_value_raw, mark.unrealized_pnl_raw,
+                          mark.gas_cost_wei), ('300', '50', '20000000'))
+        self.assertEqual(quoter.signal.evidence['route'], [TOKEN, R.USDG])
+        persisted = store.paper_position_marks('lot1')[0]
+        self.assertEqual((persisted['principal_asset'], persisted['unrealized_pnl_raw']),
+                         (R.USDG, '50'))
+        trade = store.paper_trades()[0]
+        self.assertEqual((trade['smart_wallet'], trade['source_event_id'],
+                          trade['source_tx_hash'], trade['trigger_mode'],
+                          trade['strategy_version'], trade['source_canonical_status']),
+                         (A, source.event_id, TXHASH, 'swap_evidenced', 'paper-v1',
+                          'unconfirmed'))
+        self.assertEqual((trade['amount_in_raw'], trade['amount_out_raw'],
+                          trade['gas_cost_wei'], trade['paper_only']),
+                         ('250', '5000', '20000000', True))
+        self.assertEqual(trade['position_lots'][0]['lot_id'], 'lot1')
+        self.assertEqual(trade['position_lots'][0]['latest_mark']['mark_id'], mark.mark_id)
+        self.assertFalse(store.record_paper_position_mark({
+            'mark_id': mark.mark_id, 'lot_id': 'lot1', 'principal_asset': R.USDG,
+            'token_amount_raw': '5000', 'gross_value_raw': '300',
+            'principal_remaining_raw': '250', 'unrealized_pnl_raw': '50',
+            'gas_cost_wei': '20000000', 'block_number': 123,
+            'block_hash': '0x' + 'ab' * 32, 'quote_source': R.V2_ROUTER,
+            'quote_observed_at': '2026-09-12T00:00:00+00:00', 'risk': {},
+        }))
+        store.close()
+
+    async def test_paper_engine_persists_quote_rejection_without_reserving(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                        stage='swap_evidenced', execution_status='success',
+                        token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                        evidence={'actual_input_debit_raw': '1000',
+                                  'actual_output_credit_raw': '2000'})
+
+        class StaleQuoter:
+            async def quote_with_reference(self, source, amount):
+                quote = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 90.0,
+                              R.USDG, TOKEN, amount, '200')
+                reference = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 90.0,
+                                  R.USDG, TOKEN, '10', '20')
+                return quote, reference, '100'
+
+        decision = await PaperEngine(
+            store, StaleQuoter(), QuotePolicy(), 'paper-v1').propose_buy(
+                signal, AmountRule('fixed', fixed_amount_raw='100'), now=100)
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.reason, 'quote_missing_or_expired')
+        self.assertEqual(store.paper_budget(A, 'USDG')['reserved_raw'], '0')
+        self.assertEqual(store.paper_decision(decision.decision_id)['reason'],
+                         'quote_missing_or_expired')
+        store.close()
+
+    async def test_paper_engine_sell_reserves_only_attributed_position(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        buy = {
+            'proposal_id': 'buy-p', 'source_event_id': 'buy-event',
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.USDG, 'output_asset': TOKEN,
+            'budget_bucket': 'USDG', 'amount_in_raw': '250',
+            'attribution': {'smart_wallet': A},
+        }
+        store.reserve_paper_proposal(buy)
+        store.fill_paper_buy('buy-p', {
+            'order_id': 'buy-o', 'fill_id': 'buy-f', 'lot_id': 'lot1',
+            'amount_out_raw': '5000', 'fee_asset': R.USDG, 'fee_amount_raw': '0',
+            'gas_cost_wei': '20000000',
+            'quote_observed_at': '2026-09-12T00:00:00Z',
+            'filled_at': '2026-09-12T00:00:01Z',
+        })
+        signal = Signal('0x' + '55' * 32, A, 'direct', 'SELL', 'call',
+                        R.V2_ROUTER, '0x', stage='swap_evidenced',
+                        execution_status='success', token_in=TOKEN, token_out=R.USDG,
+                        protocol='v2', evidence={'actual_input_debit_raw': '2000',
+                        'actual_output_credit_raw': '120', 'route': [TOKEN, R.USDG]})
+
+        class Quoter:
+            async def quote_with_reference(self, source, amount):
+                self.amount = amount
+                quote = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                              TOKEN, R.USDG, amount, '59')
+                reference = Quote('v2', R.V2_ROUTER, 1, '0x' + 'aa' * 32, 100.0,
+                                  TOKEN, R.USDG, '20', '1')
+                return quote, reference, '100'
+
+        quoter = Quoter()
+        decision = await PaperEngine(store, quoter, QuotePolicy(
+            max_adverse_deviation_bps=200, max_price_impact_bps=200,
+            max_gas_cost_wei='30000000'), 'paper-v1').propose_sell(
+                signal, AmountRule('proportional', ratio_ppm=500_000), now=101)
+        self.assertTrue(decision.accepted)
+        self.assertEqual(quoter.amount, '1000')
+        reservation = store.connection.execute(
+            "SELECT token_amount_raw FROM paper_position_reservations WHERE proposal_id=?",
+            (decision.proposal_id,)).fetchone()
+        self.assertEqual(reservation[0], '1000')
+        store.close()
+
+
 class SafetyTests(unittest.TestCase):
+    @staticmethod
+    def _signed_execution_store(tx_hash='0x' + '91' * 32, path=':memory:'):
+        store = Store(path)
+        store.start_paper_budget_cycle('cycle-execution', 'test')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        store.reserve_paper_proposal({
+            'proposal_id': 'proposal-track', 'source_event_id': 'event-track',
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.USDG, 'output_asset': TOKEN,
+            'budget_bucket': 'USDG', 'amount_in_raw': '100',
+            'attribution': {'smart_wallet': A, 'follower_wallet': B,
+                            'relationship_id': '42', 'config_snapshot_hash': 'ab' * 32},
+        })
+        reservation_id = 'reservation-track'
+        store.reserve_execution_nonce(
+            reservation_id, B, '42', 'proposal-track', R.CHAIN_ID, 7)
+        transaction = {
+            'chainId': R.CHAIN_ID, 'nonce': 7, 'to': R.V2_ROUTER,
+            'value': 0, 'data': '0x12345678', 'gas': 220000,
+            'maxFeePerGas': 120, 'maxPriorityFeePerGas': 2, 'type': 2,
+        }
+        store.record_execution_plan({
+            'plan_id': 'plan-track', 'proposal_id': 'proposal-track',
+            'follower_wallet': B, 'relationship_id': '42',
+            'config_snapshot_hash': 'ab' * 32,
+            'nonce_reservation_id': reservation_id, 'transaction': transaction,
+            'unsigned_plan': {'public': 'only'},
+        }, {'read_only': True})
+        store.mark_execution_plan_signed(
+            'plan-track', reservation_id, tx_hash, {'read_only': True})
+        return store, transaction
+
+    def test_execution_audit_reports_healthy_signed_state_without_secret_material(self):
+        store, _ = self._signed_execution_store()
+        audit = store.execution_audit()
+        self.assertEqual(audit, {
+            'plans': 1, 'prepared': 0, 'signed': 1, 'cancelled': 0,
+            'attempts': 1, 'issues': [], 'healthy': True,
+            'attempt_statuses': {
+                'signed': 1, 'observed_pending': 0, 'confirmed': 0,
+                'reverted': 0, 'replaced': 0, 'orphaned': 0,
+            },
+            'coverage': {
+                'has_plans': True, 'has_signed_attempts': True,
+                'has_rpc_observed_attempts': False,
+                'has_canonical_receipts': False,
+                'has_successful_confirmation': False,
+            },
+            'end_to_end_evidenced': False,
+            'read_only': True, 'copy_eligible': False, 'live_trading': False,
+        })
+        serialized = json.dumps(audit).lower()
+        self.assertNotIn('private_key', serialized)
+        self.assertNotIn('raw_transaction', serialized)
+        store.close()
+
+    def test_execution_audit_does_not_treat_empty_ledger_as_end_to_end_evidence(self):
+        store = Store(':memory:')
+        audit = store.execution_audit()
+        self.assertTrue(audit['healthy'])
+        self.assertFalse(audit['coverage']['has_plans'])
+        self.assertFalse(audit['end_to_end_evidenced'])
+        store.close()
+
+    def test_execution_track_cli_requires_explicit_proposal_and_bounded_replacement_args(self):
+        parsed = cli_parser().parse_args([
+            'execution-track', '--db', 'ledger.sqlite3',
+            '--proposal-id', 'proposal-1', '--tx-hash', '0x' + '11' * 32,
+            '--replaces-tx-hash', '0x' + '22' * 32,
+        ])
+        self.assertEqual(parsed.command, 'execution-track')
+        self.assertEqual(parsed.proposal_id, 'proposal-1')
+        self.assertEqual(parsed.db, 'ledger.sqlite3')
+
+    def test_execution_track_cli_plumbing_is_read_only_and_persistent(self):
+        async def scenario(path):
+            tx_hash = '0x' + '91' * 32
+            store, transaction = self._signed_execution_store(tx_hash, path)
+            store.close()
+
+            class Rpc:
+                async def call(self, method, params=None):
+                    if method == 'eth_chainId':
+                        return hex(R.CHAIN_ID)
+                    if method == 'eth_getTransactionByHash':
+                        return {
+                            'hash': tx_hash, 'from': B, 'to': transaction['to'],
+                            'nonce': 7, 'chainId': R.CHAIN_ID, 'type': 2,
+                            'gas': transaction['gas'], 'value': 0,
+                            'input': transaction['data'], 'maxFeePerGas': 120,
+                            'maxPriorityFeePerGas': 2,
+                        }
+                    if method == 'eth_getTransactionReceipt':
+                        return None
+                    raise AssertionError(method)
+
+            args = SimpleNamespace(
+                db=str(path), proposal_id='proposal-track',
+                tx_hash=None, replaces_tx_hash=None,
+            )
+            output = io.StringIO()
+            with patch('smart_money.cli.ReadOnlyRpc', return_value=Rpc()), \
+                    redirect_stdout(output):
+                await execution_track(args)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result['status'], 'observed_pending')
+            self.assertFalse(result['broadcast_performed'])
+            self.assertFalse(result['copy_eligible'])
+            self.assertNotIn('raw_transaction', output.getvalue())
+            self.assertNotIn('private_key', output.getvalue())
+            reopened = Store(path)
+            self.assertEqual(
+                reopened.execution_attempts('plan-track')[0]['status'],
+                'observed_pending')
+            reopened.close()
+
+        with tempfile.TemporaryDirectory() as folder:
+            asyncio.run(scenario(Path(folder) / 'track.sqlite3'))
+
+    def test_execution_track_rejects_wrong_chain_and_missing_signed_plan(self):
+        async def scenario(path):
+            Store(path).close()
+            args = SimpleNamespace(
+                db=str(path), proposal_id='missing',
+                tx_hash=None, replaces_tx_hash=None,
+            )
+
+            class Rpc:
+                chain_id = R.CHAIN_ID + 1
+
+                async def call(self, method, params=None):
+                    if method == 'eth_chainId':
+                        return hex(self.chain_id)
+                    raise AssertionError(method)
+
+            rpc = Rpc()
+            with patch('smart_money.cli.ReadOnlyRpc', return_value=rpc):
+                with self.assertRaisesRegex(ValueError, 'wrong chain'):
+                    await execution_track(args)
+                rpc.chain_id = R.CHAIN_ID
+                with self.assertRaisesRegex(ValueError, 'signed execution plan'):
+                    await execution_track(args)
+
+        with tempfile.TemporaryDirectory() as folder:
+            asyncio.run(scenario(Path(folder) / 'missing.sqlite3'))
+
+    def test_execution_audit_survives_integrity_corruption(self):
+        store, _ = self._signed_execution_store()
+        store.connection.execute(
+            "UPDATE execution_plans SET preflight_payload=? WHERE proposal_id=?",
+            (json.dumps({'read_only': False}), 'proposal-track'))
+        store.connection.commit()
+        audit = store.execution_audit()
+        self.assertFalse(audit['healthy'])
+        self.assertEqual(audit['plans'], 1)
+        self.assertEqual(audit['issues'], [{
+            'proposal_id': 'proposal-track',
+            'reason': 'execution_plan_integrity_or_decode_error',
+            'error_type': 'ValueError',
+        }])
+        store.close()
+
+    def test_execution_audit_detects_nonce_identity_mismatch(self):
+        store, _ = self._signed_execution_store()
+        store.connection.execute(
+            "UPDATE execution_nonce_reservations SET nonce=8 WHERE proposal_id=?",
+            ('proposal-track',))
+        store.connection.commit()
+        audit = store.execution_audit()
+        self.assertFalse(audit['healthy'])
+        self.assertIn({'proposal_id': 'proposal-track',
+                       'reason': 'plan_nonce_identity_mismatch'}, audit['issues'])
+        store.close()
+
+    def test_execution_audit_detects_corrupt_attempt_identity_fee_and_parent(self):
+        tx_hash = '0x' + '91' * 32
+        store, transaction = self._signed_execution_store(tx_hash)
+        payload = dict(transaction, nonce=8, maxFeePerGas=119)
+        store.connection.execute(
+            """UPDATE execution_attempts SET nonce=8,replaces_tx_hash=?,public_payload=?
+               WHERE tx_hash=?""",
+            (tx_hash, json.dumps(payload, sort_keys=True), tx_hash))
+        store.connection.commit()
+        audit = store.execution_audit()
+        reasons = {issue['reason'] for issue in audit['issues']}
+        self.assertFalse(audit['healthy'])
+        self.assertTrue({
+            'execution_attempt_identity_mismatch',
+            'execution_attempt_fee_chain_invalid',
+            'signed_attempt_has_replacement_parent',
+        } <= reasons)
+        store.close()
+
+    def test_read_only_execution_tracker_records_pending_then_canonical_receipt(self):
+        async def scenario():
+            tx_hash, block_hash = '0x' + '91' * 32, '0x' + '92' * 32
+            store, transaction = self._signed_execution_store(tx_hash)
+
+            class Rpc:
+                receipt = None
+
+                async def call(self, method, params=None):
+                    if method == 'eth_getTransactionByHash':
+                        return {'hash': tx_hash, 'from': B, 'to': transaction['to'],
+                                'nonce': '0x7', 'chainId': hex(R.CHAIN_ID), 'type': '0x2',
+                                'gas': hex(transaction['gas']), 'value': '0x0',
+                                'input': transaction['data'], 'maxFeePerGas': '0x78',
+                                'maxPriorityFeePerGas': '0x2'}
+                    if method == 'eth_getTransactionReceipt':
+                        return self.receipt
+                    return {'number': '0x64', 'hash': block_hash}
+
+            rpc = Rpc()
+            tracker = ReadOnlyExecutionTracker(store, rpc)
+            pending = await tracker.observe('proposal-track')
+            self.assertEqual(pending.status, 'observed_pending')
+            self.assertEqual(store.execution_nonce_reservation(
+                'proposal-track')['status'], 'broadcast')
+            rpc.receipt = {'transactionHash': tx_hash, 'blockNumber': '0x64',
+                           'blockHash': block_hash, 'status': '0x1'}
+            confirmed = await tracker.observe('proposal-track')
+            self.assertEqual((confirmed.status, confirmed.block_number), ('confirmed', 100))
+            attempt = store.execution_attempts('plan-track')[0]
+            self.assertEqual((attempt['status'], attempt['block_hash']),
+                             ('confirmed', block_hash))
+            self.assertEqual(store.execution_nonce_reservation(
+                'proposal-track')['status'], 'confirmed')
+            self.assertNotIn('raw_transaction', json.dumps(attempt))
+            audit = store.execution_audit()
+            self.assertTrue(audit['healthy'])
+            self.assertEqual(audit['attempt_statuses']['confirmed'], 1)
+            self.assertTrue(audit['coverage']['has_rpc_observed_attempts'])
+            self.assertTrue(audit['coverage']['has_canonical_receipts'])
+            self.assertTrue(audit['end_to_end_evidenced'])
+            store.close()
+
+        asyncio.run(scenario())
+
+    def test_read_only_execution_tracker_replacement_requires_same_intent_and_higher_fee(self):
+        async def scenario():
+            original, replacement = '0x' + '91' * 32, '0x' + '93' * 32
+            store, transaction = self._signed_execution_store(original)
+
+            class Rpc:
+                current_hash = original
+                changed_data = False
+                higher_fee = False
+
+                async def call(self, method, params=None):
+                    if method == 'eth_getTransactionByHash':
+                        return {'hash': self.current_hash, 'from': B,
+                                'to': transaction['to'], 'nonce': '0x7',
+                                'chainId': hex(R.CHAIN_ID), 'type': '0x2',
+                                'gas': hex(transaction['gas']), 'value': '0x0',
+                                'input': '0xdeadbeef' if self.changed_data else transaction['data'],
+                                'maxFeePerGas': '0x79' if self.higher_fee else '0x78',
+                                'maxPriorityFeePerGas': '0x2'}
+                    return None
+
+            rpc = Rpc()
+            tracker = ReadOnlyExecutionTracker(store, rpc)
+            await tracker.observe('proposal-track')
+            rpc.current_hash = replacement
+            with self.assertRaisesRegex(ValueError, 'fees were not increased'):
+                await tracker.observe('proposal-track', replacement, original)
+            rpc.higher_fee, rpc.changed_data = True, True
+            with self.assertRaisesRegex(ValueError, 'does not match execution intent'):
+                await tracker.observe('proposal-track', replacement, original)
+            rpc.changed_data = False
+            observed = await tracker.observe('proposal-track', replacement, original)
+            self.assertEqual(observed.status, 'observed_pending')
+            attempts = store.execution_attempts('plan-track')
+            self.assertEqual([(row['tx_hash'], row['status']) for row in attempts],
+                             [(original, 'replaced'), (replacement, 'observed_pending')])
+            self.assertTrue(store.execution_audit()['healthy'])
+            store.close()
+
+        asyncio.run(scenario())
+
+    def test_read_only_execution_tracker_records_revert_and_orphan(self):
+        async def scenario(receipt_status, canonical_hash):
+            tx_hash, receipt_hash = '0x' + '91' * 32, '0x' + '92' * 32
+            store, transaction = self._signed_execution_store(tx_hash)
+
+            class Rpc:
+                async def call(self, method, params=None):
+                    if method == 'eth_getTransactionByHash':
+                        return {'hash': tx_hash, 'from': B, 'to': transaction['to'],
+                                'nonce': 7, 'chainId': R.CHAIN_ID, 'type': 2,
+                                'gas': transaction['gas'], 'value': 0,
+                                'input': transaction['data'], 'maxFeePerGas': 120,
+                                'maxPriorityFeePerGas': 2}
+                    if method == 'eth_getTransactionReceipt':
+                        return {'transactionHash': tx_hash, 'blockNumber': 100,
+                                'blockHash': receipt_hash, 'status': receipt_status}
+                    return {'number': '0x64', 'hash': canonical_hash}
+
+            result = await ReadOnlyExecutionTracker(store, Rpc()).observe('proposal-track')
+            stored = store.execution_attempts('plan-track')[0]
+            store.close()
+            return result.status, stored['status']
+
+        self.assertEqual(asyncio.run(scenario(0, '0x' + '92' * 32)),
+                         ('reverted', 'reverted'))
+        self.assertEqual(asyncio.run(scenario(1, '0x' + '94' * 32)),
+                         ('orphaned', 'orphaned'))
+
+    def test_offline_execution_signer_rechecks_and_persists_only_public_hash(self):
+        async def scenario(path):
+            account = Account.create()
+            follower = account.address.lower()
+            store = Store(path)
+            store.start_paper_budget_cycle('cycle', 'test')
+            store.configure_paper_budget(A, 'USDG', '1000')
+            signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                            stage='swap_evidenced', execution_status='success', exact_in=True,
+                            token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                            evidence={'route': [R.USDG, TOKEN],
+                                      'actual_input_debit_raw': '100',
+                                      'actual_output_credit_raw': '200'})
+            store.put(signal)
+            store.reserve_paper_proposal({
+                'proposal_id': 'proposal-sign', 'source_event_id': signal.event_id,
+                'source_tx_hash': TXHASH, 'wallet': A,
+                'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+                'input_asset': R.USDG, 'output_asset': TOKEN,
+                'budget_bucket': 'USDG', 'amount_in_raw': '100',
+                'attribution': {'smart_wallet': A, 'follower_wallet': follower,
+                                'relationship_id': '42',
+                                'config_snapshot_hash': 'ab' * 32},
+            })
+
+            class Quoter:
+                output = '198'
+
+                async def quote_with_reference(self, source, amount):
+                    return (Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, TOKEN, amount, self.output),
+                            Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, TOKEN, '1', '2'), '100')
+
+            class Rpc:
+                nonce = 7
+
+                async def call(self, method, params=None):
+                    return {'eth_getTransactionCount': hex(self.nonce),
+                            'eth_getBalance': hex(100000000),
+                            'eth_gasPrice': '0x64', 'eth_call': '0x64'}[method]
+
+            class Signer:
+                def __init__(self, expected):
+                    self.expected = expected
+
+                def sign_transaction(self, transaction):
+                    self.assertion = transaction
+                    return bytes(account.sign_transaction(transaction).raw_transaction)
+
+            class Gate:
+                def __init__(self):
+                    self.calls = []
+
+                def validate(self, *values):
+                    self.calls.append(values)
+
+            policy = QuotePolicy(max_adverse_deviation_bps=200,
+                                 max_price_impact_bps=200,
+                                 max_gas_cost_wei='30000000')
+            route = frozenset({signal_route_key(signal)})
+            prepared = await ExecutionPreparer(
+                store, Quoter(), Rpc(), policy, frozenset({'v2'}),
+                frozenset({R.USDG, TOKEN}), route, 'ab' * 32).prepare(
+                    signal, 'proposal-sign', now=101)
+            sign_quoter, sign_rpc = Quoter(), Rpc()
+            gate = Gate()
+            offline = OfflineExecutionSigner(
+                store, sign_quoter, sign_rpc, policy, 'ab' * 32,
+                signer_factory=Signer, relationship_gate=gate)
+            persisted_payload = store.connection.execute(
+                "SELECT plan_payload FROM execution_plans WHERE plan_id=?",
+                (prepared.plan_id,)).fetchone()[0]
+            tampered = json.loads(persisted_payload)
+            tampered['transaction']['data'] = '0xdeadbeef'
+            store.connection.execute(
+                "UPDATE execution_plans SET plan_payload=? WHERE plan_id=?",
+                (json.dumps(tampered, sort_keys=True), prepared.plan_id))
+            store.connection.commit()
+            with patch.dict(os.environ, OFFLINE_ENV):
+                with self.assertRaisesRegex(ValueError, 'integrity mismatch'):
+                    await offline.sign(signal, 'proposal-sign', now=101)
+            store.connection.execute(
+                "UPDATE execution_plans SET plan_payload=? WHERE plan_id=?",
+                (persisted_payload, prepared.plan_id))
+            store.connection.commit()
+            store.connection.execute(
+                "UPDATE paper_reservations SET status='released' WHERE proposal_id=?",
+                ('proposal-sign',))
+            store.connection.commit()
+            with patch.dict(os.environ, OFFLINE_ENV):
+                with self.assertRaisesRegex(ValueError, 'reservation is stale'):
+                    await offline.sign(signal, 'proposal-sign', now=101)
+            store.connection.execute(
+                "UPDATE paper_reservations SET status='active' WHERE proposal_id=?",
+                ('proposal-sign',))
+            store.connection.commit()
+            with patch.dict(os.environ, {}, clear=False):
+                for key in OFFLINE_ENV:
+                    os.environ.pop(key, None)
+                with self.assertRaisesRegex(PermissionError, 'emergency stop'):
+                    await offline.sign(signal, 'proposal-sign', now=101)
+            with patch.dict(os.environ, OFFLINE_ENV):
+                sign_quoter.output = '180'
+                with self.assertRaises(ValueError):
+                    await offline.sign(signal, 'proposal-sign', now=101)
+                sign_quoter.output = '198'
+                sign_rpc.nonce = 8
+                with self.assertRaisesRegex(ValueError, 'behind'):
+                    await offline.sign(signal, 'proposal-sign', now=101)
+                sign_rpc.nonce = 7
+                signed = await offline.sign(signal, 'proposal-sign', now=101)
+            self.assertEqual(Account.recover_transaction(
+                signed.raw_transaction).lower(), follower)
+            self.assertNotIn(signed.raw_transaction.hex(), repr(signed))
+            self.assertNotIn('raw_transaction', repr(signed))
+            with self.assertRaises(TypeError):
+                vars(signed)
+            persisted = store.execution_plan('proposal-sign')
+            self.assertEqual((persisted['status'], persisted['signed_tx_hash']),
+                             ('signed', signed.signed_tx_hash))
+            self.assertTrue(persisted['final_review']['read_only'])
+            self.assertTrue(persisted['final_review']['relationship_revalidated'])
+            self.assertTrue(persisted['final_review']['transaction_fields_verified'])
+            self.assertEqual(persisted['final_review']['sender_recovered'], follower)
+            self.assertEqual(store.execution_nonce_reservation(
+                'proposal-sign')['status'], 'signed')
+            serialized = json.dumps(persisted)
+            self.assertNotIn(signed.raw_transaction.hex(), serialized)
+            self.assertNotIn(account.key.hex(), serialized)
+            self.assertEqual(prepared.nonce, 7)
+            self.assertTrue(gate.calls)
+            self.assertEqual(gate.calls[-1], ('42', follower, A, 'ab' * 32))
+            reviewer = ReadOnlyPreBroadcastReviewer(
+                store, sign_quoter, sign_rpc, policy, gate)
+            with patch.dict(os.environ, OFFLINE_ENV):
+                reviewed = await reviewer.review(
+                    signal, 'proposal-sign', signed.raw_transaction, now=101)
+                self.assertEqual(reviewed.signed_tx_hash, signed.signed_tx_hash)
+                self.assertFalse(reviewed.evidence['broadcast_performed'])
+                with self.assertRaisesRegex(ValueError, 'hash does not match'):
+                    await reviewer.review(
+                        signal, 'proposal-sign',
+                        signed.raw_transaction[:-1] + bytes([signed.raw_transaction[-1] ^ 1]),
+                        now=101)
+                sign_rpc.nonce = 8
+                with self.assertRaisesRegex(ValueError, 'exactly match'):
+                    await reviewer.review(
+                        signal, 'proposal-sign', signed.raw_transaction, now=101)
+            sign_rpc.nonce = 7
+            store.close()
+
+            reopened = Store(path)
+            recovery = OfflineExecutionSigner(
+                reopened, sign_quoter, sign_rpc, policy, 'ab' * 32,
+                signer_factory=Signer, relationship_gate=gate)
+            with patch.dict(os.environ, OFFLINE_ENV):
+                recovered = await recovery.recover_signed(
+                    signal, 'proposal-sign', now=101)
+            self.assertEqual(recovered.raw_transaction, signed.raw_transaction)
+            self.assertEqual(recovered.signed_tx_hash, signed.signed_tx_hash)
+            self.assertEqual(len(reopened.execution_attempts(prepared.plan_id)), 1)
+            self.assertTrue(reopened.observe_execution_attempt(
+                prepared.plan_id, signed.signed_tx_hash, prepared.transaction))
+            with patch.dict(os.environ, OFFLINE_ENV):
+                with self.assertRaisesRegex(ValueError, 'unavailable or stale'):
+                    await recovery.recover_signed(signal, 'proposal-sign', now=101)
+            reopened.close()
+
+        with tempfile.TemporaryDirectory() as folder:
+            asyncio.run(scenario(Path(folder) / 'offline-signing.sqlite3'))
+
+    def test_execution_preparer_persists_plan_nonce_and_restart_idempotency(self):
+        async def scenario(path):
+            store = Store(path)
+            store.start_paper_budget_cycle('cycle', 'test')
+            store.configure_paper_budget(A, 'USDG', '1000')
+            signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                            stage='swap_evidenced', execution_status='success', exact_in=True,
+                            token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                            evidence={'route': [R.USDG, TOKEN],
+                                      'actual_input_debit_raw': '100',
+                                      'actual_output_credit_raw': '200'})
+            store.put(signal)
+            self.assertTrue(store.reserve_paper_proposal({
+                'proposal_id': 'proposal-1', 'source_event_id': signal.event_id,
+                'source_tx_hash': TXHASH, 'wallet': A,
+                'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+                'input_asset': R.USDG, 'output_asset': TOKEN,
+                'budget_bucket': 'USDG', 'amount_in_raw': '100',
+                'attribution': {'smart_wallet': A, 'follower_wallet': B,
+                                'relationship_id': '42',
+                                'config_snapshot_hash': 'ab' * 32},
+            })[0])
+
+            class Quoter:
+                calls = 0
+
+                async def quote_with_reference(self, source, amount):
+                    self.calls += 1
+                    return (Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, TOKEN, amount, '198'),
+                            Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, TOKEN, '1', '2'), '100')
+
+            class Rpc:
+                async def call(self, method, params=None):
+                    return {'eth_getTransactionCount': '0x7',
+                            'eth_getBalance': hex(100000000),
+                            'eth_gasPrice': '0x64',
+                            'eth_call': '0x64'}[method]
+
+            quoter = Quoter()
+            policy = QuotePolicy(max_adverse_deviation_bps=200,
+                                 max_price_impact_bps=200,
+                                 max_gas_cost_wei='30000000')
+            preparer = ExecutionPreparer(
+                store, quoter, Rpc(), policy, frozenset({'v2'}),
+                frozenset({R.USDG, TOKEN}), frozenset({signal_route_key(signal)}),
+                'ab' * 32)
+            prepared = await preparer.prepare(signal, 'proposal-1', now=101)
+            self.assertEqual((prepared.nonce, prepared.existing), (7, False))
+            self.assertEqual(prepared.transaction['to'].lower(), R.V2_ROUTER)
+            duplicate = await preparer.prepare(signal, 'proposal-1', now=102)
+            self.assertEqual((duplicate.plan_id, duplicate.nonce, duplicate.existing),
+                             (prepared.plan_id, 7, True))
+            self.assertEqual(quoter.calls, 1)
+            store.close()
+            reopened = Store(path)
+            persisted = reopened.execution_plan('proposal-1')
+            self.assertEqual((persisted['transaction']['nonce'], persisted['status']),
+                             (7, 'prepared'))
+            self.assertNotIn('private', json.dumps(persisted).lower())
+            reopened.connection.execute(
+                "UPDATE execution_plans SET preflight_payload=? WHERE proposal_id=?",
+                (json.dumps({'read_only': False}), 'proposal-1'))
+            reopened.connection.commit()
+            with self.assertRaisesRegex(ValueError, 'integrity mismatch'):
+                reopened.execution_plan('proposal-1')
+            reopened.close()
+
+        with tempfile.TemporaryDirectory() as folder:
+            asyncio.run(scenario(Path(folder) / 'execution.sqlite3'))
+
+    def test_execution_builder_emits_v2_v3_and_bounded_native_v4_calldata(self):
+        common = dict(
+            follower_wallet=B, relationship_id='42', proposal_id='proposal-1',
+            minimum_amount_out_raw='190', deadline=200, gas_limit=200000,
+            max_fee_per_gas='100', max_priority_fee_per_gas='1',
+        )
+        v2 = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                    stage='swap_evidenced', execution_status='success', exact_in=True,
+                    token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                    evidence={'route': [R.USDG, TOKEN]})
+        v2_quote = Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32, 100.0,
+                         R.USDG, TOKEN, '100', '200')
+        route = frozenset({signal_route_key(v2)})
+        plan = build_execution_plan(
+            v2, quote=v2_quote, allowed_protocols=frozenset({'v2'}),
+            allowed_assets=frozenset({R.USDG, TOKEN}), allowed_routes=route, **common)
+        signature = 'swapExactTokensForTokens(uint256,uint256,address[],address,uint256)'
+        self.assertEqual(bytes.fromhex(plan.data[2:10]), selector(signature))
+        decoded = decode(['uint256', 'uint256', 'address[]', 'address', 'uint256'],
+                         bytes.fromhex(plan.data[10:]))
+        self.assertEqual((decoded[0], decoded[1], decoded[3], decoded[4]),
+                         (100, 190, B, 200))
+        for unsafe in (
+                replace(v2, stage='needs_review'),
+                replace(v2, execution_status='unknown'),
+                replace(v2, canonical_status='orphaned'),
+                replace(v2, behavior='UNKNOWN')):
+            with self.assertRaisesRegex(ValueError, 'not eligible'):
+                build_execution_plan(
+                    unsafe, quote=v2_quote, allowed_protocols=frozenset({'v2'}),
+                    allowed_assets=frozenset({R.USDG, TOKEN}),
+                    allowed_routes=route, **common)
+
+        v3 = replace(v2, contract=R.V3_ROUTER, protocol='v3',
+                     evidence={'hops': [{'token_in': R.USDG,
+                                         'token_out': TOKEN, 'fee': 500}]})
+        v3_quote = replace(v2_quote, protocol='v3')
+        v3_plan = build_execution_plan(
+            v3, quote=v3_quote, allowed_protocols=frozenset({'v3'}),
+            allowed_assets=frozenset({R.USDG, TOKEN}),
+            allowed_routes=frozenset({signal_route_key(v3)}), **common)
+        self.assertEqual(bytes.fromhex(v3_plan.data[2:10]),
+                         selector('exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))'))
+        params = decode(['(address,address,uint24,address,uint256,uint256,uint160)'],
+                        bytes.fromhex(v3_plan.data[10:]))[0]
+        self.assertEqual((params[2], params[3], params[4], params[5]), (500, B, 100, 190))
+        token_v4 = replace(
+            v2, contract=R.UNIVERSAL_ROUTER, protocol='v4',
+            evidence={'pool_key': [R.USDG, TOKEN, 3000, 60, R.NATIVE],
+                      'hook_data': '0x'})
+        with self.assertRaisesRegex(ValueError, 'Permit2'):
+            build_execution_plan(
+                token_v4, quote=replace(v2_quote, protocol='v4'),
+                allowed_protocols=frozenset({'v4'}),
+                allowed_assets=frozenset({R.USDG, TOKEN}),
+                allowed_routes=frozenset({signal_route_key(token_v4)}), **common)
+
+        v4 = replace(v2, contract=R.UNIVERSAL_ROUTER, protocol='v4',
+                     token_in=R.NATIVE,
+                     evidence={'pool_key': [R.NATIVE, TOKEN, 3000, 60, R.NATIVE],
+                               'hook_data': '0x'})
+        v4_quote = Quote('v4', R.V4_QUOTER, 10, '0x' + 'ab' * 32, 100.0,
+                         R.NATIVE, TOKEN, '100', '200')
+        v4_plan = build_execution_plan(
+            v4, quote=v4_quote, allowed_protocols=frozenset({'v4'}),
+            allowed_assets=frozenset({R.NATIVE, TOKEN}),
+            allowed_routes=frozenset({signal_route_key(v4)}), **common)
+        self.assertEqual((v4_plan.to, v4_plan.value_raw), (R.UNIVERSAL_ROUTER, '100'))
+        decoded_v4 = Decoder({B: {}}).decode(Transaction(
+            TXHASH, B, R.UNIVERSAL_ROUTER, bytes.fromhex(v4_plan.data[2:]),
+            value=100, fresh=True))[0]
+        self.assertEqual((decoded_v4.protocol, decoded_v4.exact_in,
+                          decoded_v4.token_in, decoded_v4.token_out),
+                         ('v4', True, R.NATIVE, TOKEN))
+        self.assertEqual([item['action'] for item in
+                          decoded_v4.evidence['v4_settlement_actions']],
+                         ['SETTLE_ALL', 'TAKE_ALL'])
+        self.assertEqual(decoded_v4.evidence['v4_settlement_actions'][1]['recipient'], B)
+        unknown_hook = replace(
+            v4, evidence={'pool_key': [R.NATIVE, TOKEN, 3000, 60, '0x' + '12' * 20],
+                          'hook_data': '0x'})
+        with self.assertRaisesRegex(ValueError, 'hook is not approved'):
+            build_execution_plan(
+                unknown_hook, quote=v4_quote, allowed_protocols=frozenset({'v4'}),
+                allowed_assets=frozenset({R.NATIVE, TOKEN}),
+                allowed_routes=frozenset({signal_route_key(unknown_hook)}), **common)
+
+    def test_nonce_reservations_are_persistent_idempotent_and_gap_free(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'nonce.sqlite3'
+            store = Store(path)
+            self.assertEqual(store.reserve_execution_nonce(
+                'r1', B, 'rel-1', 'proposal-1', R.CHAIN_ID, 7), (7, 'reserved'))
+            self.assertEqual(store.reserve_execution_nonce(
+                'r1-other', B, 'rel-1', 'proposal-1', R.CHAIN_ID, 99),
+                (7, 'reserved'))
+            self.assertEqual(store.reserve_execution_nonce(
+                'r2', B, 'rel-2', 'proposal-2', R.CHAIN_ID, 7), (8, 'reserved'))
+            store.close()
+            reopened = Store(path)
+            self.assertEqual(reopened.execution_nonce_reservation('proposal-2')['nonce'], 8)
+            self.assertTrue(reopened.update_execution_nonce_status('r1', 'reserved', 'signed'))
+            self.assertFalse(reopened.update_execution_nonce_status('r1', 'reserved', 'released'))
+            with self.assertRaisesRegex(ValueError, 'transition'):
+                reopened.update_execution_nonce_status('r1', 'signed', 'confirmed')
+            reopened.close()
+
+    def test_readonly_execution_preflight_checks_nonce_balances_and_gas(self):
+        plan = UnsignedExecutionPlan(
+            follower_wallet=B, relationship_id='42', proposal_id='proposal-1',
+            to=R.V2_ROUTER, data='0x12345678', value_raw='0', input_asset=R.USDG,
+            amount_in_raw='100', minimum_amount_out_raw='190', gas_limit=200000,
+            max_fee_per_gas='100', max_priority_fee_per_gas='1',
+            quote_observed_at=100.0, quote_block_number=10,
+            quote_block_hash='0x' + 'ab' * 32, deadline=200,
+        )
+
+        class Rpc:
+            async def call(self, method, params=None):
+                if method == 'eth_getTransactionCount':
+                    return '0x7'
+                if method == 'eth_getBalance':
+                    return hex(100000000)
+                if method == 'eth_gasPrice':
+                    return '0x32'
+                if method == 'eth_call':
+                    self.calls = getattr(self, 'calls', []) + [params]
+                    return '0x64'
+                raise AssertionError(method)
+
+        rpc = Rpc()
+        result = asyncio.run(ReadOnlyExecutionPreflight(
+            rpc, frozenset({R.V2_ROUTER}), '30000000').check(plan, now=101))
+        self.assertEqual((result['pending_nonce'], result['token_balance_raw'],
+                          result['maximum_gas_cost_wei'], result['read_only']),
+                         (7, '100', '20000000', True))
+        self.assertEqual(result['token_allowance_raw'], '100')
+        self.assertEqual([call[1] for call in rpc.calls], ['pending', 'pending'])
+        expired = replace(plan, quote_observed_at=90.0)
+        with self.assertRaisesRegex(ValueError, 'expired'):
+            asyncio.run(ReadOnlyExecutionPreflight(
+                rpc, frozenset({R.V2_ROUTER}), '30000000').check(expired, now=101))
+
+    def test_database_signer_is_offline_gated_and_never_exposes_key(self):
+        account = Account.create()
+
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def execute(self, sql, params):
+                self.sql, self.params = sql, params
+
+            def fetchall(self):
+                return [{'private_key_hex': '0x' + account.key.hex()}]
+
+        class Connection:
+            def cursor(self):
+                return Cursor()
+
+            def close(self):
+                self.closed = True
+
+        signer = OfflineDatabaseSigner(account.address)
+        with patch.dict(os.environ, {}, clear=False):
+            for key in OFFLINE_ENV:
+                os.environ.pop(key, None)
+            with self.assertRaisesRegex(PermissionError, 'emergency stop'):
+                signer.sign_transaction({})
+        transaction = {
+            'chainId': R.CHAIN_ID, 'nonce': 0,
+            'to': '0x' + '12' * 20, 'value': 0, 'data': '0x',
+            'gas': 21000, 'maxFeePerGas': 2, 'maxPriorityFeePerGas': 1,
+            'type': 2,
+        }
+        with patch.dict(os.environ, OFFLINE_ENV), \
+                patch('smart_money.key_source._key_connection', return_value=Connection()):
+            raw = signer.sign_transaction(transaction)
+        self.assertEqual(Account.recover_transaction(raw).lower(), account.address.lower())
+        self.assertNotIn(account.key.hex(), repr(signer))
+
+    def test_key_status_reads_only_public_metadata_and_is_offline_gated(self):
+        queries = []
+
+        with patch.dict(os.environ, {}, clear=True), patch(
+                'smart_money.key_source.pymysql.connect') as connect:
+            with self.assertRaises(PermissionError):
+                key_record_status(B)
+            connect.assert_not_called()
+
+        class Cursor:
+            rows = [{'wallet_address': B, 'enabled': 1}]
+
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def execute(self, sql, params):
+                queries.append((sql, params))
+            def fetchall(self): return self.rows
+
+        class Connection:
+            def cursor(self): return Cursor()
+            def close(self): self.closed = True
+
+        with patch.dict(os.environ, OFFLINE_ENV), patch(
+                'smart_money.key_source._key_connection', return_value=Connection()):
+            status = key_record_status(B)
+        self.assertEqual(status, {
+            'wallet_address': B, 'found': True, 'enabled': True,
+            'private_key_read': False, 'read_only': True,
+        })
+        self.assertEqual(queries[0][1], (B,))
+        self.assertNotIn('private_key', queries[0][0].lower())
+
+        Cursor.rows = []
+        with patch.dict(os.environ, OFFLINE_ENV), patch(
+                'smart_money.key_source._key_connection', return_value=Connection()):
+            status = key_record_status(B)
+        self.assertFalse(status['found'])
+        self.assertFalse(status['enabled'])
+        self.assertFalse(status['private_key_read'])
+
+    def test_execution_process_controls_require_three_offline_switches_and_never_mainnet(self):
+        with patch.dict(os.environ, {}, clear=False):
+            for key in OFFLINE_ENV:
+                os.environ.pop(key, None)
+            with self.assertRaisesRegex(PermissionError, 'emergency stop'):
+                require_offline_signing_enabled()
+        for missing in OFFLINE_ENV:
+            values = dict(OFFLINE_ENV)
+            values.pop(missing)
+            with patch.dict(os.environ, values, clear=True):
+                with self.assertRaises(PermissionError):
+                    require_offline_signing_enabled()
+        with patch.dict(os.environ, OFFLINE_ENV, clear=True):
+            require_offline_signing_enabled()
+        with tempfile.TemporaryDirectory() as folder:
+            stop_file = Path(folder) / 'EXECUTION_STOP'
+            stop_file.write_text('stop\n')
+            with patch.dict(os.environ, {
+                    **OFFLINE_ENV,
+                    'SMART_MONEY_EMERGENCY_STOP_FILE': str(stop_file),
+            }, clear=True):
+                with self.assertRaisesRegex(PermissionError, 'stop file'):
+                    require_offline_signing_enabled()
+        with patch.dict(os.environ, {
+                'SMART_MONEY_EXECUTION_MODE': 'mainnet',
+                'SMART_MONEY_SIGNING_MODE': 'mainnet',
+                'SMART_MONEY_BROADCAST_ENABLED': '1',
+                'SMART_MONEY_EMERGENCY_STOP': '0',
+        }, clear=True):
+            with self.assertRaisesRegex(PermissionError, 'not implemented or authorized'):
+                require_mainnet_broadcast_enabled()
+
+    def test_final_execution_review_rejects_secret_or_raw_transaction_fields(self):
+        store = Store(':memory:')
+        tx_hash = '0x' + '91' * 32
+        for evidence in ({'private_key': 'never'}, {'raw_transaction': '0x1234'}):
+            with self.assertRaisesRegex(ValueError, 'invalid final execution review'):
+                store.mark_execution_plan_signed('missing', 'missing', tx_hash, evidence)
+        store.close()
+
+    def test_remote_mysql_requires_ca_before_credentials_are_used(self):
+        with patch.dict(os.environ, {
+                'SMART_MONEY_MYSQL_HOST': 'remote.example',
+                'SMART_MONEY_MYSQL_PASSWORD': 'must-not-leak',
+        }, clear=False), patch('smart_money.mysql_config.pymysql.connect') as connect:
+            os.environ.pop('SMART_MONEY_MYSQL_SSL_CA', None)
+            with self.assertRaisesRegex(ValueError, 'requires SMART_MONEY_MYSQL_SSL_CA'):
+                mysql_connection()
+            connect.assert_not_called()
+
+    def test_relationship_import_rejects_new_zero_wallet_placeholders(self):
+        with patch('smart_money.mysql_config.mysql_connection') as connect:
+            with self.assertRaisesRegex(ValueError, 'zero follower wallet'):
+                import_watchlist_relationships(
+                    R.NATIVE, 'invalid', ROOT / 'data/fomo_watchlist.csv',
+                    ROOT / 'config/paper.example.json')
+            connect.assert_not_called()
+        with patch('smart_money.mysql_config.load_watchlist',
+                   return_value={R.NATIVE: {'handle': 'invalid'}}), patch(
+                       'smart_money.mysql_config.mysql_connection') as connect:
+            with self.assertRaisesRegex(ValueError, 'zero smart wallet'):
+                import_watchlist_relationships(
+                    B, 'follower', 'unused.csv',
+                    ROOT / 'config/paper.example.json')
+            connect.assert_not_called()
+
+    def test_remote_mysql_never_falls_back_to_local_credentials(self):
+        with patch.dict(os.environ, {
+                'SMART_MONEY_MYSQL_HOST': 'remote.example',
+                'SMART_MONEY_MYSQL_SSL_CA': '/trusted/ca.pem',
+        }, clear=True), patch('smart_money.mysql_config.pymysql.connect') as connect:
+            with self.assertRaisesRegex(ValueError, 'requires explicit connection settings'):
+                mysql_connection()
+            connect.assert_not_called()
+
+        with patch.dict(os.environ, {
+                **OFFLINE_ENV,
+                'SMART_MONEY_KEY_MYSQL_HOST': 'keys.remote.example',
+                'SMART_MONEY_KEY_MYSQL_SSL_CA': '/trusted/ca.pem',
+        }, clear=True), patch('smart_money.key_source.pymysql.connect') as connect:
+            signer = OfflineDatabaseSigner(B)
+            with self.assertRaisesRegex(ValueError, 'requires explicit connection settings'):
+                signer._load_account()
+            connect.assert_not_called()
+
+    def test_mysql_connection_errors_do_not_leak_remote_credentials(self):
+        config_env = {
+            'SMART_MONEY_MYSQL_HOST': 'remote.example',
+            'SMART_MONEY_MYSQL_PORT': '3306',
+            'SMART_MONEY_MYSQL_USER': 'runtime-user',
+            'SMART_MONEY_MYSQL_PASSWORD': 'config-secret-value',
+            'SMART_MONEY_MYSQL_DATABASE': 'smart_money',
+            'SMART_MONEY_MYSQL_SSL_CA': '/trusted/ca.pem',
+        }
+        with patch.dict(os.environ, config_env, clear=True), patch(
+                'smart_money.mysql_config.pymysql.connect',
+                side_effect=RuntimeError('server repeated config-secret-value')):
+            with self.assertRaises(ValueError) as caught:
+                mysql_connection()
+        self.assertNotIn('config-secret-value', str(caught.exception))
+
+        key_env = {
+            **OFFLINE_ENV,
+            'SMART_MONEY_KEY_MYSQL_HOST': 'keys.remote.example',
+            'SMART_MONEY_KEY_MYSQL_PORT': '3306',
+            'SMART_MONEY_KEY_MYSQL_USER': 'key-runtime-user',
+            'SMART_MONEY_KEY_MYSQL_PASSWORD': 'key-secret-value',
+            'SMART_MONEY_KEY_MYSQL_DATABASE': 'smart_money_keys',
+            'SMART_MONEY_KEY_MYSQL_SSL_CA': '/trusted/key-ca.pem',
+        }
+        with patch.dict(os.environ, key_env, clear=True), patch(
+                'smart_money.key_source.pymysql.connect',
+                side_effect=RuntimeError('server repeated key-secret-value')):
+            with self.assertRaises(ValueError) as caught:
+                OfflineDatabaseSigner(B)._load_account()
+        self.assertNotIn('key-secret-value', str(caught.exception))
+
+    def test_mysql_relationship_gate_fails_closed_on_disable_or_snapshot_change(self):
+        base = load_paper_config(ROOT / 'config/paper.example.json').relationships[0]
+        policy = replace(base, follower_wallet=B, relationship_id='42',
+                         snapshot_hash='ab' * 32)
+        gate = MySqlRelationshipGate()
+        with patch('smart_money.mysql_config.load_enabled_relationship_policy',
+                   return_value=policy):
+            self.assertIs(gate.validate('42', B, policy.wallet, 'ab' * 32), policy)
+            with self.assertRaisesRegex(
+                    ValueError, 'no longer matches execution snapshot'):
+                gate.validate('42', B, policy.wallet, 'cd' * 32)
+        with patch('smart_money.mysql_config.load_enabled_relationship_policy',
+                   side_effect=ValueError('relationship is disabled or unavailable')):
+            with self.assertRaisesRegex(ValueError, 'disabled or unavailable'):
+                gate.validate('42', B, policy.wallet, 'ab' * 32)
+
+    def test_mysql_relationship_rows_reuse_strict_paper_validation(self):
+        template = json.loads((ROOT / 'config/paper.example.json').read_text())
+        policy = template['wallets'][0]
+        row = {
+            'id': 7,
+            'follower_wallet': '0x' + '11' * 20, 'follower_label': 'paper-wallet',
+            'smart_wallet': '0x' + '22' * 20, 'smart_wallet_label': 'smart-a',
+            'run_mode': 'paper', 'strategy_version': template['strategy_version'],
+            'trigger_mode': template['trigger_mode'],
+            'shadow_trigger_modes': template['shadow_trigger_modes'],
+            'quote_policy': template['quote_policy'],
+            'allowed_protocols': template['allowed_protocols'],
+            'allowed_assets': template['allowed_assets'],
+            'allowed_routes': template['allowed_routes'],
+            'usdg_rule_mode': policy['buy_rules']['USDG']['mode'],
+            'usdg_fixed_amount_raw': policy['buy_rules']['USDG']['fixed_amount_raw'],
+            'usdg_ratio_ppm': None,
+            'usdg_budget_limit_raw': policy['budget_limits']['USDG'],
+            'eth_rule_mode': policy['buy_rules']['ETH_WETH']['mode'],
+            'eth_fixed_amount_raw': None,
+            'eth_ratio_ppm': policy['buy_rules']['ETH_WETH']['ratio_ppm'],
+            'eth_budget_limit_raw': policy['budget_limits']['ETH_WETH'],
+            'sell_rule_mode': policy['sell_rule']['mode'],
+            'sell_fixed_amount_raw': None,
+            'sell_ratio_ppm': policy['sell_rule']['ratio_ppm'],
+        }
+        document = rows_to_document([row])
+        self.assertEqual(document['wallets'][0]['wallet'], '0x' + '22' * 20)
+        self.assertEqual(document['wallets'][0]['follower_wallet'], '0x' + '11' * 20)
+        self.assertEqual(document['wallets'][0]['relationship_id'], '7')
+        self.assertEqual(document['wallets'][0]['buy_rules']['USDG'],
+                         {'mode': 'fixed', 'fixed_amount_raw': '1000000'})
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'mysql-converted.json'
+            path.write_text(json.dumps(document))
+            converted = load_paper_config(path)
+            self.assertEqual(len(converted.snapshot_hash), 64)
+            self.assertEqual(converted.wallets['0x' + '22' * 20].follower_wallet,
+                             '0x' + '11' * 20)
+        second = dict(row, id=8, follower_wallet='0x' + '33' * 20)
+        multi = rows_to_document([row, second])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'multi-follower.json'
+            path.write_text(json.dumps(multi))
+            converted = load_paper_config(path)
+        self.assertEqual(len(converted.relationships), 2)
+        self.assertEqual(len(converted.policies_for('0x' + '22' * 20)), 2)
+        self.assertNotEqual(converted.relationships[0].ledger_scope,
+                            converted.relationships[1].ledger_scope)
+
+    def test_same_smart_wallet_relationships_have_isolated_budget_and_proposals(self):
+        async def scenario():
+            template = json.loads((ROOT / 'config/paper.example.json').read_text())
+            base = template['wallets'][0]
+            base['wallet'] = A
+            base['follower_wallet'], base['relationship_id'] = B, 'relationship-a'
+            second = deepcopy(base)
+            second['follower_wallet'], second['relationship_id'] = TOKEN, 'relationship-b'
+            template['wallets'] = [base, second]
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / 'relationships.json'
+                path.write_text(json.dumps(template))
+                config = load_paper_config(path)
+            store = Store(':memory:')
+            store.start_paper_budget_cycle('multi-cycle', 'test')
+            for policy in config.relationships:
+                store.configure_paper_budget(policy.ledger_scope, 'USDG', '100000000')
+            signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                            stage='swap_evidenced', execution_status='success', exact_in=True,
+                            token_in=R.USDG, token_out=R.WETH, protocol='v2',
+                            evidence={'route': [R.USDG, R.WETH],
+                                      'actual_input_debit_raw': '1000000',
+                                      'actual_output_credit_raw': '2000000'})
+
+            class Quoter:
+                async def quote_with_reference(self, source, amount):
+                    return (Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, R.WETH, amount, '2000000'),
+                            Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, R.WETH, '1', '2'), '1')
+
+            decisions = []
+            for policy in config.relationships:
+                engine = PaperEngine(
+                    store, Quoter(), config.quote_policy, config.strategy_version,
+                    allowed_protocols=config.allowed_protocols,
+                    allowed_assets=config.allowed_assets,
+                    allowed_routes=config.allowed_routes,
+                    wallet_contexts={A: {'follower_wallet': policy.follower_wallet,
+                                         'relationship_id': policy.relationship_id,
+                                         'ledger_scope': policy.ledger_scope}},
+                    config_snapshot_hash=config.snapshot_hash)
+                decisions.append(await engine.propose_buy(
+                    signal, policy.buy_rules['USDG'], now=100))
+            self.assertTrue(all(item.accepted for item in decisions))
+            self.assertNotEqual(decisions[0].proposal_id, decisions[1].proposal_id)
+            for policy in config.relationships:
+                budget = store.paper_budget(policy.ledger_scope, 'USDG')
+                self.assertEqual((budget['reserved_raw'], budget['invested_raw']),
+                                 ('1000000', '0'))
+            proposals = [store.paper_proposal(item.proposal_id) for item in decisions]
+            self.assertEqual({row['source_event_id'] for row in proposals}, {signal.event_id})
+            self.assertEqual({row['attribution']['follower_wallet'] for row in proposals},
+                             {B, TOKEN})
+            store.close()
+
+        asyncio.run(scenario())
+
+    def test_mysql_relationships_can_use_independent_strategy_and_risk_policy(self):
+        template = json.loads((ROOT / 'config/paper.example.json').read_text())
+        policy = template['wallets'][0]
+
+        def row(row_id, follower, strategy, trigger, max_slippage):
+            quote_policy = dict(template['quote_policy'], max_slippage_bps=max_slippage)
+            shadows = [mode for mode in ('feed_intent', 'receipt_success', 'swap_evidenced')
+                       if mode != trigger]
+            return {
+                'id': row_id, 'follower_wallet': follower, 'follower_label': 'follower',
+                'smart_wallet': A, 'smart_wallet_label': 'smart', 'run_mode': 'paper',
+                'strategy_version': strategy, 'trigger_mode': trigger,
+                'shadow_trigger_modes': shadows, 'quote_policy': quote_policy,
+                'allowed_protocols': template['allowed_protocols'],
+                'allowed_assets': template['allowed_assets'],
+                'allowed_routes': template['allowed_routes'],
+                'usdg_rule_mode': 'fixed', 'usdg_fixed_amount_raw': '1000000',
+                'usdg_ratio_ppm': None,
+                'usdg_budget_limit_raw': policy['budget_limits']['USDG'],
+                'eth_rule_mode': 'proportional', 'eth_fixed_amount_raw': None,
+                'eth_ratio_ppm': 100000,
+                'eth_budget_limit_raw': policy['budget_limits']['ETH_WETH'],
+                'sell_rule_mode': 'proportional', 'sell_fixed_amount_raw': None,
+                'sell_ratio_ppm': 100000,
+            }
+
+        rows = [row(7, B, 'strategy-a', 'swap_evidenced', 100),
+                row(8, TOKEN, 'strategy-b', 'receipt_success', 500)]
+
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def execute(self, sql): self.sql = sql
+            def fetchall(self): return rows
+
+        class Connection:
+            def cursor(self): return Cursor()
+            def close(self): pass
+
+        with patch('smart_money.mysql_config.mysql_connection', return_value=Connection()):
+            config = load_mysql_paper_config()
+        self.assertEqual([item.strategy_version for item in config.relationships],
+                         ['strategy-a', 'strategy-b'])
+        self.assertEqual([item.trigger_mode for item in config.relationships],
+                         ['swap_evidenced', 'receipt_success'])
+        self.assertEqual([item.quote_policy.max_slippage_bps
+                          for item in config.relationships], [100, 500])
+        self.assertNotEqual(config.relationships[0].snapshot_hash,
+                            config.relationships[1].snapshot_hash)
+
+    def test_paper_config_is_strict_secret_free_and_defaults_to_evidenced(self):
+        config = load_paper_config(ROOT / 'config/paper.example.json')
+        self.assertEqual(config.trigger_mode, 'swap_evidenced')
+        self.assertEqual(config.shadow_trigger_modes, ('feed_intent', 'receipt_success'))
+        self.assertEqual(config.allowed_protocols, frozenset({'v2', 'v3', 'v4'}))
+        self.assertEqual(len(config.allowed_routes), 2)
+        policy = config.wallets['0x' + '00' * 19 + '01']
+        self.assertEqual(policy.label, 'replace-with-smart-wallet-label')
+        self.assertEqual(policy.budget_limits['USDG'], '100000000')
+        self.assertEqual(policy.buy_rules['USDG'].fixed_amount_raw, '1000000')
+
+        document = json.loads((ROOT / 'config/paper.example.json').read_text())
+        document['private_key'] = 'must-never-be-accepted'
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'bad.json'
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, 'paper config fields'):
+                load_paper_config(path)
+
+    def test_paper_config_rejects_zero_relationship_wallets_but_allows_native_asset(self):
+        document = json.loads((ROOT / 'config/paper.example.json').read_text())
+        self.assertIn(R.NATIVE, document['allowed_assets'])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'zero-wallet.json'
+            for field, reason in (
+                    ('wallet', 'zero smart wallet'),
+                    ('follower_wallet', 'zero follower wallet')):
+                changed = deepcopy(document)
+                changed['wallets'][0][field] = R.NATIVE
+                path.write_text(json.dumps(changed))
+                with self.assertRaisesRegex(ValueError, reason):
+                    load_paper_config(path)
+
+    def test_paper_config_rejects_trigger_overlap_and_bucket_rule_gaps(self):
+        document = json.loads((ROOT / 'config/paper.example.json').read_text())
+        document['shadow_trigger_modes'].append('swap_evidenced')
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'bad-trigger.json'
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, 'shadow trigger'):
+                load_paper_config(path)
+            document['shadow_trigger_modes'] = []
+            del document['wallets'][0]['buy_rules']['USDG']
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, 'same supported buckets'):
+                load_paper_config(path)
+            document['wallets'][0]['buy_rules']['USDG'] = {
+                'mode': 'fixed', 'fixed_amount_raw': 100,
+            }
+            document['wallets'][0]['budget_limits']['USDG'] = '1000'
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, 'fixed amount'):
+                load_paper_config(path)
+
+    def test_paper_amount_policy_uses_verified_input_and_asset_bucket(self):
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x12345678',
+                        stage='swap_evidenced', token_in=R.USDG, token_out=TOKEN,
+                        execution_status='success',
+                        evidence={'actual_input_debit_raw': '1001'})
+        self.assertEqual(budget_bucket(R.USDG), 'USDG')
+        self.assertEqual(budget_bucket(R.NATIVE), 'ETH_WETH')
+        self.assertEqual(budget_bucket(R.WETH), 'ETH_WETH')
+        self.assertEqual(budget_bucket(TOKEN), None)
+        amount, bucket = planned_input_amount(
+            signal, AmountRule('proportional', ratio_ppm=100_000))
+        self.assertEqual((amount, bucket), ('100', 'USDG'))
+        signal.evidence.clear()
+        self.assertEqual(planned_input_amount(
+            signal, AmountRule('fixed', fixed_amount_raw='50')),
+            ('50', 'USDG'))
+        self.assertEqual(planned_input_amount(
+            signal, AmountRule('proportional', ratio_ppm=100_000)),
+            (None, 'verified_actual_input_missing'))
+        sell = Signal(TXHASH, A, 'direct', 'SELL', 'call', R.V2_ROUTER, '0',
+                      stage='swap_evidenced', token_in=TOKEN, token_out=R.USDG,
+                      evidence={'actual_input_debit_raw': '301'})
+        self.assertEqual(planned_input_amount(
+            sell, AmountRule('proportional', ratio_ppm=500_000)), ('150', 'USDG'))
+
+    def test_paper_trigger_modes_fail_closed(self):
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x12345678',
+                        stage='swap_evidenced', execution_status='success', fresh=True)
+        self.assertEqual(trigger_allowed(signal, 'swap_evidenced'), (True, None))
+        signal.canonical_status = 'orphaned'
+        self.assertEqual(trigger_allowed(signal, 'feed_intent'),
+                         (False, 'source_signal_orphaned'))
+        signal.canonical_status = 'unconfirmed'
+        signal.stage = 'needs_review'
+        self.assertEqual(trigger_allowed(signal, 'receipt_success'),
+                         (False, 'source_signal_not_eligible'))
+
+    def test_paper_asset_allowlist_covers_every_route_intermediate(self):
+        middle = '0x' + '44' * 20
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V3_ROUTER, '0x',
+                        protocol='v3', token_in=R.USDG, token_out=TOKEN,
+                        evidence={'hops': [
+                            {'token_in': R.USDG, 'token_out': middle, 'fee': 500},
+                            {'token_in': middle, 'token_out': TOKEN, 'fee': 3000},
+                        ]})
+        self.assertEqual(scope_reason(
+            signal, frozenset({'v3'}), frozenset({R.USDG, TOKEN})),
+            'asset_not_allowed')
+        self.assertIsNone(scope_reason(
+            signal, frozenset({'v3'}), frozenset({R.USDG, middle, TOKEN})))
+
+    def test_paper_route_allowlist_is_fee_aware_and_direction_symmetric(self):
+        config = load_paper_config(ROOT / 'config/paper.example.json')
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V3_ROUTER, '0x',
+                        protocol='v3', token_in=R.WETH, token_out=R.USDG,
+                        evidence={'hops': [
+                            {'token_in': R.WETH, 'token_out': R.USDG, 'fee': 500},
+                        ]})
+        self.assertIn(signal_route_key(signal), config.allowed_routes)
+        self.assertIsNone(scope_reason(signal, config.allowed_protocols,
+                                       config.allowed_assets, config.allowed_routes))
+        reverse = replace(signal, token_in=R.USDG, token_out=R.WETH,
+                          evidence={'hops': [
+                              {'token_in': R.USDG, 'token_out': R.WETH, 'fee': 500},
+                          ]})
+        self.assertEqual(signal_route_key(reverse), signal_route_key(signal))
+        wrong_fee = replace(signal, evidence={'hops': [
+            {'token_in': R.WETH, 'token_out': R.USDG, 'fee': 3000},
+        ]})
+        self.assertEqual(scope_reason(wrong_fee, config.allowed_protocols,
+                                      config.allowed_assets, config.allowed_routes),
+                         'route_not_allowed')
+        document = json.loads((ROOT / 'config/paper.example.json').read_text())
+        document['allowed_routes'].append({
+            'protocol': 'v4', 'assets': [R.NATIVE, R.USDG], 'fees': [500],
+            'tick_spacings': [10], 'hooks': [R.NATIVE], 'hook_data': ['0x'],
+        })
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'routes.json'
+            path.write_text(json.dumps(document))
+            extended = load_paper_config(path)
+        v4 = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.UNIVERSAL_ROUTER, '0x',
+                    protocol='v4', token_in=R.NATIVE, token_out=R.USDG,
+                    evidence={'pool_key': [R.NATIVE, R.USDG, 500, 10, R.NATIVE],
+                              'hook_data': '0x'})
+        self.assertIsNone(scope_reason(v4, extended.allowed_protocols,
+                                       extended.allowed_assets, extended.allowed_routes))
+        v4.evidence['hook_data'] = '0x12'
+        self.assertEqual(scope_reason(v4, extended.allowed_protocols,
+                                      extended.allowed_assets, extended.allowed_routes),
+                         'route_not_allowed')
+
+    def test_paper_budget_reservation_is_atomic_idempotent_and_persistent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'paper.sqlite3'
+            store = Store(path)
+            store.start_paper_budget_cycle('manual-1', 'operator_started')
+            very_large = str(10 ** 30)
+            store.configure_paper_budget(A, 'USDG', very_large)
+            proposal = {
+                'proposal_id': 'p1', 'source_event_id': 'event-1',
+                'source_tx_hash': TXHASH, 'wallet': A,
+                'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+                'input_asset': R.USDG, 'output_asset': TOKEN,
+                'budget_bucket': 'USDG', 'amount_in_raw': str(6 * 10 ** 29),
+                'attribution': {'smart_wallet': A, 'source_tx_hash': TXHASH},
+            }
+            self.assertEqual(store.reserve_paper_proposal(proposal), (True, 'reserved'))
+            self.assertEqual(store.reserve_paper_proposal(proposal),
+                             (True, 'proposal_already_exists'))
+            self.assertEqual(store.paper_budget(A, 'USDG')['available_raw'],
+                             str(4 * 10 ** 29))
+            too_large = dict(proposal, proposal_id='p2', source_event_id='event-2',
+                             amount_in_raw=str(5 * 10 ** 29))
+            self.assertEqual(store.reserve_paper_proposal(too_large),
+                             (False, 'budget_limit_exceeded'))
+            with self.assertRaisesRegex(ValueError, 'active reservations'):
+                store.start_paper_budget_cycle('manual-2', 'unsafe_reset')
+            store.close()
+            reopened = Store(path)
+            self.assertEqual(reopened.active_paper_budget_cycle(), 'manual-1')
+            self.assertEqual(reopened.paper_budget(A, 'USDG')['reserved_raw'],
+                             str(6 * 10 ** 29))
+            reopened.close()
+
+    def test_reserved_paper_proposal_and_source_signal_survive_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'paper-recovery.sqlite3'
+            store = Store(path)
+            store.start_paper_budget_cycle('manual-1', 'operator_started')
+            store.configure_paper_budget(A, 'USDG', '1000')
+            signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                            stage='swap_evidenced', execution_status='success',
+                            token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                            evidence={'actual_input_debit_raw': '100',
+                                      'actual_output_credit_raw': '200'})
+            store.put(signal)
+            proposal = {
+                'proposal_id': 'recover-p', 'source_event_id': signal.event_id,
+                'source_tx_hash': TXHASH, 'wallet': A,
+                'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+                'input_asset': R.USDG, 'output_asset': TOKEN,
+                'budget_bucket': 'USDG', 'amount_in_raw': '100',
+                'attribution': {'smart_wallet': A},
+            }
+            store.reserve_paper_proposal(proposal)
+            store.close()
+            reopened = Store(path)
+            self.assertEqual(reopened.reserved_paper_proposal_ids(
+                'paper-v1', 'swap_evidenced'), ['recover-p'])
+            recovered = reopened.signal(signal.event_id)
+            self.assertEqual((recovered.event_id, recovered.stage),
+                             (signal.event_id, 'swap_evidenced'))
+            reopened.close()
+
+    def test_paper_ledger_rejects_caller_supplied_asset_bucket_mismatch(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        buy = {
+            'proposal_id': 'wrong-buy-bucket', 'source_event_id': 'event-1',
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.WETH, 'output_asset': TOKEN,
+            'budget_bucket': 'USDG', 'amount_in_raw': '100',
+            'attribution': {'smart_wallet': A},
+        }
+        self.assertEqual(store.reserve_paper_proposal(buy),
+                         (False, 'input_asset_budget_bucket_mismatch'))
+        sell = dict(buy, proposal_id='wrong-sell-bucket', source_event_id='event-2',
+                    input_asset=TOKEN, output_asset=R.WETH)
+        self.assertEqual(store.reserve_paper_sell(sell),
+                         (False, 'sell_output_budget_bucket_mismatch'))
+        self.assertEqual(store.paper_budget(A, 'USDG')['reserved_raw'], '0')
+        store.close()
+
+    def test_paper_cancel_releases_budget_and_allows_manual_new_cycle(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        proposal = {
+            'proposal_id': 'p1', 'source_event_id': 'event-1',
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.USDG, 'output_asset': TOKEN,
+            'budget_bucket': 'USDG', 'amount_in_raw': '600',
+            'attribution': {'smart_wallet': A},
+        }
+        self.assertEqual(store.reserve_paper_proposal(proposal), (True, 'reserved'))
+        self.assertTrue(store.cancel_paper_proposal('p1', 'quote_expired'))
+        self.assertFalse(store.cancel_paper_proposal('p1', 'duplicate'))
+        self.assertEqual(store.paper_budget(A, 'USDG')['available_raw'], '1000')
+        store.start_paper_budget_cycle('manual-2', 'operator_reset')
+        self.assertEqual(store.active_paper_budget_cycle(), 'manual-2')
+        self.assertIsNone(store.paper_budget(A, 'USDG'))
+        store.close()
+
+    def test_paper_buy_fill_consumes_reservation_and_creates_attributed_lot(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'ETH_WETH', '1000')
+        proposal = {
+            'proposal_id': 'p1', 'source_event_id': 'event-1',
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.NATIVE, 'output_asset': TOKEN,
+            'budget_bucket': 'ETH_WETH', 'amount_in_raw': '250',
+            'attribution': {'smart_wallet': A, 'source_signal_stage': 'swap_evidenced'},
+        }
+        store.reserve_paper_proposal(proposal)
+        fill = {
+            'order_id': 'o1', 'fill_id': 'f1', 'lot_id': 'lot1',
+            'amount_out_raw': '5000', 'fee_asset': R.NATIVE,
+            'fee_amount_raw': '2', 'gas_cost_wei': '20000000',
+            'quote_observed_at': '2026-09-12T00:00:00Z',
+            'filled_at': '2026-09-12T00:00:01Z',
+        }
+        self.assertTrue(store.fill_paper_buy('p1', fill))
+        self.assertTrue(store.fill_paper_buy('p1', fill))
+        budget = store.paper_budget(A, 'ETH_WETH')
+        self.assertEqual((budget['reserved_raw'], budget['invested_raw'],
+                          budget['available_raw']), ('0', '250', '750'))
+        lot = store.paper_position('lot1')
+        self.assertEqual((lot['principal_remaining_raw'], lot['token_remaining_raw']),
+                         ('250', '5000'))
+        self.assertEqual(lot['attribution']['smart_wallet'], A)
+        store.close()
+
+    def test_paper_sell_uses_only_attributed_lot_and_restores_original_principal(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        buy = {
+            'proposal_id': 'buy-p', 'source_event_id': 'buy-event',
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.USDG, 'output_asset': TOKEN,
+            'budget_bucket': 'USDG', 'amount_in_raw': '250',
+            'attribution': {'smart_wallet': A},
+        }
+        store.reserve_paper_proposal(buy)
+        store.fill_paper_buy('buy-p', {
+            'order_id': 'buy-o', 'fill_id': 'buy-f', 'lot_id': 'lot1',
+            'amount_out_raw': '5000', 'fee_asset': R.USDG, 'fee_amount_raw': '0',
+            'gas_cost_wei': '20000000',
+            'quote_observed_at': '2026-09-12T00:00:00Z',
+            'filled_at': '2026-09-12T00:00:01Z',
+        })
+        sell = {
+            'proposal_id': 'sell-p', 'source_event_id': 'sell-event',
+            'source_tx_hash': '0x' + '55' * 32, 'wallet': A,
+            'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': TOKEN, 'output_asset': R.USDG,
+            'budget_bucket': 'USDG', 'amount_in_raw': '2500',
+            'attribution': {'smart_wallet': A, 'source_sell_tx': '0x' + '55' * 32},
+        }
+        self.assertEqual(store.reserve_paper_sell(sell), (True, 'reserved'))
+        other_wallet = dict(sell, proposal_id='wrong-wallet', source_event_id='other',
+                            wallet=B, amount_in_raw='1')
+        self.assertEqual(store.reserve_paper_sell(other_wallet),
+                         (False, 'attributed_position_insufficient'))
+        self.assertTrue(store.fill_paper_sell('sell-p', {
+            'order_id': 'sell-o', 'fill_id': 'sell-f', 'amount_out_raw': '180',
+            'fee_asset': R.USDG, 'fee_amount_raw': '5', 'gas_cost_wei': '7',
+            'quote_observed_at': '2026-09-12T00:01:00Z',
+            'filled_at': '2026-09-12T00:01:01Z',
+        }))
+        self.assertTrue(store.fill_paper_sell('sell-p', {
+            'order_id': 'sell-o', 'fill_id': 'sell-f', 'amount_out_raw': '180',
+            'fee_asset': R.USDG, 'fee_amount_raw': '5', 'gas_cost_wei': '7',
+            'quote_observed_at': '2026-09-12T00:01:00Z',
+            'filled_at': '2026-09-12T00:01:01Z',
+        }))
+        lot = store.paper_position('lot1')
+        self.assertEqual((lot['token_remaining_raw'], lot['principal_remaining_raw']),
+                         ('2500', '125'))
+        budget = store.paper_budget(A, 'USDG')
+        self.assertEqual((budget['invested_raw'], budget['available_raw']), ('125', '875'))
+        pnl = store.paper_realized_pnl('sell-f')[0]
+        self.assertEqual((pnl['principal_released_raw'], pnl['realized_pnl_raw'],
+                          pnl['gas_cost_wei']), ('125', '50', '7'))
+        cancel = dict(sell, proposal_id='sell-cancel', source_event_id='sell-cancel-event',
+                      amount_in_raw='100')
+        self.assertEqual(store.reserve_paper_sell(cancel), (True, 'reserved'))
+        self.assertTrue(store.cancel_paper_proposal('sell-cancel', 'quote_expired'))
+        retry = dict(sell, proposal_id='sell-retry', source_event_id='sell-retry-event',
+                     amount_in_raw='2500')
+        self.assertEqual(store.reserve_paper_sell(retry), (True, 'reserved'))
+        store.close()
+
+    def test_receipt_coverage_does_not_double_count_intent_updates(self):
+        stats = Counter(receipt_signals=4, receipt_unknown=1,
+                        receipt_needs_review=2, receipt_swap_evidenced=1,
+                        intent_signals=99)
+        self.assertEqual(coverage_summary(stats), {
+            "receipt_signals": 4, "unknown": 1, "needs_review": 2,
+            "swap_evidenced": 1, "unknown_fraction": 0.25,
+        })
+
+    def test_signal_upgrades_to_safe_head_but_not_finality(self):
+        store = Store(":memory:")
+        block_hash = "0x" + "cc" * 32
+        signal = Signal(TXHASH, A, "self", "TRANSFER", "x", TOKEN, "0x",
+                        stage="execution_observed", evidence={"block_number": 10,
+                        "block_hash": block_hash, "canonicality": "not_rechecked_for_reorgs"})
+        store.put(signal)
+        store.put_candidate(tx(b""))
+        store.record_chain_block(10, block_hash, "0x" + "bb" * 32)
+        store.complete_candidate(TXHASH, 10, block_hash)
+        row = next(store.rows())
+        self.assertEqual(row["canonical_status"], "safe_head_confirmed")
+        self.assertEqual(row["evidence"]["canonicality"],
+                         "safe_head_hash_rechecked_not_l1_finality")
+        store.close()
+
+    def test_solver_delivery_requires_exact_order_and_wallet_evidence(self):
+        store = Store(":memory:")
+        order_id = "0x" + "77" * 32
+        deposit = Signal(TXHASH, A, "self", "INTENT_DEPOSIT", "deposit", R.DEPOSITORY,
+                         "0xe8017952", stage="execution_observed", token_in=R.USDG,
+                         amount_in_raw="100", evidence={"order_id": order_id,
+                         "solver_order_status": "source_deposit_evidenced"})
+        self.assertTrue(store.put(deposit))
+        self.assertEqual(len(store.solver_order(order_id)), 1)
+        self.assertEqual(store.record_solver_delivery("0x" + "88" * 32, A, "0x" + "99" * 32, {}),
+                         "source_order_not_uniquely_evidenced")
+        self.assertEqual(store.record_solver_delivery(order_id, B, "0x" + "99" * 32, {}),
+                         "delivery_wallet_mismatch")
+        self.assertEqual(store.record_solver_delivery(
+            order_id, A, "0x" + "99" * 32, {"proof": "explicit_order_event"}),
+            "order_delivery_linked")
+        self.assertEqual([row["kind"] for row in store.solver_order(order_id)],
+                         ["destination_delivery", "source_deposit"])
+        store.close()
+
+    def test_reorg_removes_solver_execution_evidence(self):
+        store = Store(":memory:")
+        order_id = "0x" + "77" * 32
+        parent_hash, orphan_hash = "0x" + "bb" * 32, "0x" + "cc" * 32
+        store.record_chain_block(9, parent_hash, "0x" + "aa" * 32)
+        store.record_chain_block(10, orphan_hash, parent_hash)
+        source = tx(b"")
+        store.put_candidate(source)
+        deposit = Signal(TXHASH, A, "self", "INTENT_DEPOSIT", "deposit", R.DEPOSITORY,
+                         "0xe8017952", stage="execution_observed", token_in=R.USDG,
+                         amount_in_raw="100", evidence={"order_id": order_id,
+                         "block_hash": orphan_hash, "block_number": 10,
+                         "solver_order_status": "source_deposit_evidenced"})
+        store.put(deposit)
+        store.complete_candidate(TXHASH, 10, orphan_hash)
+        self.assertEqual(len(store.solver_order(order_id)), 1)
+        store.rewind_chain(9, parent_hash)
+        self.assertEqual(store.solver_order(order_id), [])
+        store.close()
+
+    def test_endpoint_env_loader_ignores_wallet_secrets(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True):
+            path = Path(folder) / '.env'
+            path.write_text('ROBINHOOD_RPC_URL="https://paid.example/key"\nPRIVATE_KEY=never-load\n')
+            self.assertEqual(load_endpoint_env(path), {'ROBINHOOD_RPC_URL'})
+            self.assertEqual(os.environ['ROBINHOOD_RPC_URL'], 'https://paid.example/key')
+            self.assertNotIn('PRIVATE_KEY', os.environ)
+
     def test_rpc_broadcast_forbidden(self):
         rpc = ReadOnlyRpc('https://example.com')
         with self.assertRaises(PermissionError):
             asyncio.run(rpc.call('eth_sendRawTransaction', ['0x00']))
+
+    def test_rpc_custom_debug_tracer_forbidden(self):
+        rpc = ReadOnlyRpc('http://localhost:8545')
+        with self.assertRaises(PermissionError):
+            asyncio.run(rpc.call('debug_traceTransaction', [TXHASH, {'tracer': 'callTracer'}]))
 
     def test_remote_plain_http_rejected(self):
         with self.assertRaises(ValueError):
@@ -445,6 +2696,146 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(store.chain_cursor(), (101, '0x' + 'bb' * 32))
         with self.assertRaisesRegex(ValueError, 'explicit reorg handling'):
             store.set_chain_cursor(99, '0x' + 'cc' * 32)
+        store.close()
+
+    def test_block_scanner_initializes_then_backfills_rpc_visible_candidate(self):
+        class Rpc:
+            latest = 102
+
+            async def call(self, method, params=None):
+                if method == 'eth_blockNumber':
+                    return hex(self.latest)
+                if method == 'eth_getLogs':
+                    return []
+                height = int(params[0], 16)
+                transaction = {
+                    'hash': TXHASH, 'from': A, 'to': TOKEN, 'input': '0x',
+                    'value': '0x0', 'chainId': hex(R.CHAIN_ID), 'nonce': '0x1', 'type': '0x2',
+                }
+                return {'number': hex(height), 'hash': '0x' + format(height, '064x'),
+                        'parentHash': '0x' + format(height - 1, '064x'), 'timestamp': '0x64',
+                        'transactions': [transaction] if height == 101 else []}
+
+        store = Store(':memory:')
+        rpc = Rpc()
+        progress = []
+        scanner = BlockScanner(rpc, store, {A: {}}, confirmations=2,
+                               progress=lambda candidates, passive: progress.append((candidates, passive)))
+        self.assertTrue(asyncio.run(scanner.scan_once()).initialized)
+        self.assertEqual(store.chain_cursor()[0], 100)
+        rpc.latest = 103
+        result = asyncio.run(scanner.scan_once())
+        self.assertEqual((result.blocks, result.candidates), (1, 1))
+        self.assertEqual(progress, [(1, 0)])
+        candidate = store.claim_candidates(1)[0]
+        self.assertEqual((candidate.observation_source, candidate.fresh), ('backfill', False))
+        store.close()
+
+    def test_block_scanner_finds_passive_transfer_recipient(self):
+        class Rpc:
+            latest = 102
+
+            async def call(self, method, params=None):
+                if method == 'eth_blockNumber':
+                    return hex(self.latest)
+                if method == 'eth_getLogs':
+                    return [{'transactionHash': TXHASH, 'removed': False,
+                             'topics': [TRANSFER, addr_topic(B), addr_topic(A)]}]
+                height = int(params[0], 16)
+                transaction = {
+                    'hash': TXHASH, 'from': B, 'to': TOKEN, 'input': '0x',
+                    'value': '0x0', 'chainId': hex(R.CHAIN_ID), 'nonce': '0x1', 'type': '0x2',
+                }
+                return {'number': hex(height), 'hash': '0x' + format(height, '064x'),
+                        'parentHash': '0x' + format(height - 1, '064x'), 'timestamp': '0x64',
+                        'transactions': [transaction] if height == 101 else []}
+
+        store = Store(':memory:')
+        rpc = Rpc()
+        progress = []
+        scanner = BlockScanner(rpc, store, {A: {}}, confirmations=2,
+                               progress=lambda candidates, passive: progress.append((candidates, passive)))
+        asyncio.run(scanner.scan_once())
+        rpc.latest = 103
+        result = asyncio.run(scanner.scan_once())
+        self.assertEqual((result.candidates, result.passive_candidates), (1, 1))
+        self.assertEqual(progress, [(1, 1)])
+        candidate = store.claim_candidates(1)[0]
+        self.assertEqual((candidate.sender, candidate.observation_source, candidate.fresh),
+                         (B, 'backfill', False))
+        store.close()
+
+    def test_block_scanner_halts_on_parent_hash_mismatch(self):
+        class Rpc:
+            async def call(self, method, params=None):
+                if method == 'eth_blockNumber':
+                    return '0x65'
+                height = int(params[0], 16)
+                return {'number': hex(height),
+                        'hash': '0x' + ('aa' if height == 100 else 'bb') * 32,
+                        'parentHash': '0x' + ('00' if height == 100 else 'cc') * 32,
+                        'timestamp': '0x64', 'transactions': []}
+
+        store = Store(':memory:')
+        store.set_chain_cursor(100, '0x' + 'aa' * 32)
+        with self.assertRaises(ReorgDetected):
+            asyncio.run(BlockScanner(Rpc(), store, {A: {}}, confirmations=0).scan_once())
+        self.assertEqual(store.chain_cursor(), (100, '0x' + 'aa' * 32))
+        store.close()
+
+    def test_reorg_preserves_intent_and_orphans_execution_evidence(self):
+        old100, old101 = '0x' + 'aa' * 32, '0x' + 'bb' * 32
+
+        class Rpc:
+            async def call(self, method, params=None):
+                height = int(params[0], 16)
+                current_hash = old100 if height == 100 else '0x' + 'dd' * 32
+                return {'number': hex(height), 'hash': current_hash,
+                        'parentHash': '0x' + '00' * 32, 'transactions': []}
+
+        store = Store(':memory:')
+        store.record_chain_block(100, old100, '0x' + '99' * 32)
+        store.record_chain_block(101, old101, old100)
+        source = tx(b'payload')
+        store.put_candidate(source)
+        signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', TOKEN, '0x12345678',
+                        stage='execution_observed', execution_status='success',
+                        evidence={'block_hash': old101, 'block_number': 101})
+        store.put(signal)
+        store.complete_candidate(source.hash, 101, old101)
+        resolution = asyncio.run(BlockScanner(Rpc(), store, {A: {}}, confirmations=0)
+                                 .reconcile_reorg())
+        self.assertEqual((resolution.common_ancestor, resolution.orphaned_signals,
+                          resolution.candidates_requeued), (100, 1, 1))
+        row = list(store.rows())[0]
+        self.assertEqual(row['intent_status'], 'observed')
+        self.assertEqual(row['execution_status'], 'success')
+        self.assertEqual(row['canonical_status'], 'orphaned')
+        self.assertEqual(store.candidate_counts()['pending'], 1)
+        store.close()
+
+    def test_explicit_deep_reorg_recovery_can_search_beyond_automatic_limit(self):
+        hashes = {height: '0x' + format(height, '064x') for height in range(30, 101)}
+
+        class Rpc:
+            async def call(self, method, params=None):
+                height = int(params[0], 16)
+                canonical_hash = hashes[height] if height == 30 else '0x' + 'ff' * 32
+                return {'number': hex(height), 'hash': canonical_hash,
+                        'parentHash': '0x' + '00' * 32, 'transactions': []}
+
+        store = Store(':memory:')
+        for height in range(30, 101):
+            store.record_chain_block(height, hashes[height],
+                                     hashes.get(height - 1, '0x' + '00' * 32))
+        scanner = BlockScanner(Rpc(), store, {A: {}}, confirmations=0)
+        with self.assertRaisesRegex(ReorgDetected, 'within 64 blocks'):
+            asyncio.run(scanner.reconcile_reorg(max_depth=64))
+        self.assertEqual(store.chain_cursor(), (100, hashes[100]))
+        resolution = asyncio.run(scanner.reconcile_reorg(max_depth=100))
+        self.assertEqual(resolution.common_ancestor, 30)
+        self.assertEqual(store.chain_cursor(), (30, hashes[30]))
+        self.assertIsNone(store.chain_block_hash(31))
         store.close()
 
     def test_duplicate_watchlist_rejected(self):
