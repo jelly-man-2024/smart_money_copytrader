@@ -172,6 +172,19 @@ codex resume --all -C /home/jelly/applet/smart_money_copytrader
 多数据源 Goal 的逐项证据、部分验证项和待外部确认项见 `docs/GOAL_ACCEPTANCE.md`，不得只根据
 测试总数判断已可上线。
 
+## 本地双钱包链上闭环（2026-09-12）
+
+新增独立 Anvil `local-test` profile、一次性 `LocalUSDG`/`LocalFixedRatePool` 合约和
+`scripts/validate_local_copytrade.py`。脚本只接受 loopback HTTP、chain ID 31337 且客户端标识
+必须为 Anvil；两个钱包地址每次随机生成，项目不生成、读取或保存其私钥，Anvil 仅在本地模拟
+账户能力。当前闭环完成聪明钱 BUY、50% 跟买、聪明钱 SELL、50% 跟卖，并逐回执限定 pool、
+Swap topic 与 trader 归属。它是隔离集成测试，不走 Robinhood Feed，也未接业务 MySQL 的真实
+跟单关系。两个聪明钱回执现已作为 chain 31337 的 `swap_evidenced` 测试信号接入现有
+signal→比例策略→额度→proposal→fill→position→realized PnL 状态机；验证 50% 跟买占用本金、
+50% 跟卖只恢复对应本金，归因保留 smart/follower/relationship/source tx。测试使用独立 SQLite
+artifact，不写业务 MySQL；下一步是增加可精确清理的 MySQL 测试模式，而不是将测试合约事件
+当作主网受支持 Router 证据。
+
 ## 多数据源与实盘准备追加状态（2026-09-12）
 
 配置 MySQL 的 `copy_relationships` 已支持 CSV 导入和 `--paper-mysql` 加载；独立 `key_mysql`

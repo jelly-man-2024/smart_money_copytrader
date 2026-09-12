@@ -438,3 +438,30 @@ candidates=5、cursor=60984943、canonical_blocks=570、paper_fills=0、executio
 为 0 符合本次未启用跟单配置/未广播的边界，不能解释为收益链路测试失败；BUY/SELL/PnL 和公开
 execution lifecycle 已由此前隔离 UUID 演练覆盖。旧具名 SQLite 文件保持未修改，作为历史验证
 归档，不与本次新的业务 MySQL 运行起点混合。
+
+## Anvil 本地双钱包买卖闭环
+
+2026-09-12 UTC 使用 Foundry 官方镜像（锁定 digest `sha256:0c00...f9a17`），Anvil 仅绑定
+`127.0.0.1:8545`，chain ID 31337。首次编译发现 artifact bytecode 自带 `0x` 前缀，部署脚本
+重复添加导致本地 RPC 拒绝；修正后重新编译和执行成功。
+
+- 聪明钱临时地址执行 `0.1 ETH → 100 USDG`，跟单临时地址按 50% 执行
+  `0.05 ETH → 50 USDG`。
+- 聪明钱卖出 `50 USDG → 0.05 ETH`，跟单地址按对应持仓比例卖出
+  `25 USDG → 0.025 ETH`。
+- 四笔交易均取得 status=1 回执；脚本要求每笔恰有一个测试池 Swap，且 indexed trader 必须
+  等于对应聪明钱或跟单地址。最终 token 余额分别为 50 USDG 与 25 USDG。
+- 项目未处理私钥，未读取 `.env`/key MySQL，未连接 Robinhood RPC，未签名或广播主网交易；
+  输出固定 `mainnet_rpc_used=false`、`private_keys_used_by_project=false`、
+  `copy_eligible=false`、`live_trading=false`。
+
+这证明隔离链上的双钱包买卖和 50% 数量关系能够执行，不证明主网 Feed→signal→业务 MySQL→
+执行器端到端通过。
+
+随后将本地回执接入现有状态机并重跑：两个源回执保存为 chain 31337 的 `swap_evidenced` 信号；
+BUY 经 50% 比例策略预留并投入 `50000000000000000` wei 本金，形成带 smart wallet、follower、
+relationship/source tx 的 order/fill/position 归因。SELL 只预留同一关系 lot 的
+`25000000000000000000` token，成交后恢复 `25000000000000000` wei 本金；预算最终
+reserved=0、invested=`25000000000000000`、available=`975000000000000000`，realized PnL=0。
+导出顺序为 BUY/SELL 两条 paper trade。测试账本位于被忽略的
+`var/local-copytrade-9d87fddfffb8388e.sqlite3`；该轮未写业务 MySQL。

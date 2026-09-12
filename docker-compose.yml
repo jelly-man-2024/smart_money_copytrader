@@ -1,4 +1,25 @@
 services:
+  local_chain:
+    image: ghcr.io/foundry-rs/foundry@sha256:0c00cb0bda1ab1b91c9a6bf60f4c76c09c1a8870824b6d4718afbabacf6f9a17
+    container_name: smart-money-local-chain
+    profiles: ["local-test"]
+    entrypoint: ["anvil"]
+    command:
+      - "--host"
+      - "0.0.0.0"
+      - "--chain-id"
+      - "31337"
+      - "--accounts"
+      - "2"
+      - "--silent"
+    ports:
+      - "127.0.0.1:8545:8545"
+    healthcheck:
+      test: ["CMD", "cast", "chain-id", "--rpc-url", "http://127.0.0.1:8545"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
   mysql:
     image: mysql:8.4
     container_name: smart-money-mysql

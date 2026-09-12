@@ -243,3 +243,26 @@ orphaned 的 attempt 不允许走该恢复路径。
 [OPERATOR_RUNBOOK](docs/OPERATOR_RUNBOOK.md)。
 逐项完成度与仍需外部验收的边界见
 [GOAL_ACCEPTANCE](docs/GOAL_ACCEPTANCE.md)。
+
+## 本地双钱包买卖闭环
+
+本地集成测试使用 Anvil chain ID `31337`，不会连接 Robinhood 主网，也不会读取项目 `.env` 或
+私钥数据库。脚本每次生成两个临时公开地址，由 Anvil 在本地模拟账户能力，部署一次性 USDG 与
+固定汇率池；聪明钱买入/卖出后，跟单钱包按 50% 比例执行对应买卖：
+
+```bash
+docker compose --profile local-test up -d local_chain
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD:/work" -w /work \
+  ghcr.io/foundry-rs/foundry@sha256:0c00cb0bda1ab1b91c9a6bf60f4c76c09c1a8870824b6d4718afbabacf6f9a17 \
+  'forge build'
+.venv/bin/python scripts/validate_local_copytrade.py
+docker compose --profile local-test stop local_chain
+```
+
+输出包含两个临时地址、四笔本地交易 hash、原始整数金额和最终 token 余额，并固定声明
+`mainnet_rpc_used=false`、`private_keys_used_by_project=false`、`copy_eligible=false`。
+脚本还把两个聪明钱回执保存为 chain 31337 的 `swap_evidenced` 测试信号，通过现有比例策略、
+额度预留、BUY/SELL proposal、fill、position lot 和 realized PnL 状态机；跟卖后仅恢复对应本金。
+测试账本使用每次独立的 `var/local-copytrade-*.sqlite3`，不写业务 MySQL。该测试不代表主网
+Router、Feed、报价、延迟或实盘广播已经通过。

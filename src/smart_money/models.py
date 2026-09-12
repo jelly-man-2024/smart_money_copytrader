@@ -71,10 +71,11 @@ class Signal:
     reasons: list[str] = field(default_factory=list)
     evidence: dict = field(default_factory=dict)
     copy_eligible: bool = False
+    chain_id: int = 4663
 
     @property
     def event_id(self) -> str:
-        return f"4663:{self.tx_hash}:{self.wallet}:{self.path}"
+        return f"{self.chain_id}:{self.tx_hash}:{self.wallet}:{self.path}"
 
     def to_dict(self) -> dict:
         return {"event_id": self.event_id, **asdict(self)}
