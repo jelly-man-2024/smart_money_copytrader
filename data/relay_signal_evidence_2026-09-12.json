@@ -1,0 +1,47 @@
+{
+  "captured_at_utc": "2026-09-12",
+  "source": "60+ second read-only monitor using configured dRPC and Robinhood feed",
+  "chain_id": 4663,
+  "samples": [
+    {
+      "role": "positive_relay_zero_x_sell",
+      "tx_hash": "0xb48c9106dc8c5ef90b08866190819f689973a71291fcf237f5fea7eddfeceba0",
+      "wallet": "0xfec1002223824973bcd7907d133b4c027beb40c0",
+      "userop_index": 0,
+      "protocol": "0x",
+      "token_in": "0x559b4293e2f372774e1fa6dc0a38a2cef6e04a99",
+      "token_out": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+      "amount_in_raw": "289696462484308100000000",
+      "actual_output_deposit_raw": "888307227",
+      "order_id": "0xc7507262a17aa343b1a92bdf685323a49c27f348053924827f8741cb5da9fb1c",
+      "stage": "relay_sell_evidenced",
+      "copy_eligible": false
+    },
+    {
+      "role": "positive_relay_kyber_sell",
+      "tx_hash": "0x182188f8319d6a38ba4f1b45932b7c3e8ec22cb4a8b36e9d8596b0343e679e50",
+      "wallet": "0xfec1002223824973bcd7907d133b4c027beb40c0",
+      "userop_index": 0,
+      "protocol": "kyber",
+      "token_in": "0x559b4293e2f372774e1fa6dc0a38a2cef6e04a99",
+      "token_out": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+      "amount_in_raw": "289696462484308100000000",
+      "amount_limit_raw": "802796140",
+      "actual_output_deposit_raw": "890588810",
+      "order_id": "0xafb2de42fc2decf84872824b075d2f1a3cfc1a4151c159b9f578a99aaf8757e9",
+      "stage": "relay_sell_evidenced",
+      "copy_eligible": false
+    },
+    {
+      "role": "passive_credit_before_relay_order_association",
+      "tx_hash": "0x1d6bb5c7d09e803793c2ad08420fc077f779dbeceb3adb36914d9ffa0c2d4a12",
+      "wallet": "0x06de9c48b1e639ed5c13ec8fbd4080a38e39f2d1",
+      "credited_token": "0x7050670f45a4ae3f2cd7c0c24f244ecb13832101",
+      "credited_amount_raw": "72378205763277380661382",
+      "behavior": "INCOMING_TRANSFER",
+      "stage": "needs_review",
+      "reason": "recipient_is_not_proof_of_order_ownership_without_external_order_evidence",
+      "copy_eligible": false
+    }
+  ]
+}

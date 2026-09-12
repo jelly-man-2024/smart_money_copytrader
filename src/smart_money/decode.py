@@ -12,6 +12,10 @@ CALLS = "(address,uint256,bytes)[]"
 RELAY_CALLS = "(address,bool,uint256,bytes)[]"
 POOL_KEY = "(address,address,uint24,int24,address)"
 V4_PATH_KEY = "(address,uint24,int24,address,bytes)"
+KYBER_SWAP_DESCRIPTION = (
+    "(address,address,address[],uint256[],address[],uint256[],address,uint256,uint256,uint256,bytes)"
+)
+KYBER_SWAP_EXECUTION = f"(address,address,bytes,{KYBER_SWAP_DESCRIPTION},bytes)"
 
 
 def selector(signature: str) -> bytes:
@@ -133,19 +137,79 @@ class Decoder:
                     for i, (dest, allow_failure, amount, body) in enumerate(calls):
                         child(dest, amount, body, f"relay/{i}")
                     return
+                if to == R.RELAY_ROUTER and sel == bytes.fromhex("73b7bb2f"):
+                    tokens, targets, payloads, minimums = decode(
+                        ["address[]", "address[]", "bytes[]", "uint256[]"], args)
+                    if (not len(tokens) == len(targets) == len(payloads) == len(minimums)
+                            or len(tokens) > 256):
+                        raise ValueError("invalid Relay cleanup arrays")
+                    for i, (token, target, payload, minimum) in enumerate(zip(
+                            tokens, targets, payloads, minimums)):
+                        start = len(result)
+                        child(target, 0, payload, f"cleanup/{i}")
+                        for item in result[start:]:
+                            item.evidence.update({
+                                "source_orchestrator": "relay",
+                                "relay_cleanup_token": address(token),
+                                "relay_cleanup_minimum_raw": str(minimum),
+                            })
+                    return
 
                 if to == R.DEPOSITORY:
                     if sel == bytes.fromhex("e8017952"):
                         depositor, token, amount, order = decode(["address", "address", "uint256", "bytes32"], args)
+                        amount_source = "calldata"
+                    elif sel == bytes.fromhex("5a1ee3ac"):
+                        depositor, token, order = decode(["address", "address", "bytes32"], args)
+                        amount, amount_source = None, "full_allowance_receipt_event"
                     elif sel == bytes.fromhex("49290c1c"):
                         depositor, order = decode(["address", "bytes32"], args)
                         token, amount = R.NATIVE, value
+                        amount_source = "call_value"
                     else:
                         raise ValueError("unsupported depository method")
                     emit(wallet, mode, path, to, data, "INTENT_DEPOSIT", op, token_in=token,
-                         amount_in_raw=str(amount), recipient=depositor,
-                         evidence={"order_id": "0x" + order.hex()},
+                         amount_in_raw=str(amount) if amount is not None else None, recipient=depositor,
+                         evidence={"order_id": "0x" + order.hex(),
+                                   "deposit_amount_source": amount_source},
                          reasons=["deposit_is_not_a_destination_purchase"])
+                    return
+
+                if to == R.ZERO_X_ALLOWANCE_HOLDER and sel == bytes.fromhex("2213bc0b"):
+                    operator, token, amount, target, payload = decode(
+                        ["address", "address", "uint256", "address", "bytes"], args)
+                    emit(wallet, mode, path, to, data, "AGGREGATOR_SWAP_INTENT", op,
+                         token_in=token, amount_in_raw=str(amount), recipient=target,
+                         protocol="0x", evidence={
+                             "source_aggregator": "0x",
+                             "allowance_holder_operator": address(operator),
+                             "allowance_holder_target": address(target),
+                             "operator_payload_selector": "0x" + payload[:4].hex(),
+                         }, reasons=["decoded_aggregator_intent_not_execution"])
+                    return
+
+                if (to == R.KYBER_META_AGGREGATION_ROUTER_V2
+                        and sel == bytes.fromhex("e21fd0e9")):
+                    execution = decode([KYBER_SWAP_EXECUTION], args)[0]
+                    call_target, approve_target, target_data, desc, client_data = execution
+                    (src_token, dst_token, src_receivers, src_amounts, fee_receivers,
+                     fee_amounts, dst_receiver, amount, minimum, flags, permit) = desc
+                    if (len(src_receivers) != len(src_amounts)
+                            or len(fee_receivers) != len(fee_amounts)
+                            or max(len(src_receivers), len(fee_receivers)) > 256
+                            or amount <= 0 or minimum <= 0):
+                        raise ValueError("invalid Kyber swap description")
+                    emit(wallet, mode, path, to, data, "AGGREGATOR_SWAP_INTENT", op,
+                         token_in=src_token, token_out=dst_token,
+                         amount_in_raw=str(amount), amount_limit_raw=str(minimum),
+                         recipient=dst_receiver if int(dst_receiver, 16) else R.RELAY_ROUTER,
+                         protocol="kyber", evidence={
+                             "source_aggregator": "kyber",
+                             "kyber_call_target": address(call_target),
+                             "kyber_approve_target": address(approve_target),
+                             "kyber_target_data_selector": "0x" + target_data[:4].hex(),
+                             "kyber_flags": str(flags),
+                         }, reasons=["decoded_aggregator_intent_not_execution"])
                     return
 
                 if to == R.RIPE_CLAIM and sel == bytes.fromhex("815a4392"):
@@ -402,4 +466,44 @@ class Decoder:
         elif tx.sender in self.watchlist:
             mode = "self_account" if tx.to == tx.sender else "direct"
             walk(tx.sender, mode, tx.to, tx.value, tx.data, "call", caller=tx.sender)
+        relay_groups = {}
+        for item in result:
+            if "/relay/" not in item.path:
+                continue
+            root = item.path.split("/relay/", 1)[0]
+            relay_groups.setdefault((item.wallet, item.userop_index, root), []).append(item)
+        for items in relay_groups.values():
+            aggregators = [item for item in items if item.behavior == "AGGREGATOR_SWAP_INTENT"]
+            deposits = [item for item in items if (
+                item.behavior == "INTENT_DEPOSIT"
+                and item.evidence.get("source_orchestrator") == "relay")]
+            if len(aggregators) != 1 or len(deposits) != 1:
+                for item in aggregators:
+                    item.behavior = "UNKNOWN"
+                    item.reasons.append("aggregator_call_not_linked_to_unique_relay_deposit")
+                continue
+            trade, deposit = aggregators[0], deposits[0]
+            if (deposit.recipient != trade.wallet or deposit.token_in != R.USDG
+                    or deposit.evidence.get("relay_cleanup_token") != deposit.token_in
+                    or trade.token_out not in (None, deposit.token_in)
+                    or (trade.protocol == "kyber" and trade.recipient != R.RELAY_ROUTER)):
+                trade.behavior = "UNKNOWN"
+                trade.reasons.append("aggregator_call_relay_deposit_identity_mismatch")
+                continue
+            trade.token_out = deposit.token_in
+            trade.recipient = R.RELAY_ROUTER
+            trade.behavior = side(trade.token_in, trade.token_out)
+            if trade.behavior != "SELL":
+                trade.behavior = "UNKNOWN"
+                trade.reasons.append("relay_mvp_only_supports_token_to_usdg_sell")
+                continue
+            trade.evidence.update({
+                "source_orchestrator": "relay",
+                "relay_deposit_order_id": deposit.evidence["order_id"],
+                "relay_deposit_path": deposit.path,
+            })
+        for item in result:
+            if item.behavior == "AGGREGATOR_SWAP_INTENT":
+                item.behavior = "UNKNOWN"
+                item.reasons.append("aggregator_call_not_linked_to_relay_sell")
         return result

@@ -1,11 +1,14 @@
 # 开发交接：在新工程继续
 
-更新时间：2026-09-11。
+更新时间：2026-09-12。
 
 新服务器接手时先按 [SERVER_HANDOFF.md](SERVER_HANDOFF.md) 复现功能基线，
 再推进后续只读开发。该文包含测试命令、验收口径、开发优先级和可复制提示词。
 已推送的初始代码基线为 `main / 67c86b5`，以服务器实际 HEAD 为准，不要重置后续改动。
 下文 `/home/jelly/...` 是原开发机路径；服务器应使用自己的仓库路径，不依赖旧工程目录。
+当前配置驱动的信号→动作说明见 [COPYTRADING_FLOW.md](COPYTRADING_FLOW.md)。
+67 地址的 2026-09-01 至 2026-09-12 路径统计见
+[WATCHLIST_ROUTE_ANALYSIS_2026-09-12.md](WATCHLIST_ROUTE_ANALYSIS_2026-09-12.md)。
 
 ## 用户目标与已确认的设计方向
 
@@ -81,7 +84,33 @@ Solver 目标链独立复核尚未实现。
 纸面报价、PnL、订单/仓位/预算预留系统已经实现；生产交易执行器仍不存在。
 未知输入不会被猜成成交。真实样本 UNKNOWN 是支持边界，不是没有交易。
 
+2026-09-12 dRPC 窗口扫描发现 5,248 个主动交换候选组：3,177 个经过 0x、1,992 个经过
+KyberSwap，当前 OKX Router 对观察钱包为 0，直接池调用为 0。最常见的 5,123 组实际是
+`Token -> 0x/Kyber -> USDG -> Relay Depository order`，其中 5,122 个回执存款事件逐字段匹配，
+1 个 orderId 不匹配继续复核。名称启发式的 meme 子集 1,649 组中有 1,627 组走该 Relay
+订单路径。源信号适配应先补 Relay `0x73b7bb2f`、Depository `0x5a1ee3ac`、0x
+`0x2213bc0b` 和 Kyber `0xe21fd0e9`；方案 B 的跟单执行端仍可独立使用 OKX 重新报价。
+Fomo 官方条款和公开 Web `/swaps/v2` 返回结构也确认 Robinhood Token 使用 Relay 基础设施；
+这不表示 Relay 是唯一成交聚合器，目标 UserOperation 的实际内层成交仍主要归属 0x/Kyber。
+
 ## 下次开发建议：先把 M2 的确认链路做完整
+
+### 2026-09-12 用户确认的精简 MVP 范围
+
+后续按两个顺序 Goal 交付，不以接齐所有聚合器作为首次可用门槛：
+
+1. **Goal 1：只读信号 MVP**。保留现有 V2/V3/V4/Universal Router 等支持路径；只新增当前
+   观察名单的主路径 Fomo/Relay 外层与 0x、Kyber 内层识别。必须完成目标 UserOperation
+   归属、Relay 卖出订单闭环，以及被动入账的最小 Solver 交付关联；单纯收币不能判为 BUY。
+   复用并回归现有游标、补洞、重试和重组撤销。GMGN、1inch、OKX 源解析和未知 Router 延后，
+   但已有安全检查和负例必须保留。Goal 1 全程 `copy_eligible=false`。
+2. **Goal 2：跟单 MVP**。Goal 1 验收后再创建；跟单钱包使用 OKX 取得自己的实时报价，不复用
+   聪明钱 Relay/0x/Kyber calldata。先接现有 MySQL 策略、额度、周期、lot 与归因账本，进行实时
+   纸面跟单和故障恢复验收。签名、广播和小额主网试单仍属于需单独明确授权及风险清单通过的
+   M3，不因“精简上线测试”自动开启。
+
+Goal 1 的首次可用门槛不是路由全覆盖，而是主要 Fomo 买卖能被保守识别、未知路径不误跟、
+重启/断线不静默漏信号，并能给 Goal 2 输出幂等且可审计的确认信号。
 
 1. 阅读 COPYTRADING_PLAN.md，运行 tests 和 replay。
 2. 补 V3/V4 多跳真实样本和原生币完整资金流对应。
@@ -373,3 +402,18 @@ UUID 行、随机规范块和 canonical cursor 清理后综合残留为 0。接�
 为归档而未混入新账本。收益数据可直接通过 `paper-export --ledger-mysql` 查询；当前为 0 是因为尚
 未启用任何真实跟单关系，不是迁移失败。
 依据 [官方 CLI 参考](https://developers.openai.com/codex/cli/reference/) 和本机帮助。
+
+## 2026-09-12 精简版 Goal 1 完成
+
+已新增 Relay + 0x/Kyber 卖出识别和严格回执闭环，以及被动入账与保存的 Relay 订单响应精确
+关联后才升级 BUY 的离线逻辑。新增阶段 `relay_sell_evidenced`、`relay_buy_evidenced` 均保持
+`copy_eligible=false`；`sm-copy relay-associate` 只处理本地文件和账本，不联网、不自动下单。
+60+ 秒只读监听现场闭合 3 笔 Relay SELL（含 0x、Kyber），纯入账负例未判 BUY。实现、验证、
+临时日志位置和剩余工作见 `docs/SERVER_VALIDATION_2026-09-12.md` 最后一节。
+
+随后 Relay 官方 `requests/v2?hash=` 证明该入账存在唯一跨链 BUY 订单。实现允许源链付款人与
+Robinhood 收币钱包不同，但分别严格绑定 request user/origin depositor 与目标 recipient/order
+payment/outTx/fill/local receipt；真实正例升级为 `relay_buy_evidenced`，篡改收款人的负例拒绝。
+重复关联幂等、重组撤销和跨 UserOperation 禁止拼接均已有回归。Relay 响应提示 requests/v2 将
+退役，后续需兼容 v3。最终 `pip check`、153/153 unittest、13 笔 replay 和 diff check 通过；
+Goal 1 已停止在只读信号层，等待用户讨论并另建 Goal 2。

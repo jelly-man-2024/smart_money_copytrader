@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from dataclasses import replace
 import io
@@ -25,10 +25,13 @@ from smart_money.account_state import prestate_implementations
 from smart_money.backfill import BlockScanner, ReorgDetected
 from smart_money.cli import (
     LatencySamples, coverage_summary, dispatch_pending, execution_track,
-    parser as cli_parser,
+    parser as cli_parser, relay_associate,
 )
 from smart_money.config import load_endpoint_env
-from smart_money.decode import CALLS, PACKED_OPS, POOL_KEY, V4_PATH_KEY, Decoder, selector, v3_hops, v3_path
+from smart_money.decode import (
+    CALLS, PACKED_OPS, POOL_KEY, RELAY_CALLS, V4_PATH_KEY, Decoder, selector,
+    v3_hops, v3_path,
+)
 from smart_money.feed import DecodeError, FeedHealth, decode_raw, envelopes, signed_transactions
 from smart_money.execution_prep import (
     ReadOnlyExecutionPreflight, UnsignedExecutionPlan, build_execution_plan,
@@ -57,9 +60,11 @@ from smart_money.paper import (
 )
 from smart_money.paper_config import load_paper_config
 from smart_money.quotes import LiveQuoter, Quote, QuotePolicy, assess_quote, validate_quote
-from smart_money.receipts import BEFORE, SWAPS, TRANSFER, USEROP, TRADE_BEHAVIORS, enrich
+from smart_money.receipts import (
+    BEFORE, DEPOSIT_RECORDED, SWAPS, TRANSFER, USEROP, TRADE_BEHAVIORS, enrich,
+)
 from smart_money.rpc import ReadOnlyRpc
-from smart_money.solver import relay_delivery_evidence
+from smart_money.solver import relay_delivery_evidence, relay_passive_buy
 from smart_money.store import MAX_CANDIDATE_ATTEMPTS, Store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +130,52 @@ def v4_multihop(exact_in=True):
         ["bytes", "bytes[]", "uint256"], [b"\x10", [action], 2000000000])
 
 
+def relay_deposit_all(order=b"\x01" * 32):
+    return bytes.fromhex("5a1ee3ac") + encode(
+        ["address", "address", "bytes32"], [A, R.USDG, order])
+
+
+def relay_cleanup(deposit=None, cleanup_token=R.USDG):
+    deposit = deposit or relay_deposit_all()
+    return bytes.fromhex("73b7bb2f") + encode(
+        ["address[]", "address[]", "bytes[]", "uint256[]"],
+        [[cleanup_token], [R.DEPOSITORY], [deposit], [0]])
+
+
+def zero_x_exec(token=TOKEN, amount=100):
+    return bytes.fromhex("2213bc0b") + encode(
+        ["address", "address", "uint256", "address", "bytes"],
+        [B, token, amount, B, bytes.fromhex("1fff991f")])
+
+
+def kyber_swap(token=TOKEN, amount=100, output=R.USDG,
+               receiver=R.RELAY_ROUTER, minimum=90):
+    description = (
+        token, output, [B], [amount], [], [], receiver, amount, minimum, 0, b"")
+    description_type = (
+        "(address,address,address[],uint256[],address[],uint256[],address,uint256,uint256,uint256,bytes)"
+    )
+    execution_type = f"(address,address,bytes,{description_type},bytes)"
+    execution = (B, B, b"\x12\x34\x56\x78", description, b"")
+    return bytes.fromhex("e21fd0e9") + encode([execution_type], [execution])
+
+
+def relay_proxy(calls):
+    return bytes.fromhex("f9e4bab4") + encode(
+        ["address[]", "uint256[]", RELAY_CALLS, "address", "address", "bytes"],
+        [[TOKEN], [100], calls, A, A, b""])
+
+
+def relay_sell(aggregator, aggregator_address):
+    calls = [
+        (TOKEN, False, 0, bytes.fromhex("095ea7b3")
+         + encode(["address", "uint256"], [aggregator_address, 100])),
+        (aggregator_address, False, 0, aggregator),
+        (R.RELAY_ROUTER, False, 0, relay_cleanup()),
+    ]
+    return batch([(R.RELAY_PROXY, 0, relay_proxy(calls))])
+
+
 def batch(calls):
     return bytes.fromhex("34fcd5be") + encode([CALLS], [calls])
 
@@ -139,6 +190,44 @@ def bundled(ops):
 
 def log(contract, topics, data="0x", index=0):
     return {"address": contract, "topics": topics, "data": data, "logIndex": hex(index)}
+
+
+def passive_candidate():
+    return Signal(
+        TXHASH, A, "third_party", "EXTERNAL_DELIVERY_CANDIDATE", "incoming",
+        B, "0x12345678", stage="needs_review", execution_status="success",
+        execution_success=True, evidence={
+            "wallet_erc20_deltas_raw": {TOKEN: "90"}, "swap_event_count": 1,
+        })
+
+
+def relay_buy_document():
+    source_hash = "0x" + "bb" * 32
+    return {"requests": [{
+        "id": "0x" + "02" * 32, "status": "success", "user": A,
+        "recipient": A, "data": {
+            "inTxs": [{"hash": source_hash, "chainId": 8453, "status": "success"}],
+            "outTxs": [{
+                "hash": TXHASH, "chainId": R.CHAIN_ID, "status": "success",
+                "stateChanges": [{"address": A, "change": {
+                    "kind": "token", "balanceDiff": "90", "data": {
+                        "tokenKind": "ft", "tokenAddress": TOKEN,
+                    }}}],
+            }],
+        }, "protocol": {
+            "orderId": "0x" + "01" * 32,
+            "deposit": {"origin": {
+                "amount": "100", "chainId": 8453, "currency": R.USDG,
+                "depositor": A, "transactionId": source_hash,
+            }},
+            "settlement": {"destination": {"fills": [{
+                "chainId": R.CHAIN_ID, "transactionId": TXHASH,
+            }]}},
+            "orderData": {"output": {"payments": [{
+                "currency": TOKEN, "recipient": A, "minimumAmount": "80",
+            }]}},
+        },
+    }]}
 
 
 def addr_topic(a):
@@ -230,6 +319,80 @@ class DecodeTests(unittest.TestCase):
     def test_deposit_is_not_buy(self):
         body = bytes.fromhex("e8017952") + encode(["address", "address", "uint256", "bytes32"], [A, R.USDG, 123, bytes(32)])
         self.assertEqual(self.decoder.decode(tx(body, R.DEPOSITORY))[0].behavior, "INTENT_DEPOSIT")
+
+    def test_relay_zero_x_sell_links_only_through_unique_cleanup_deposit(self):
+        signals = self.decoder.decode(tx(relay_sell(
+            zero_x_exec(), R.ZERO_X_ALLOWANCE_HOLDER)))
+        trade = next(item for item in signals if item.behavior in TRADE_BEHAVIORS)
+        deposit = next(item for item in signals if item.behavior == "INTENT_DEPOSIT")
+        self.assertEqual((trade.behavior, trade.protocol, trade.token_in, trade.token_out),
+                         ("SELL", "0x", TOKEN, R.USDG))
+        self.assertEqual(trade.evidence["relay_deposit_order_id"], "0x" + "01" * 32)
+        self.assertEqual(deposit.evidence["deposit_amount_source"],
+                         "full_allowance_receipt_event")
+        self.assertFalse(trade.copy_eligible)
+
+    def test_relay_kyber_sell_preserves_declared_minimum(self):
+        signals = self.decoder.decode(tx(relay_sell(
+            kyber_swap(), R.KYBER_META_AGGREGATION_ROUTER_V2)))
+        trade = next(item for item in signals if item.behavior in TRADE_BEHAVIORS)
+        self.assertEqual((trade.behavior, trade.protocol, trade.amount_in_raw,
+                          trade.amount_limit_raw, trade.recipient),
+                         ("SELL", "kyber", "100", "90", R.RELAY_ROUTER))
+
+    def test_unlinked_aggregator_call_stays_unknown(self):
+        signal = self.decoder.decode(tx(zero_x_exec(), R.ZERO_X_ALLOWANCE_HOLDER))[0]
+        self.assertEqual(signal.behavior, "UNKNOWN")
+        self.assertIn("aggregator_call_not_linked_to_relay_sell", signal.reasons)
+
+    def test_relay_cleanup_token_mismatch_stays_unknown(self):
+        calls = [
+            (R.ZERO_X_ALLOWANCE_HOLDER, False, 0, zero_x_exec()),
+            (R.RELAY_ROUTER, False, 0, relay_cleanup(cleanup_token=B)),
+        ]
+        signals = self.decoder.decode(tx(batch([(R.RELAY_PROXY, 0, relay_proxy(calls))])))
+        trade = next(item for item in signals if item.protocol == "0x")
+        self.assertEqual(trade.behavior, "UNKNOWN")
+        self.assertIn("aggregator_call_relay_deposit_identity_mismatch", trade.reasons)
+
+    def test_relay_calls_in_different_userops_are_never_joined(self):
+        aggregator_only = batch([(R.RELAY_PROXY, 0, relay_proxy([
+            (R.ZERO_X_ALLOWANCE_HOLDER, False, 0, zero_x_exec()),
+        ]))])
+        deposit_only = batch([(R.RELAY_PROXY, 0, relay_proxy([
+            (R.RELAY_ROUTER, False, 0, relay_cleanup()),
+        ]))])
+        signals = self.decoder.decode(bundled([
+            op(A, aggregator_only, nonce=1), op(A, deposit_only, nonce=2),
+        ]))
+        trade = next(item for item in signals if item.protocol == "0x")
+        self.assertEqual((trade.userop_index, trade.behavior), (0, "UNKNOWN"))
+        self.assertIn("aggregator_call_not_linked_to_unique_relay_deposit",
+                      trade.reasons)
+        deposit = next(item for item in signals if item.behavior == "INTENT_DEPOSIT")
+        self.assertEqual(deposit.userop_index, 1)
+        self.assertFalse(any(item.behavior in TRADE_BEHAVIORS for item in signals))
+
+    def test_relay_full_allowance_sell_closes_from_receipt_amount(self):
+        source = tx(relay_sell(zero_x_exec(), R.ZERO_X_ALLOWANCE_HOLDER))
+        signals = self.decoder.decode(source)
+        swap_topic = next(topic for topic, protocol in SWAPS.items() if protocol == "v2")
+        order = b"\x01" * 32
+        logs = [
+            transfer(TOKEN, A, R.RELAY_ROUTER, 100),
+            log(B, [swap_topic]),
+            log(R.DEPOSITORY, [DEPOSIT_RECORDED], "0x" + encode(
+                ["address", "address", "uint256", "bytes32"],
+                [A, R.USDG, 95, order]).hex()),
+        ]
+        result = enrich(source, signals, receipt(logs), {A: {}})
+        trade = next(item for item in result if item.behavior == "SELL")
+        deposit = next(item for item in result if item.behavior == "INTENT_DEPOSIT")
+        self.assertEqual((trade.stage, trade.evidence["actual_input_debit_raw"],
+                          trade.evidence["actual_output_deposit_raw"]),
+                         ("relay_sell_evidenced", "100", "95"))
+        self.assertEqual(deposit.amount_in_raw, "95")
+        self.assertFalse(trade.copy_eligible)
 
     def test_weth_wrap_is_not_buy_and_preserves_raw_value(self):
         source = replace(tx(bytes.fromhex("d0e30db0"), R.WETH), value=123)
@@ -689,6 +852,26 @@ class FixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'conflated'):
             relay_delivery_evidence(document, deposit)
 
+    def test_passive_credit_becomes_buy_only_with_exact_relay_order(self):
+        candidate = passive_candidate()
+        document = relay_buy_document()
+        signal = relay_passive_buy(document, candidate)
+        self.assertEqual((signal.behavior, signal.stage, signal.token_in,
+                          signal.token_out, signal.amount_in_raw, signal.amount_out_raw),
+                         ("BUY", "relay_buy_evidenced", R.USDG, TOKEN, "100", "90"))
+        self.assertFalse(signal.copy_eligible)
+
+        document["requests"][0]["recipient"] = B
+        with self.assertRaisesRegex(ValueError, "not owned"):
+            relay_passive_buy(document, candidate)
+
+    def test_passive_credit_without_relay_order_remains_candidate(self):
+        candidate = passive_candidate()
+        with self.assertRaisesRegex(ValueError, "not unique"):
+            relay_passive_buy({"requests": []}, candidate)
+        self.assertEqual(candidate.behavior, "EXTERNAL_DELIVERY_CANDIDATE")
+        self.assertFalse(candidate.copy_eligible)
+
     def test_real_bulk_distribution_summary(self):
         row = json.loads((ROOT / 'data/bulk_distribution.json').read_text())
         source = Transaction.from_rpc(row['transaction'])
@@ -702,6 +885,52 @@ class FixtureTests(unittest.TestCase):
         signals = self.example('0x542ba9')
         self.assertEqual(signals[0].behavior, 'EXTERNAL_DELIVERY_CANDIDATE')
         self.assertFalse(signals[0].copy_eligible)
+
+    def test_real_relay_passive_credit_has_exact_buy_order_attribution(self):
+        summary = json.loads(
+            (ROOT / 'data/relay_signal_evidence_2026-09-12.json').read_text())
+        row = next(item for item in summary['samples']
+                   if item['role'] == 'passive_credit_before_relay_order_association')
+        candidate = Signal(
+            row['tx_hash'], row['wallet'], 'third_party', 'INCOMING_TRANSFER',
+            'incoming', R.RELAY_ROUTER, '0xcd6e13f7', stage='needs_review',
+            execution_status='success', execution_success=True,
+            evidence={'wallet_erc20_deltas_raw': {
+                row['credited_token']: row['credited_amount_raw']}})
+        document = json.loads(
+            (ROOT / 'data/relay_passive_buy_evidence_2026-09-12.json').read_text())
+        buy = relay_passive_buy(document, candidate)
+        self.assertEqual((buy.behavior, buy.stage, buy.token_in, buy.token_out,
+                          buy.amount_in_raw, buy.amount_out_raw), (
+                              'BUY', 'relay_buy_evidenced', R.NATIVE,
+                              row['credited_token'], '196852887764874',
+                              row['credited_amount_raw']))
+        self.assertNotEqual(buy.evidence['source_payer'], buy.wallet)
+        self.assertFalse(buy.copy_eligible)
+
+        forged = deepcopy(document)
+        forged['requests'][0]['protocol']['orderData']['output']['payments'][0][
+            'recipient'] = B
+        with self.assertRaisesRegex(ValueError, 'uniquely authorize'):
+            relay_passive_buy(forged, candidate)
+
+    def test_real_relay_zero_x_sell_closes_token_debit_and_usdg_deposit(self):
+        signals = self.example('0x23419e')
+        trade = next(item for item in signals if item.behavior == 'SELL')
+        deposit = next(item for item in signals if item.behavior == 'INTENT_DEPOSIT')
+        self.assertEqual((trade.protocol, trade.stage), ('0x', 'relay_sell_evidenced'))
+        self.assertEqual(trade.evidence['actual_input_debit_raw'], trade.amount_in_raw)
+        self.assertEqual(trade.evidence['actual_output_deposit_raw'], deposit.amount_in_raw)
+        self.assertEqual(trade.evidence['relay_deposit_order_id'],
+                         deposit.evidence['order_id'])
+        self.assertFalse(trade.copy_eligible)
+
+    def test_real_unlinked_kyber_swap_stays_unknown(self):
+        signal = next(item for item in self.example('0x714aaa')
+                      if item.protocol == 'kyber')
+        self.assertEqual(signal.behavior, 'UNKNOWN')
+        self.assertIn('aggregator_call_not_linked_to_relay_sell', signal.reasons)
+        self.assertFalse(signal.copy_eligible)
 
     def test_real_transfer_not_sell(self):
         self.assertEqual(self.example('0x5ef512')[0].behavior, 'TRANSFER')
@@ -2672,10 +2901,13 @@ class SafetyTests(unittest.TestCase):
     def test_receipt_coverage_does_not_double_count_intent_updates(self):
         stats = Counter(receipt_signals=4, receipt_unknown=1,
                         receipt_needs_review=2, receipt_swap_evidenced=1,
+                        receipt_relay_sell_evidenced=1,
+                        receipt_relay_buy_evidenced=0,
                         intent_signals=99)
         self.assertEqual(coverage_summary(stats), {
             "receipt_signals": 4, "unknown": 1, "needs_review": 2,
-            "swap_evidenced": 1, "unknown_fraction": 0.25,
+            "swap_evidenced": 1, "relay_sell_evidenced": 1,
+            "relay_buy_evidenced": 0, "unknown_fraction": 0.25,
         })
 
     def test_signal_upgrades_to_safe_head_but_not_finality(self):
@@ -2713,6 +2945,37 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual([row["kind"] for row in store.solver_order(order_id)],
                          ["destination_delivery", "source_deposit"])
         store.close()
+
+    def test_relay_associate_is_idempotent_and_reorg_orphans_buy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            db = Path(folder) / "observer.sqlite3"
+            document = Path(folder) / "relay.json"
+            document.write_text(json.dumps(relay_buy_document()))
+            parent_hash, block_hash = "0x" + "cc" * 32, "0x" + "dd" * 32
+            candidate = passive_candidate()
+            candidate.evidence.update({"block_number": 10, "block_hash": block_hash})
+            store = Store(db)
+            store.record_chain_block(9, parent_hash, "0x" + "bb" * 32)
+            store.record_chain_block(10, block_hash, parent_hash)
+            store.put_candidate(tx(b""))
+            store.put(candidate)
+            store.complete_candidate(TXHASH, 10, block_hash)
+            store.close()
+            args = SimpleNamespace(db=str(db), ledger_mysql=False,
+                                   event_id=candidate.event_id, document=str(document))
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                relay_associate(args)
+                relay_associate(args)
+            reopened = Store(db)
+            associated = reopened.signal(candidate.event_id)
+            self.assertEqual((associated.behavior, associated.stage),
+                             ("BUY", "relay_buy_evidenced"))
+            self.assertEqual(sum(1 for _ in reopened.rows()), 1)
+            reopened.rewind_chain(9, parent_hash)
+            orphaned = reopened.signal(candidate.event_id)
+            self.assertEqual(orphaned.canonical_status, "orphaned")
+            self.assertFalse(orphaned.copy_eligible)
+            reopened.close()
 
     def test_reorg_removes_solver_execution_evidence(self):
         store = Store(":memory:")

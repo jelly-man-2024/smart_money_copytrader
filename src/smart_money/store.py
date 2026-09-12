@@ -9,7 +9,9 @@ import time
 from . import registry as R
 from .models import Signal, Transaction
 
-STAGE_RANK = {"intent": 0, "execution_observed": 1, "needs_review": 1, "swap_evidenced": 2, "failed": 3}
+STAGE_RANK = {"intent": 0, "execution_observed": 1, "needs_review": 1,
+              "swap_evidenced": 2, "relay_sell_evidenced": 2,
+              "relay_buy_evidenced": 2, "failed": 3}
 MAX_CANDIDATE_ATTEMPTS = 8
 
 

@@ -4,6 +4,8 @@ Robinhood Chain 聪明钱跟单工程，独立于同级 `fomo_sniper`。
 当前 v0.1.0 是 **只读观察器 + 回放验证**：不读取私钥，不签名、不发送交易，不实现真实成交。
 
 - [完整跟单方案](docs/COPYTRADING_PLAN.md)
+- [当前跟单流程与行为矩阵](docs/COPYTRADING_FLOW.md)
+- [观察名单历史交易路径分析](docs/WATCHLIST_ROUTE_ANALYSIS_2026-09-12.md)
 - [继续开发交接](docs/HANDOFF.md)
 - [新服务器测试与开发交付](docs/SERVER_HANDOFF.md)
 - [数据与代码来源](docs/PROVENANCE.md)
@@ -26,6 +28,16 @@ python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests -v
 .venv/bin/sm-copy replay --extra-fixture data/bulk_distribution.json
 ```
+
+对 monitor 已保存的被动入账候选，可用操作者另行保存的 Relay 响应做严格离线订单关联：
+
+```bash
+.venv/bin/sm-copy relay-associate --db var/observer.sqlite3 \
+  --event-id '<完整 event_id>' --document '<Relay requests JSON>'
+```
+
+只有源付款身份、目标 recipient/payment、outTx/fill 和本地回执 Token 入账全部唯一匹配才升级为
+`relay_buy_evidenced`；命令不联网、不签名、不广播，输出仍为 `copy_eligible=false`。
 
 离线回放包含 11 笔历史样本、1 笔真实 feed 存款样本和可选的 230 地址批量分发。
 不需要网络、付费 RPC 或私钥。信号输出到 stdout（JSONL），统计输出到 stderr。

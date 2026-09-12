@@ -136,14 +136,22 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
                     depositor, token, amount, order_id = decode(
                         ["address", "address", "uint256", "bytes32"], bytes.fromhex(item["data"][2:]))
                     candidate = (depositor.lower(), token.lower(), str(amount), "0x" + order_id.hex())
-                    expected = (signal.wallet, signal.token_in, signal.amount_in_raw,
-                                signal.evidence.get("order_id"))
-                    if candidate == expected:
+                    expected = (signal.wallet, signal.token_in, signal.evidence.get("order_id"))
+                    identity = (candidate[0], candidate[1], candidate[3])
+                    amount_matches = (signal.amount_in_raw is None
+                                      or candidate[2] == signal.amount_in_raw)
+                    if identity == expected and amount_matches:
                         matches.append(item)
                 except Exception:
                     continue
             signal.evidence["matching_deposit_order_events"] = len(matches)
             if len(matches) == 1:
+                if signal.amount_in_raw is None:
+                    _, _, amount, _ = decode(
+                        ["address", "address", "uint256", "bytes32"],
+                        bytes.fromhex(matches[0]["data"][2:]))
+                    signal.amount_in_raw = str(amount)
+                    signal.evidence["actual_deposit_amount_raw"] = str(amount)
                 signal.evidence["solver_order_status"] = "source_deposit_evidenced"
             else:
                 signal.stage = "needs_review"
@@ -153,6 +161,10 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
             # Outer/UserOp success does not prove each allow-failure subcall succeeded.
             continue
         swap_logs = [log for log in local_logs if log.get("topics") and log["topics"][0] in SWAPS]
+        if (signal.protocol in {"0x", "kyber"}
+                and signal.evidence.get("source_orchestrator") == "relay"):
+            signal.evidence["swap_event_count_in_scope"] = len(swap_logs)
+            continue
         check = (pool_checks or {}).get(signal.event_id)
         if signal.protocol in ("v2", "v3"):
             signal.evidence["pool_verification"] = check or {
@@ -262,6 +274,42 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
         else:
             signal.stage = "needs_review"
             signal.reasons.append("wallet_exchange_flows_not_closed")
+
+    for signal in signals:
+        if (signal.protocol not in {"0x", "kyber"}
+                or signal.evidence.get("source_orchestrator") != "relay"
+                or signal.behavior != "SELL"):
+            continue
+        group = (signal.wallet, signal.userop_index)
+        deposits = [item for item in signals if (
+            (item.wallet, item.userop_index) == group
+            and item.behavior == "INTENT_DEPOSIT"
+            and item.path == signal.evidence.get("relay_deposit_path"))]
+        net = signal.evidence.get("wallet_erc20_deltas_raw", {})
+        try:
+            actual_input = -int(net.get(signal.token_in, "0"))
+        except (TypeError, ValueError):
+            actual_input = 0
+        if (signal.execution_status != "success" or len(deposits) != 1
+                or deposits[0].evidence.get("solver_order_status") != "source_deposit_evidenced"
+                or deposits[0].evidence.get("order_id") != signal.evidence.get("relay_deposit_order_id")
+                or deposits[0].token_in != signal.token_out
+                or not deposits[0].amount_in_raw
+                or int(deposits[0].amount_in_raw) <= 0
+                or actual_input <= 0
+                or actual_input != int(signal.amount_in_raw or "0")
+                or int(signal.evidence.get("swap_event_count_in_scope", 0)) <= 0
+                or trade_counts[group] != 1 or group in uncertain_groups):
+            signal.stage = "needs_review"
+            signal.reasons.append("relay_sell_evidence_not_uniquely_closed")
+            continue
+        signal.stage = "relay_sell_evidenced"
+        signal.evidence.update({
+            "actual_input_debit_raw": str(actual_input),
+            "actual_output_deposit_raw": deposits[0].amount_in_raw,
+            "source_deposit_event_id": deposits[0].event_id,
+        })
+        signal.reasons.append("relay_source_deposit_is_not_destination_finality_or_trade_approval")
 
     if not signals and succeeded:
         events = transfers(logs)

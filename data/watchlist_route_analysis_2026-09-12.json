@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "report_date_utc": "2026-09-12",
+  "chain_id": 4663,
+  "rpc_provider_host": "lb.drpc.live",
+  "scope": {
+    "watchlist_count": 67,
+    "from_block": 51551461,
+    "from_block_hash": "0x2c8831ff7fd88eb89ea789186620fa6bd967b81f67fdecfade65018faa54dc84",
+    "from_utc": "2026-09-01T07:45:29+00:00",
+    "to_block": 61167966,
+    "to_block_hash": "0xa73d13d1c329f10319c7c8864360de2ffbe1df34da723238ffe4ba3a9a46a1b7",
+    "to_utc": "2026-09-12T14:13:03+00:00"
+  },
+  "discovery": {
+    "transfer_logs": 59026,
+    "transfer_related_transactions": 37152,
+    "active_watchlist_wallets": 60,
+    "wallet_or_userop_initiated_transactions": 7145,
+    "decoded_initiated_transactions": 7133,
+    "active_exchange_candidate_groups": 5248,
+    "historical_account_code_checks": 5248,
+    "account_code_snapshot_matches": 5244,
+    "direct_eoa_transactions_before_later_delegation": 3,
+    "same_transaction_type4_authorization": 1
+  },
+  "route_entry_counts": {
+    "0x_allowance_holder": 3177,
+    "kyberswap_meta_aggregation_router_v2": 1992,
+    "gmgn_router": 30,
+    "oneinch_router": 6,
+    "uniswap_universal_router": 13,
+    "uniswap_v3_router": 1,
+    "other_unknown": 28,
+    "relay_unresolved_inner_route": 1,
+    "direct_pool_call": 0,
+    "okx_current_router_attributed_to_watchlist": 0
+  },
+  "relay_order_source_flow": {
+    "relay_wrapped_groups": 5125,
+    "token_to_usdg_then_deposit_attempts": 5123,
+    "deposit_all_erc20_selector": "0x5a1ee3ac",
+    "deposit_token": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+    "unique_order_ids": 5123,
+    "matching_depositor_wallets": 5123,
+    "uniquely_matching_deposit_events": 5122,
+    "order_event_mismatches": 1,
+    "routes": {
+      "0x_allowance_holder": 3161,
+      "kyberswap_meta_aggregation_router_v2": 1961,
+      "relay_unresolved_inner_route": 1
+    }
+  },
+  "closed_local_exchange": {
+    "note": "Analysis-level scoped Swap plus closed wallet flow; not automatically equivalent to the production swap_evidenced state for every unsupported router.",
+    "groups": 118,
+    "erc20_to_native": 69,
+    "native_to_erc20": 13,
+    "erc20_to_erc20": 36,
+    "routes": {
+      "0x_allowance_holder": 16,
+      "kyberswap_meta_aggregation_router_v2": 30,
+      "gmgn_router": 30,
+      "oneinch_router": 6,
+      "uniswap_universal_router": 13,
+      "uniswap_v3_router": 1,
+      "other_unknown": 22
+    },
+    "still_unresolved_groups": 7
+  },
+  "meme_name_heuristic": {
+    "note": "A conservative symbol/name keyword heuristic, not an on-chain token standard or investment classification.",
+    "unique_token_candidates": 172,
+    "exchange_candidate_groups": 1649,
+    "token_debit_groups": 1643,
+    "token_credit_only_groups": 6,
+    "relay_order_source_swaps": 1627,
+    "closed_local_exchanges": 21,
+    "unresolved": 1,
+    "routes": {
+      "0x_allowance_holder": 1095,
+      "kyberswap_meta_aggregation_router_v2": 547,
+      "uniswap_universal_router": 2,
+      "other_unknown": 5,
+      "okx_current_router": 0
+    }
+  },
+  "top_clear_meme_style_tokens": [
+    {"symbol": "MOO", "name": "Memory cow Moo", "address": "0xd9db30bb0d2b8d2eae3826a1372117e058791e18", "groups": 243, "debits": 243, "credits": 0, "zero_x": 155, "kyberswap": 88},
+    {"symbol": "MEME", "name": "A Meme Coin", "address": "0x385f4f8ae47651ce5f58f5265395a669f8281e18", "groups": 159, "debits": 159, "credits": 0, "zero_x": 99, "kyberswap": 60},
+    {"symbol": "FATCOIN", "name": "FATCOIN", "address": "0x12d5ee7917ca430073c3a638ee1e6f0648a98a01", "groups": 125, "debits": 125, "credits": 0, "zero_x": 99, "kyberswap": 26},
+    {"symbol": "AI", "name": "Artificial Inu", "address": "0x2e8c31162b855a2ffa90f6f8634643ad6f111e18", "groups": 118, "debits": 115, "credits": 3, "zero_x": 80, "kyberswap": 38},
+    {"symbol": "SHROOM", "name": "MUSHROOM", "address": "0xab093def657f15df31b33922a95e047add645b29", "groups": 86, "debits": 86, "credits": 0, "zero_x": 61, "kyberswap": 25},
+    {"symbol": "CASHCAT", "name": "Cash Cat", "address": "0x020bfc650a365f8bb26819deaabf3e21291018b4", "groups": 77, "debits": 77, "credits": 0, "zero_x": 59, "kyberswap": 18},
+    {"symbol": "NUDES", "name": "Send Nudes", "address": "0xbe98b75361935b18d688409424a869a4c3dc7401", "groups": 72, "debits": 72, "credits": 0, "zero_x": 45, "kyberswap": 27},
+    {"symbol": "BONER", "name": "Boner Coin", "address": "0x98096d17e191b3da1d5f99a6d7b3584351b11e18", "groups": 42, "debits": 42, "credits": 0, "zero_x": 27, "kyberswap": 14, "other": 1}
+  ],
+  "representative_transactions": {
+    "relay_zero_x_to_usdg_deposit": "0x003604028b8e089bddd8ad9bce52b6bdea90606481825af4117b010cfb2f138d",
+    "relay_kyberswap_to_usdg_deposit": "0x0009c8b2af9c6d68bd903ed3c7a3617a7237ddd5c4492f4c9f8440f906416150",
+    "closed_zero_x_meme_sell_to_native": "0x00bb5cbb48f2e2a4a55382cdcde132031a022834dff18ccdd557d6259685a35a",
+    "closed_kyberswap_erc20_to_erc20": "0x0381f7ef868dc93aebac7b86187cedbb968e2b873dbc75d7afd07535fffe70b8",
+    "closed_universal_router_meme_buy": "0xd69b89a1e2a019aa685b1825f148c203ab68beab4ffae486731a4bf2ce62a571",
+    "okx_address_only_in_other_userop": "0x113cde57e08817cd18306acb1387aba79b3845d8391886c5cecf6cfa341b690b"
+  },
+  "limitations": [
+    "Discovery starts from ERC-20 Transfer logs and therefore omits failed, approval-only, native-only and logless activity.",
+    "The window is 2026-09-01 through 2026-09-12, not chain-lifetime history.",
+    "Meme classification is a documented name heuristic and can have false positives and false negatives.",
+    "Unsupported router candidates were not promoted to the production swap_evidenced state merely by this analysis.",
+    "The current official OKX router was checked; OKX documents that router addresses may be replaced, so zero is not proof that no older OKX deployment was ever used.",
+    "A source-chain Relay deposit proves neither destination-chain ownership nor destination finality without separate order and destination-chain evidence."
+  ]
+}

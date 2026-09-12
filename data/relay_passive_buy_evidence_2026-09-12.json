@@ -1,0 +1,59 @@
+{
+  "provenance": {
+    "source": "Relay public GET /requests/v2 filtered by destination transaction hash",
+    "retrieved_date_utc": "2026-09-12",
+    "url_query": "hash=0x1d6bb5c7d09e803793c2ad08420fc077f779dbeceb3adb36914d9ffa0c2d4a12&includeOrderData=true&limit=2",
+    "note": "Compact field-preserving fixture. The Robinhood outTx was independently observed through the configured read-only RPC; requests/v2 reported deprecation in favor of v3."
+  },
+  "requests": [
+    {
+      "id": "0x17892262899f7a3eca4cf56ceda4ad01167f624492a4d9ad790f1493c4599e8f",
+      "status": "success",
+      "user": "0x89f5430c664cfeb9cdfa6535e6f8118b65c93be2",
+      "recipient": "0x06de9c48b1e639ed5c13ec8fbd4080a38e39f2d1",
+      "data": {
+        "inTxs": [{
+          "hash": "0x51cb062a6f829a71a51845252990536c46bdabccd5e5de719c72bf35c7ac4ccd",
+          "chainId": 8453,
+          "status": "success"
+        }],
+        "outTxs": [{
+          "hash": "0x1d6bb5c7d09e803793c2ad08420fc077f779dbeceb3adb36914d9ffa0c2d4a12",
+          "chainId": 4663,
+          "status": "success",
+          "stateChanges": [{
+            "address": "0x06de9c48b1e639ed5c13ec8fbd4080a38e39f2d1",
+            "change": {
+              "kind": "token",
+              "balanceDiff": "72378205763277380661382",
+              "data": {
+                "tokenKind": "ft",
+                "tokenAddress": "0x7050670f45a4ae3f2cd7c0c24f244ecb13832101"
+              }
+            }
+          }]
+        }]
+      },
+      "protocol": {
+        "orderId": "0x6ac516383ce65941daa48e311674dc43cf610b58a41912c0b0cba1b644043b8f",
+        "deposit": {"origin": {
+          "amount": "196852887764874",
+          "chainId": 8453,
+          "currency": "0x0000000000000000000000000000000000000000",
+          "depositor": "0x89f5430c664cfeb9cdfa6535e6f8118b65c93be2",
+          "transactionId": "0x51cb062a6f829a71a51845252990536c46bdabccd5e5de719c72bf35c7ac4ccd"
+        }},
+        "settlement": {"destination": {"fills": [{
+          "chainId": 4663,
+          "transactionId": "0x1d6bb5c7d09e803793c2ad08420fc077f779dbeceb3adb36914d9ffa0c2d4a12"
+        }]}},
+        "orderData": {"output": {"payments": [{
+          "currency": "0x7050670f45a4ae3f2cd7c0c24f244ecb13832101",
+          "recipient": "0x06de9c48b1e639ed5c13ec8fbd4080a38e39f2d1",
+          "minimumAmount": "69105336797781899393901",
+          "expectedAmount": "72376766650379031623273"
+        }]}}
+      }
+    }
+  ]
+}

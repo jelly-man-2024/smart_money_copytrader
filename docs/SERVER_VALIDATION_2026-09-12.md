@@ -465,3 +465,52 @@ relationship/source tx 的 order/fill/position 归因。SELL 只预留同一关�
 reserved=0、invested=`25000000000000000`、available=`975000000000000000`，realized PnL=0。
 导出顺序为 BUY/SELL 两条 paper trade。测试账本位于被忽略的
 `var/local-copytrade-9d87fddfffb8388e.sqlite3`；该轮未写业务 MySQL。
+
+## 精简版 Goal 1：Relay + 0x/Kyber 信号闭环（完成）
+
+新增 Relay cleanup、Depository full-allowance deposit、0x AllowanceHolder `exec` 和 Kyber
+MetaAggregationRouterV2 `swap` 解码。聚合器调用只有在同一真实钱包、同一 UserOperation、
+同一 Relay 根调用下唯一关联 USDG deposit/orderId 时才判 SELL；回执还必须证明 UserOperation
+成功、钱包 Token 精确扣款、唯一 DepositRecorded 金额/orderId 及同范围 Swap，才能进入
+`relay_sell_evidenced`。不满足条件保持 UNKNOWN/needs_review。
+
+被动买入要求已有 `EXTERNAL_DELIVERY_CANDIDATE`/`INCOMING_TRANSFER` 与保存的 Relay 响应中
+的 request/order 身份、源付款人、目标 recipient/payment、唯一成功源交易、目标 outTx、
+settlement fill 及本地唯一 Token 净入账完全相符，才生成 `relay_buy_evidenced`；单纯收币不升级。
+离线入口为：
+
+```bash
+.venv/bin/sm-copy relay-associate --db var/observer.sqlite3 \
+  --event-id '<完整 event_id>' --document '<保存的 Relay requests/v2 JSON>'
+```
+
+该命令只读取本地文件和现有 SQLite/MySQL 信号，不自动访问 Relay/RPC，不进入 paper 或实盘。
+所有新增阶段仍强制 `copy_eligible=false`。
+
+实测：`pip check` 通过；完整 unittest 在修复一次回归发现的重复接口定义并增加真实样本断言后，
+最终 153/153 通过；`git diff --check` 通过。13 笔离线 replay 通过，行为分布为 TRANSFER=1、
+CLAIM=1、APPROVAL=12、UNKNOWN=2、SELL=3、BUY=1、LIQUIDITY=1、
+EXTERNAL_DELIVERY_CANDIDATE=1、INTENT_DEPOSIT=4、BULK_DISTRIBUTION=1。旧 `0x23419e…`
+真实 Relay + 0x 样本闭合，旧直连 Kyber 样本因没有 Relay 订单关联保持 UNKNOWN。
+
+主网只读监听首次在沙箱内阻塞于初始网络连接且没有创建账本，不计为监听。获准联网后运行至少
+60 秒并以 Ctrl-C 触发现有优雅收尾：feed healthy，connections=1、frames=3043、decoded=7896；
+候选/派发/回执=4/4/4，complete=4，pending/queued/retry/failed=0；重连、frame、worker、
+account-code、backfill、RPC、retry、drop 错误均为 0。receipt_signals=13、UNKNOWN=0、
+needs_review=1、relay_sell_evidenced=3；现场同时捕获 0x 与 Kyber Relay SELL。一笔无本地 Swap
+的入账先保持 INCOMING_TRANSFER/needs_review，随后通过 Relay 官方按目标 tx hash 查询得到
+唯一订单，进入下述独立 BUY 归属验证。
+
+现场账本：`/tmp/smart-money-goal1-live-escalated.sqlite3`。紧凑正负证据：
+`data/relay_signal_evidence_2026-09-12.json`。本轮没有读取私钥、签名、广播、paper 或真实跟单。
+随后保存独立紧凑 Relay 响应 `data/relay_passive_buy_evidence_2026-09-12.json`。真实结构显示
+Base 付款人不是 Robinhood 收币钱包，因此规则分别要求 `request.user == origin.depositor`，
+以及目标钱包匹配 recipient、orderData payment、成功 outTx/stateChange、destination fill 和
+本地回执唯一正向 Token delta。真实样本闭合为 `relay_buy_evidenced`；篡改 payment recipient
+负例被拒绝。另补 CLI→Store 重复关联幂等和重组 orphan 回归，以及同钱包跨 UserOperation
+不得拼接 aggregator/deposit 的负例。
+
+最终再次执行 `pip check`、153 项 unittest、13 笔 replay 和 `git diff --check`，全部通过。Goal 1
+至此完成；没有自动进入 Goal 2、paper 或实盘。非阻塞后续风险：紧凑 Kyber 样本不是完整原始
+tx/receipt 归档；Relay requests/v2 官方将在 2026-11-24 退役，而 v3 需要 API key。当前程序不
+自动调用 v2，只消费操作者保存的证据 JSON；Goal 2 前应单独设计 v3 凭据和响应兼容方案。

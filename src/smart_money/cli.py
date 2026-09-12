@@ -30,6 +30,7 @@ from .quotes import LiveQuoter
 from .receipts import enrich
 from .registry import CHAIN_ID, ENTRYPOINT, delegation, load_watchlist, snapshot_delegations
 from .rpc import ReadOnlyRpc, RpcError
+from .solver import relay_passive_buy
 from .store import Store
 
 
@@ -93,6 +94,8 @@ def coverage_summary(stats) -> dict:
         "unknown": int(stats.get("receipt_unknown", 0)),
         "needs_review": int(stats.get("receipt_needs_review", 0)),
         "swap_evidenced": int(stats.get("receipt_swap_evidenced", 0)),
+        "relay_sell_evidenced": int(stats.get("receipt_relay_sell_evidenced", 0)),
+        "relay_buy_evidenced": int(stats.get("receipt_relay_buy_evidenced", 0)),
         "unknown_fraction": round(int(stats.get("receipt_unknown", 0)) / total, 6) if total else None,
     }
 
@@ -130,6 +133,23 @@ def replay(args):
     finally:
         store.close()
     report("replay_finished", transactions=len(examples), behaviors=dict(counts), live_trading=False)
+
+
+def relay_associate(args):
+    """Offline/manual association; the command never calls Relay or an RPC endpoint."""
+    require_existing_sqlite(args)
+    document = json.loads(Path(args.document).read_text())
+    store = runtime_store(args)
+    try:
+        candidate = store.signal(args.event_id)
+        if candidate is None:
+            raise ValueError("signal event id not found")
+        associated = relay_passive_buy(document, candidate)
+        emit(store, associated)
+        report("relay_passive_buy_associated", event_id=associated.event_id,
+               stage=associated.stage, copy_eligible=False, live_trading=False)
+    finally:
+        store.close()
 
 
 def paper_cycle(args):
@@ -216,6 +236,7 @@ async def monitor(args):
         "backfill_passive_candidates",
         "intent_signals", "receipt_signals", "receipt_unknown",
         "receipt_needs_review", "receipt_swap_evidenced",
+        "receipt_relay_sell_evidenced", "receipt_relay_buy_evidenced",
         "account_prestate_missing",
         "paper_decisions", "paper_accepted", "paper_rejected", "paper_shadow_accepted",
         "paper_filled", "paper_fill_cancelled",
@@ -395,6 +416,10 @@ async def monitor(args):
                             stats["receipt_needs_review"] += 1
                         if signal.stage == "swap_evidenced":
                             stats["receipt_swap_evidenced"] += 1
+                        if signal.stage == "relay_sell_evidenced":
+                            stats["receipt_relay_sell_evidenced"] += 1
+                        if signal.stage == "relay_buy_evidenced":
+                            stats["receipt_relay_buy_evidenced"] += 1
                     stats["receipts"] += 1
                     store.complete_candidate(tx.hash, number(receipt.get("blockNumber", 0)),
                                              receipt.get("blockHash"))
@@ -710,6 +735,12 @@ def parser():
         "ledger-migrate", help="Migrate a stopped SQLite ledger to business MySQL")
     ledger_migrate_parser.add_argument("--sqlite", required=True)
     ledger_migrate_parser.add_argument("--confirm-source-sha256", required=True)
+    relay_associate_parser = commands.add_parser(
+        "relay-associate", help="Offline association of a saved Relay response with a passive signal")
+    relay_associate_parser.add_argument("--event-id", required=True)
+    relay_associate_parser.add_argument("--document", required=True)
+    relay_associate_parser.add_argument("--db", default="var/observer.sqlite3")
+    relay_associate_parser.add_argument("--ledger-mysql", action="store_true")
     for command_parser in (
             replay_parser, monitor_parser, reconcile_parser, cycle_parser,
             mark_parser, paper_export_parser, export_parser,
@@ -783,6 +814,8 @@ def main():
             print(json.dumps(migrate_sqlite_ledger(
                 args.sqlite, args.confirm_source_sha256), ensure_ascii=False,
                 sort_keys=True))
+        elif args.command == "relay-associate":
+            relay_associate(args)
         elif args.command == "relationships-import":
             inserted, skipped = import_watchlist_relationships(
                 args.follower_wallet, args.follower_label, args.watchlist, args.template)

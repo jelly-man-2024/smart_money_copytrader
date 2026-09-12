@@ -17,6 +17,24 @@
   protocol deposit、destination fill/outTx 和接收者 FT 正向 stateChange；未保存无关费用明细、
   签名或大段原始 calldata。API key 未使用。该样本证明 Relay API 报告的订单关联，不证明
   Solana 目标交易已由本项目独立 RPC 复核。
+- `data/relay_signal_evidence_2026-09-12.json`：2026-09-12 使用项目 `.env` 中已配置的
+  dRPC 与 Robinhood 公开 feed 做只读监听时捕获的紧凑证据摘要。包含 Relay + 0x、
+  Relay + Kyber 各一笔正例和一笔关联前的被动入账候选；原始整数金额保持字符串，
+  不含 RPC URL、凭据或私钥。完整运行账本位于服务器临时路径
+  `/tmp/smart-money-goal1-live-escalated.sqlite3`，该临时文件不作为长期来源保证。
+- `data/relay_passive_buy_evidence_2026-09-12.json`：2026-09-12 使用 Relay 官方公开只读
+  `GET /requests/v2?hash=...` 按上述被动入账的目标交易哈希查询并人工裁剪。保留唯一 request/
+  order ID、源链付款人和入金、Robinhood outTx/stateChange、destination fill 与 orderData payment。
+  Relay 响应声明 v2 已弃用、应迁移 v3；该文件不含签名、大段 calldata 或接口凭据。
+- `data/watchlist_route_analysis_2026-09-12.json`：2026-09-12 使用项目已配置 dRPC 只读端点，
+  对原有 67 地址从区块 51,551,461 至 61,167,966 做 Transfer 起点的窗口扫描后生成的聚合摘要。
+  另取候选交易、回执和受限 prestate state-diff，按目标 UserOperation 隔离；未保存 RPC 凭据、
+  完整原始扫描或私钥。旧样本均未改写。详细口径和限制见
+  `docs/WATCHLIST_ROUTE_ANALYSIS_2026-09-12.md`。
+- 2026-09-12 同时只读核对 Fomo 官方条款、钱包架构文章、Fomo Web 说明及当时公开 Web
+  静态模块。条款明确 Robinhood Token 入口包含 Relay API；公开模块的 `/swaps/v2` 返回结构
+  包含 `relaySwapId`/`relayTransaction`。静态模块未复制进仓库，也没有登录、签名或提交交易；
+  聚合器归属仍以来自 dRPC 的目标 UserOperation 链上证据为准。
 - 测试中的随机本地账户只用于离线编码/验签，没有资金、不会广播。
 
 纸面报价使用的 V3 Quoter `0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7` 和 V4 Quoter
