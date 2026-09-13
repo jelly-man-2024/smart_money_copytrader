@@ -124,6 +124,10 @@ invested/reserved 数值，若新上限低于已占用额度则启动失败，�
    密钥访问和广播前都会复查。`SMART_MONEY_EMERGENCY_STOP` 只保留给离线签名测试，不再是实盘
    部署配置。
 
+停止进程时先创建 stop file，再 `kill -INT <pid>`。若进程是在非交互 shell 中以 `nohup ... &`
+方式启动的，它会继承对 SIGINT 的忽略而不会退出，此时等待 30 秒后改用 `kill -TERM <pid>`；两种
+信号下账本写入都是事务性的，stop file 已保证不会再有密钥读取或广播。
+
 出现异常时先停用关系并创建 stop file，再运行 `execution-audit` 和只读 RPC 核对。不要清库、
 重置 nonce 或盲目重发交易。mainnet_live 广播 hash 和外部广播 hash 都交给只读 tracker 跟踪。
 CLI 为 `sm-copy execution-track --db ... --proposal-id ...`；原始签名 hash 可省略 `--tx-hash`，
