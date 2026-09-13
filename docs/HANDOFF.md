@@ -567,3 +567,11 @@ Token approve 与 SELL 分别为
 Token余额/allowance均为0，latest/pending nonce均为13；执行审计8/8 confirmed且无 issue。monitor仍
 运行于 `smart_money_mainnet_live_78_kyber_retry2`，relationship 78仍enabled，完整公开证据继续写入
 `var/mainnet_live_78_20260913_kyber_retry2.log`。
+
+第五轮继续完成另一组 Relay BUY→Kyber/Relay SELL。follower BUY
+`0x867e5806e98d470a905b67509060f009e9cc4071892e26a5ed2434fad0bd2b0c`
+以2 USDG买到 `3396809340185972048` raw Token；自动有界授权后，follower SELL
+`0x61051d5f1bd056db1018237c711bf81c725c208b07bf5ae513e079225934afc5`
+卖出全部归因持仓并收回 `1988018` raw USDG。realized PnL为 -0.011982 USDG（不含Gas），lot closed，
+10 USDG额度全部恢复，链上目标Token余额/allowance均为0。执行审计10/10 confirmed且无issue；
+monitor仍在原screen常驻，relationship 78保持enabled。

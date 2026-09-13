@@ -360,3 +360,28 @@ SELL的ETH Gas）。链上复核 USDG/Token余额为 `19690880/0` raw，Token al
 `4812658077970556` wei，latest/pending nonce均为13。执行审计8/8 attempt全部confirmed，
 `healthy=true/issues=[]`；候选complete，queue与pending/retry/failed均为0。原 screen、relationship
 和急停暂存状态不变，monitor继续常驻。
+
+## 第五轮常驻测试：第二组连续 Relay BUY/SELL
+
+源 BUY `0x5bdf5097e6d54abf7d7533ee6a6aa2f3a0d005ff6d088b308f19330eb2d03163`
+经两次 RelayNotReady 后自动重试并唯一关联；目标 Token 为
+`0x39dbed3a2bd333467115de45665cc57f813c4571`。系统验证 V3 fee=3000 池
+`0x0652d61511f3a96b8721be6825680f5954d9baf3`，follower BUY
+`0x867e5806e98d470a905b67509060f009e9cc4071892e26a5ed2434fad0bd2b0c`
+在规范区块61665773成功，实际支付 `2000000` raw USDG、收到
+`3396809340185972048` raw Token，Gas=`13508420220000` wei。candidate attempts=3后complete，
+open lot、链上余额与预算 invested=`2000000` raw精确一致。
+
+源 SELL `0xb1c690fffde9ff31d79b69acb326bdfd6b45d5352e5ae8029b3c6ee9e9ead324`
+由 Kyber + Relay 完成并严格闭合 Token debit与USDG deposit。系统按全卖比例映射 follower lot，
+从 BUY lot反转已验证的 V3 fee=3000路径。Token approve
+`0x902a911cb0789f6854a56b35e61d064c30ca7966a5009e53937690c6601a056f`
+在规范区块61666802成功；follower SELL
+`0x61051d5f1bd056db1018237c711bf81c725c208b07bf5ae513e079225934afc5`
+在规范区块61666829成功，卖出全部 `3396809340185972048` raw Token并收到
+`1988018` raw USDG，SELL Gas=`10873767584000` wei。
+
+结算后 realized PnL=`-11982` raw USDG（-0.011982 USDG，不含 Gas），lot closed，预算
+reserved/invested/available=`0/0/10000000` raw。链上 USDG/Token余额为 `19678898/0` raw，Token
+allowance为0，ETH余额 `4784170529528556` wei，latest/pending nonce均为16。执行审计10/10 attempt
+全部confirmed，`healthy=true/issues=[]`；monitor、relationship和急停暂存状态保持不变。
