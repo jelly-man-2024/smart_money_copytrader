@@ -1047,6 +1047,34 @@ class FixtureTests(unittest.TestCase):
 
 
 class QuoteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_decision_id_changes_when_relationship_snapshot_changes(self):
+        store = Store(':memory:')
+        signal = Signal(
+            TXHASH, A, 'direct', 'TRANSFER', 'call', B, '0x',
+            stage='receipt_success', execution_status='success')
+        context = {A: {'relationship_id': '78'}}
+        policy = QuotePolicy()
+        first = PaperEngine(
+            store, None, policy, 'snapshot-retry-v1', 'swap_evidenced',
+            wallet_contexts=context, config_snapshot_hash='aa' * 32)
+        second = PaperEngine(
+            store, None, policy, 'snapshot-retry-v1', 'swap_evidenced',
+            wallet_contexts=context, config_snapshot_hash='bb' * 32)
+
+        first_decision = await first.propose_buy(
+            signal, AmountRule('fixed', fixed_amount_raw='1'))
+        second_decision = await second.propose_buy(
+            signal, AmountRule('fixed', fixed_amount_raw='1'))
+
+        self.assertNotEqual(first_decision.decision_id, second_decision.decision_id)
+        self.assertEqual(
+            store.paper_decision(first_decision.decision_id)['payload'][
+                'config_snapshot_hash'], 'aa' * 32)
+        self.assertEqual(
+            store.paper_decision(second_decision.decision_id)['payload'][
+                'config_snapshot_hash'], 'bb' * 32)
+        store.close()
+
     async def test_evidenced_dynamic_meme_buy_reaches_budget_reservation(self):
         store = Store(':memory:')
         store.start_paper_budget_cycle('manual-dynamic', 'test')

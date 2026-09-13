@@ -319,6 +319,8 @@ class PaperEngine:
         value = f"{kind}:{signal.event_id}:{self.trigger_mode}:{self.strategy_version}"
         if relationship:
             value += f":{relationship}"
+        if self.config_snapshot_hash:
+            value += f":snapshot:{self.config_snapshot_hash}"
         return hashlib.sha256(value.encode()).hexdigest()
 
     def _attribution(self, signal: Signal) -> dict:
@@ -350,8 +352,11 @@ class PaperEngine:
 
     def _ledger_source_event(self, signal: Signal) -> str:
         relationship = self.wallet_contexts.get(signal.wallet, {}).get("relationship_id")
-        return (f"{signal.event_id}:relationship:{relationship}"
-                if relationship else signal.event_id)
+        value = (f"{signal.event_id}:relationship:{relationship}"
+                 if relationship else signal.event_id)
+        if self.config_snapshot_hash:
+            value += f":snapshot:{self.config_snapshot_hash}"
+        return value
 
     def _decision(self, signal: Signal, accepted: bool, reason: str | None,
                   payload: dict, proposal_id: str | None = None) -> PaperDecision:
