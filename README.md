@@ -8,6 +8,7 @@ Robinhood Chain 聪明钱跟单工程，独立于同级 `fomo_sniper`。
 - [观察名单历史交易路径分析](docs/WATCHLIST_ROUTE_ANALYSIS_2026-09-12.md)
 - [继续开发交接](docs/HANDOFF.md)
 - [新服务器测试与开发交付](docs/SERVER_HANDOFF.md)
+- [Mac mini 空运行环境交付](docs/MAC_MINI_ENV_HANDOFF.md)
 - [数据与代码来源](docs/PROVENANCE.md)
 
 ## 快速开始
