@@ -7,15 +7,23 @@ import time
 from eth_utils import keccak
 from eth_abi import encode
 
+from eth_abi import decode
+from eth_abi.exceptions import DecodingError
+
+from .kyber import KyberSwapTransaction, decode_kyber_swap
 from .models import address, number
-from .paper import scope_reason
+from .paper import AGGREGATOR_PROVIDERS, AGGREGATOR_ROUTERS, scope_reason
 from .quotes import Quote
 from .registry import (
     CHAIN_ID, KNOWN_V4_HOOK_CODE_HASHES, NATIVE, UNIVERSAL_ROUTER,
     V2_ROUTER, V3_ROUTER, WETH,
 )
+from .rpc import RpcError
 
 POOL_KEY = "(address,address,uint24,int24,address)"
+LOCAL_EXECUTION_TARGETS = frozenset({V2_ROUTER, V3_ROUTER, UNIVERSAL_ROUTER})
+AGGREGATOR_EXECUTION_TARGETS = frozenset(AGGREGATOR_ROUTERS.values())
+EXECUTION_TARGETS = LOCAL_EXECUTION_TARGETS | AGGREGATOR_EXECUTION_TARGETS
 
 
 def _uint(value: str, name: str) -> int:
@@ -160,6 +168,104 @@ def build_execution_plan(signal, follower_wallet: str, relationship_id: str,
     )
 
 
+def build_aggregator_execution_plan(
+        signal, follower_wallet: str, relationship_id: str, proposal_id: str,
+        quote: Quote, minimum_amount_out_raw: str, swap: KyberSwapTransaction,
+        gas_limit: int, max_fee_per_gas: str, max_priority_fee_per_gas: str,
+        allowed_protocols: frozenset[str], allowed_assets: frozenset[str],
+        allowed_routes: frozenset[str]) -> "UnsignedExecutionPlan":
+    """Wrap an aggregator-built swap after verifying every field we can decode.
+
+    The inner executor payload is opaque, so this only admits calldata whose
+    router is allowlisted, whose top-level description names the follower as the
+    sole recipient for the exact planned input, and whose on-chain minimum output
+    is at least the locally computed slippage floor. The pipeline additionally
+    simulates the call before signing and before broadcast.
+    """
+    follower = address(follower_wallet)
+    if (signal.stage not in {"swap_evidenced", "relay_buy_evidenced",
+                             "relay_sell_evidenced"}
+            or signal.execution_status != "success"
+            or signal.canonical_status == "orphaned"
+            or signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}
+            or signal.exact_in is not True or signal.protocol not in AGGREGATOR_PROVIDERS):
+        raise ValueError("signal is not eligible for aggregator execution construction")
+    reason = scope_reason(signal, allowed_protocols, allowed_assets, allowed_routes)
+    if reason:
+        raise ValueError(reason)
+    if not isinstance(swap, KyberSwapTransaction):
+        raise ValueError("aggregator transaction is not a verified Kyber swap")
+    amount = _uint(quote.amount_in_raw, "quote amount in")
+    floor = _uint(minimum_amount_out_raw, "minimum amount out")
+    if (quote.protocol != signal.protocol or quote.input_asset != signal.token_in
+            or quote.output_asset != signal.token_out or amount <= 0 or floor <= 0
+            or floor > _uint(quote.amount_out_raw, "quote amount out")):
+        raise ValueError("quote does not match execution signal")
+    target = address(swap.to)
+    if (target != AGGREGATOR_ROUTERS[signal.protocol]
+            or target not in AGGREGATOR_EXECUTION_TARGETS):
+        raise ValueError("aggregator router is not allowlisted")
+    if signal.token_in == NATIVE or signal.token_out == NATIVE:
+        raise ValueError("aggregator execution supports ERC-20 pairs only")
+    decoded = decode_kyber_swap(swap.data)
+    on_chain_minimum = _uint(swap.minimum_amount_out_raw, "aggregator minimum out")
+    if (swap.input_asset != signal.token_in or swap.output_asset != signal.token_out
+            or swap.recipient != follower or _uint(swap.amount_in_raw, "swap amount") != amount
+            or _uint(swap.value_raw, "swap value") != 0
+            or decoded["src_token"] != signal.token_in
+            or decoded["dst_token"] != signal.token_out
+            or decoded["dst_receiver"] != follower
+            or _uint(decoded["amount_raw"], "decoded amount") != amount
+            or _uint(decoded["minimum_amount_out_raw"], "decoded minimum") != on_chain_minimum):
+        raise ValueError("aggregator calldata does not match the execution plan")
+    # The aggregator derives its minimum from its own output figure, which can
+    # round one raw unit below the route quote we assessed. Allow exactly that
+    # unit; any larger gap means the price moved and the plan must be rebuilt.
+    if on_chain_minimum + 1 < floor:
+        raise ValueError("aggregator minimum output is below the plan slippage floor")
+    if on_chain_minimum > _uint(swap.amount_out_raw, "aggregator amount out"):
+        raise ValueError("aggregator minimum output exceeds its own quote")
+    return UnsignedExecutionPlan(
+        follower_wallet=follower, relationship_id=relationship_id,
+        proposal_id=proposal_id, to=target, data=swap.data.lower(),
+        value_raw="0", input_asset=signal.token_in,
+        amount_in_raw=str(amount), minimum_amount_out_raw=str(on_chain_minimum),
+        gas_limit=gas_limit, max_fee_per_gas=max_fee_per_gas,
+        max_priority_fee_per_gas=max_priority_fee_per_gas,
+        quote_observed_at=quote.observed_at, quote_block_number=quote.block_number,
+        quote_block_hash=quote.block_hash, deadline=swap.deadline,
+        execution_provider=signal.protocol,
+    )
+
+
+async def simulate_aggregator_execution(rpc, plan: "UnsignedExecutionPlan") -> dict:
+    """Simulate the exact aggregator call from the follower; fail closed on any doubt."""
+    if plan.execution_provider not in AGGREGATOR_PROVIDERS:
+        raise ValueError("simulation is only defined for aggregator execution plans")
+    if address(plan.to) not in AGGREGATOR_EXECUTION_TARGETS:
+        raise ValueError("aggregator router is not allowlisted")
+    call = {"from": plan.follower_wallet, "to": plan.to, "data": plan.data,
+            "value": hex(_uint(plan.value_raw, "value")), "gas": hex(plan.gas_limit)}
+    try:
+        raw = await rpc.call("eth_call", [call, "pending"])
+    except RpcError as exc:
+        raise ValueError(
+            f"aggregator execution simulation reverted: {str(exc)[:120]}") from None
+    if not isinstance(raw, str) or not raw.startswith("0x") or len(raw) < 130:
+        raise ValueError("aggregator execution simulation returned no output")
+    try:
+        return_amount, gas_used = decode(["uint256", "uint256"], bytes.fromhex(raw[2:]))
+    except (ValueError, DecodingError):
+        raise ValueError("aggregator execution simulation result is undecodable") from None
+    minimum = _uint(plan.minimum_amount_out_raw, "minimum amount out")
+    if int(return_amount) < minimum:
+        raise ValueError("aggregator execution simulation output is below the minimum")
+    return {
+        "simulated": True, "simulated_return_amount_raw": str(int(return_amount)),
+        "simulated_gas_used": str(int(gas_used)), "simulation_block": "pending",
+    }
+
+
 @dataclass(frozen=True)
 class UnsignedExecutionPlan:
     follower_wallet: str
@@ -179,6 +285,7 @@ class UnsignedExecutionPlan:
     quote_block_hash: str
     deadline: int
     chain_id: int = CHAIN_ID
+    execution_provider: str = "local"
 
     def validate(self, allowed_targets: frozenset[str], now: float | None = None,
                  max_quote_age_seconds: float = 2.0) -> None:
@@ -187,6 +294,12 @@ class UnsignedExecutionPlan:
         address(self.input_asset)
         if target not in allowed_targets or self.chain_id != CHAIN_ID:
             raise ValueError("execution target or chain is not allowed")
+        if self.execution_provider != "local" and (
+                self.execution_provider not in AGGREGATOR_PROVIDERS
+                or target != AGGREGATOR_ROUTERS[self.execution_provider]):
+            raise ValueError("execution provider does not match the plan target")
+        if self.execution_provider == "local" and target in AGGREGATOR_EXECUTION_TARGETS:
+            raise ValueError("local execution plan targets an aggregator router")
         if (not self.relationship_id or not self.proposal_id
                 or not isinstance(self.gas_limit, int) or self.gas_limit <= 0
                 or not isinstance(self.quote_block_number, int) or self.quote_block_number < 0

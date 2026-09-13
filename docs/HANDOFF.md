@@ -606,3 +606,21 @@ allowance、nonce、签名与广播使用进程内钱包锁串行，不同 follo
 `sm-copy run` 启动开始，覆盖全部 enabled 关系加载、逐关系门禁、多 follower 分发、同 follower
 nonce/授权串行、纸面/实盘分支、有界授权、签名广播、回执结算、行为矩阵和当前代码入口；同时
 明确进程内锁不能保护重复实例，以及路由、V4/Permit2、复杂结算和深重组等剩余边界。
+
+## 2026-09-13 Kyber 聚合器执行提供方（阶段 1）与 nonce 释放修复
+
+Mac mini 接入 6 个真实聪明钱后，7 笔已证实买入只有 1 笔可跟，其余卡在 V4 池、非本工厂池或多跳路径，
+设计与证据见 `docs/AGGREGATOR_ROUTE_DESIGN.md`。本次实现其阶段 1：新增 `src/smart_money/kyber.py`
+（固定官方域名、Router 白名单、顶层 calldata 反解），`copy_relationships.execution_providers`
+（迁移 007，默认 `["local"]`，进入配置快照），决策引擎按提供方顺序回退，执行准备器以 Kyber 构建交易
+的输出为风控基准并在签名前、广播前以 follower 身份 `eth_call` 模拟；授权 spender 白名单加入 Kyber
+Router；聚合器买入的 lot 卖出时同样走 Kyber。运维手册"执行路径提供方"一节记录门禁与 SQL。
+
+首批实盘尝试跑通了路由选择、USDG 有界授权、构建、计划与模拟，但签名前二次报价因
+`adverse_price_deviation_exceeded` 被拒：这批新币在聪明钱买入后数秒内即超过 3% 偏离上限，是否放宽
+`quote_policy` 由操作员决定。过程中暴露原有缺陷：签名被拒后 `prepared` 计划和 reserved nonce 残留，
+后续计划比网络 pending nonce 多 1 并在广播前全部被拒。现已改为在同一进程内自动取消从未签名的计划、
+以及审核阶段被拒且从未广播的已签名计划，nonce 行置为 `released` 并改为高位哨兵值（原 nonce 记录在
+`final_review.released_nonce`），事件 `live_execution_abandoned` 携带原因；`copy_execution_error` 和
+`paper_decisions.payload.quote_error` 现在保存具体错误文本。本机账本中 3 条残留已按此清理，审计
+healthy。188/188 unittest、pip check、13 笔回放、diff check 通过。

@@ -107,6 +107,7 @@ def rows_to_document(rows: list[dict]) -> dict:
             if ratio is not None:
                 result["ratio_ppm"] = int(ratio)
             return result
+        providers = row.get("execution_providers")
         wallets.append({
             "wallet": smart,
             "label": row["smart_wallet_label"],
@@ -119,6 +120,10 @@ def rows_to_document(rows: list[dict]) -> dict:
             },
             "buy_rules": {"USDG": rule("usdg"), "ETH_WETH": rule("eth")},
             "sell_rule": rule("sell"),
+            # Databases created before migration 007 have no column: keep the
+            # verified local behaviour instead of guessing an aggregator.
+            "execution_providers": (["local"] if providers is None
+                                    else _json(providers, "execution_providers")),
         })
     return {"version": 1, **common, "wallets": wallets}
 

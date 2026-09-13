@@ -11,14 +11,16 @@ from eth_utils import keccak, to_checksum_address
 from hexbytes import HexBytes
 
 from .execution_prep import (
-    ReadOnlyExecutionPreflight, UnsignedExecutionPlan, build_execution_plan,
+    EXECUTION_TARGETS, ReadOnlyExecutionPreflight, UnsignedExecutionPlan,
+    build_aggregator_execution_plan, build_execution_plan,
+    simulate_aggregator_execution,
 )
 from .key_source import LiveDatabaseSigner, OfflineDatabaseSigner
 from .execution_controls import (
     require_mainnet_signing_enabled, require_offline_signing_enabled,
 )
+from .paper import AGGREGATOR_PROVIDERS
 from .quotes import assess_quote
-from .registry import UNIVERSAL_ROUTER, V2_ROUTER, V3_ROUTER
 
 
 def validate_transaction_matches_plan(transaction: dict,
@@ -105,7 +107,7 @@ class ExecutionPreparer:
         self.allowed_routes = allowed_routes
         self.config_snapshot_hash = config_snapshot_hash
         self.gas_limits = gas_limit_by_protocol or {
-            "v2": 220000, "v3": 350000, "v4": 500000,
+            "v2": 220000, "v3": 350000, "v4": 500000, "kyber": 600000,
         }
         if (not 30 <= deadline_seconds <= 600
                 or not 0 <= fee_headroom_bps <= 5000):
@@ -139,21 +141,44 @@ class ExecutionPreparer:
         quote, reference, gas_price_raw = await self.quoter.quote_with_reference(
             signal, proposal["amount_in_raw"])
         now = time.time() if now is None else now
+        swap = None
+        if signal.protocol in AGGREGATOR_PROVIDERS:
+            swap = await self.quoter.build_aggregator_transaction(
+                signal, proposal["amount_in_raw"], follower,
+                self.quote_policy.max_slippage_bps, int(now) + self.deadline_seconds)
+            # The built transaction's own output is the figure its on-chain minimum
+            # protects, so risk is assessed on that fresher figure; the route quote
+            # keeps supplying the small reference quote for price-impact estimation.
+            quote = replace(quote, amount_out_raw=swap.amount_out_raw,
+                            gas_estimate_raw=str(swap.gas_estimate))
         accepted, reason, risk = assess_quote(
             signal, quote, reference, self.quote_policy, gas_price_raw, now)
         if not accepted:
             raise ValueError(f"execution requote rejected: {reason}")
         gas_price = int(gas_price_raw)
         max_fee = (gas_price * (10000 + self.fee_headroom_bps) + 9999) // 10000
-        plan = build_execution_plan(
-            signal, follower, relationship, proposal_id, quote,
-            risk["minimum_amount_out_raw"], int(now) + self.deadline_seconds,
-            self.gas_limits.get(signal.protocol, 0), str(max_fee), "0",
-            self.allowed_protocols, self.allowed_assets, self.allowed_routes,
-        )
+        simulation = {}
+        if swap is not None:
+            gas_limit = max(self.gas_limits.get(signal.protocol, 0),
+                            swap.gas_estimate * 13 // 10 + 50_000)
+            plan = build_aggregator_execution_plan(
+                signal, follower, relationship, proposal_id, quote,
+                risk["minimum_amount_out_raw"], swap, gas_limit, str(max_fee), "0",
+                self.allowed_protocols, self.allowed_assets, self.allowed_routes,
+            )
+            simulation = await simulate_aggregator_execution(self.rpc, plan)
+            simulation["aggregator"] = swap.public_evidence()
+        else:
+            plan = build_execution_plan(
+                signal, follower, relationship, proposal_id, quote,
+                risk["minimum_amount_out_raw"], int(now) + self.deadline_seconds,
+                self.gas_limits.get(signal.protocol, 0), str(max_fee), "0",
+                self.allowed_protocols, self.allowed_assets, self.allowed_routes,
+            )
         preflight = await ReadOnlyExecutionPreflight(
-            self.rpc, frozenset({V2_ROUTER, V3_ROUTER, UNIVERSAL_ROUTER}),
+            self.rpc, EXECUTION_TARGETS,
             self.quote_policy.max_gas_cost_wei).check(plan, now)
+        preflight.update(simulation)
         reservation_id = hashlib.sha256(
             f"nonce:{proposal_id}:{follower}:{relationship}".encode()).hexdigest()
         nonce, status = self.store.reserve_execution_nonce(
@@ -254,6 +279,8 @@ class OfflineExecutionSigner:
             self.quote_policy.max_gas_cost_wei).check(refreshed, now)
         if preflight["pending_nonce"] > reservation["nonce"]:
             raise ValueError("reserved nonce is behind current pending nonce")
+        if original.execution_provider in AGGREGATOR_PROVIDERS:
+            preflight.update(await simulate_aggregator_execution(self.rpc, original))
         signer = self._signer(row)
         raw = signer.sign_transaction(row["transaction"])
         if Account.recover_transaction(raw).lower() != row["follower_wallet"]:
@@ -369,6 +396,8 @@ class ReadOnlyPreBroadcastReviewer:
             self.quote_policy.max_gas_cost_wei).check(refreshed, now)
         if preflight["pending_nonce"] != signable["nonce"]:
             raise ValueError("network pending nonce does not exactly match signed transaction")
+        if original.execution_provider in AGGREGATOR_PROVIDERS:
+            preflight.update(await simulate_aggregator_execution(self.rpc, original))
         evidence = {
             "read_only": True, "broadcast_performed": False,
             "relationship_revalidated": True, "transaction_hash_verified": True,

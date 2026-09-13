@@ -142,7 +142,7 @@ def assess_market_quote(quote: Quote, reference: Quote, policy: QuotePolicy,
         return False, "price_impact_exceeded", evidence
     if not isinstance(gas_price_wei, str) or not gas_price_wei.isdecimal():
         return False, "gas_price_missing", evidence
-    floor = {"v2": 200_000, "v3": 300_000, "v4": 400_000}[quote.protocol]
+    floor = {"v2": 200_000, "v3": 300_000, "v4": 400_000, "kyber": 350_000}[quote.protocol]
     quoted_gas = int(quote.gas_estimate_raw or "0")
     gas_units = max(floor, quoted_gas + 100_000 if quoted_gas else 0)
     gas_cost = gas_units * int(gas_price_wei)
@@ -159,15 +159,46 @@ def assess_market_quote(quote: Quote, reference: Quote, policy: QuotePolicy,
     return True, None, evidence
 
 
+AGGREGATOR_PROTOCOLS = frozenset({"kyber"})
+
+
 class LiveQuoter:
-    def __init__(self, rpc):
+    def __init__(self, rpc, aggregators: dict | None = None):
         self.rpc = rpc
+        self.aggregators = dict(aggregators or {})
+        if any(name not in AGGREGATOR_PROTOCOLS for name in self.aggregators):
+            raise ValueError("unsupported aggregator provider")
+
+    def _quotable_protocols(self) -> frozenset[str]:
+        return frozenset({"v2", "v3", "v4"} | set(self.aggregators))
+
+    def _aggregator(self, protocol: str):
+        client = self.aggregators.get(protocol)
+        if client is None:
+            raise ValueError(f"aggregator provider is not configured: {protocol}")
+        return client
+
+    async def build_aggregator_transaction(self, signal: Signal, amount_in_raw: str,
+                                           follower_wallet: str, slippage_bps: int,
+                                           deadline: int):
+        """Ask the configured aggregator for the follower's own swap transaction."""
+        if (signal.protocol not in AGGREGATOR_PROTOCOLS
+                or signal.stage in {"needs_review", "failed"}
+                or signal.canonical_status == "orphaned"
+                or signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}
+                or not signal.token_in or not signal.token_out):
+            raise ValueError("signal is not eligible for aggregator execution")
+        if not amount_in_raw.isdecimal() or int(amount_in_raw) <= 0:
+            raise ValueError("invalid aggregator input amount")
+        client = self._aggregator(signal.protocol)
+        route = await client.route(signal.token_in, signal.token_out, amount_in_raw)
+        return await client.build(route, follower_wallet, slippage_bps, deadline)
 
     async def quote_exact_input(self, signal: Signal, amount_in_raw: str) -> Quote:
         if (signal.stage in {"needs_review", "failed"}
                 or signal.canonical_status == "orphaned"
                 or signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}
-                or signal.protocol not in {"v2", "v3", "v4"}
+                or signal.protocol not in self._quotable_protocols()
                 or not signal.token_in or not signal.token_out):
             raise ValueError("signal is not a supported quotable swap")
         if not amount_in_raw.isdecimal() or int(amount_in_raw) <= 0:
@@ -283,13 +314,22 @@ class LiveQuoter:
         if (signal.stage in {"needs_review", "failed"}
                 or signal.canonical_status == "orphaned"
                 or signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}
-                or signal.protocol not in {"v2", "v3", "v4"}
+                or signal.protocol not in self._quotable_protocols()
                 or not signal.token_in or not signal.token_out):
             raise ValueError("signal is not a supported quotable swap")
         if not amount_in_raw.isdecimal() or int(amount_in_raw) <= 0:
             raise ValueError("invalid quote input amount")
         block_number = number(header["number"])
         block_tag = hex(block_number)
+        if signal.protocol in AGGREGATOR_PROTOCOLS:
+            # Aggregator quotes are API responses observed while this header was
+            # latest; the block pin records the observation window, not a state read.
+            route = await self._aggregator(signal.protocol).route(
+                signal.token_in, signal.token_out, amount_in_raw)
+            return Quote(signal.protocol, route.router, block_number,
+                         header["hash"].lower(), route.observed_at, signal.token_in,
+                         signal.token_out, amount_in_raw, route.amount_out_raw,
+                         str(route.gas_estimate))
         if signal.protocol == "v2":
             output, gas = await self._v2(signal, int(amount_in_raw), block_tag)
             source = R.V2_ROUTER

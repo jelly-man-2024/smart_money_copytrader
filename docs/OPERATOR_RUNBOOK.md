@@ -47,6 +47,34 @@ WHERE id = ?
 执行后用 `relationship-status` 确认 `live_risk_acceptance_current=true`，再重启任务。配置字段发生任何
 变化时，把确认时间放在同一条 UPDATE 中刷新；只修改 `wallet_keys` 不会改变关系确认。
 
+### 执行路径提供方 `execution_providers`
+
+`docker/mysql/init/007_execution_providers.sql` 为 `copy_relationships` 增加 JSON 列
+`execution_providers`，默认 `["local"]`，已初始化的库同样只执行该迁移一次。含义：
+
+- `local`：只执行能在本地逐字段验证的 V2/V3/V4 路径（回执提取、预配置 `allowed_routes`、
+  V3 工厂直连池发现），与此前行为完全一致。必须是列表第一项。
+- `kyber`：本地路径不可用时，向 KyberSwap 官方聚合器 API（`aggregator-api.kyberswap.com`，
+  链名 `robinhood`，无需密钥）为 follower 自己的输入量询价并构建交易。只接受 Router 为
+  `0x6131b5fae19ea4f9d964eac0408e4408b66337b5`、顶层 `swap` 描述里 dstReceiver 等于 follower、
+  金额等于计划输入、无手续费、value 为 0 的 calldata；链上 minReturn 必须不低于按
+  `max_slippage_bps` 从构建输出算出的下限；签名前和广播前都会以 follower 身份 `eth_call`
+  模拟整笔交易并要求返回量不低于该最小值。USDG 对 Kyber Router 的授权沿用"周期预算 × 200"
+  的有界规则，卖出授权等于归因持仓。聚合器买入的 lot 卖出时同样走聚合器重新询价。
+
+该字段进入配置快照，修改时必须在同一条 UPDATE 中刷新 `live_risk_accepted_at`：
+
+```sql
+UPDATE copy_relationships
+SET execution_providers = JSON_ARRAY('local', 'kyber'),
+    live_risk_accepted_at = CURRENT_TIMESTAMP(6)
+WHERE id = ? AND follower_wallet = '0x跟单钱包' AND smart_wallet = '0x聪明钱钱包';
+```
+
+聚合器 calldata 的内部执行数据是黑盒，这是相对本地路径的安全模型让步；启用前应确认接受
+`docs/AGGREGATOR_ROUTE_DESIGN.md` 第 6 节列出的替代门禁。任何提供方失败都回落到
+`quote_unavailable`，决策记录的 `quote_error` 字段保存各步失败原因。
+
 CSV 占位关系可能使用零 follower，但必须保持 disabled；启用策略中的零 follower 或零 smart
 wallet 会在配置加载阶段失败关闭。旧占位数据保留用于来源追踪，但新的 `relationships-import`
 拒绝零 follower/smart wallet。资产路由中的零地址仍表示 native asset，不应替换。
@@ -104,7 +132,12 @@ replacement 必须同时给出新 hash 和 `--replaces-tx-hash`。输出固定
 
 ## 状态处置
 
-- `prepared`：有持久 nonce reservation，尚未签名；重启应复用同一 proposal/plan。
+- `prepared`：有持久 nonce reservation，尚未签名；重启应复用同一 proposal/plan。若签名前的
+  二次报价、门禁或模拟在同一进程内被拒（例如 `adverse_price_deviation_exceeded`），monitor 会
+  立即把该计划改为 `cancelled`、把 nonce reservation 置为 `released`（nonce 值改为高位哨兵，
+  原 nonce 记录在 `final_review.released_nonce`）并取消 proposal 释放额度，日志事件为
+  `live_execution_abandoned`。否则被占用的 nonce 会让后续计划比网络 pending nonce 多 1 而全部
+  在广播前被拒。已签名的计划不会被自动取消，仍走操作员复核。
 - `signed`：只保存公开 tx hash 和最终复核证据；raw signed bytes 不落库。
 - `observed_pending`：RPC 已发现外部广播交易，nonce 标记为 broadcast。
 - `confirmed`：receipt 位于同高度规范块且成功。

@@ -9,6 +9,7 @@ Robinhood Chain 聪明钱跟单工程，独立于同级 `fomo_sniper`。
 - [继续开发交接](docs/HANDOFF.md)
 - [新服务器测试与开发交付](docs/SERVER_HANDOFF.md)
 - [Mac mini 空运行环境交付](docs/MAC_MINI_ENV_HANDOFF.md)
+- [聚合器执行路径接入设计（提案）](docs/AGGREGATOR_ROUTE_DESIGN.md)
 - [数据与代码来源](docs/PROVENANCE.md)
 
 ## 快速开始
@@ -75,7 +76,10 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 或 Relay SELL 证据。Feed 和 receipt 只作影子比较且不占额度。主触发通过后会再次
 取得固定区块的实时报价；只有第二次报价仍通过原始 `minOut`、时效、偏离、价格冲击和 Gas
 门控，才写入本地 paper fill。`run_mode=paper` 全过程没有签名、广播或真实订单。显式的
-`mainnet_live` 测试模式只执行最终能严格验证为本地 V2/V3/V4 的路径，并且还要求 MySQL
+`mainnet_live` 测试模式默认只执行最终能严格验证为本地 V2/V3/V4 的路径；关系的
+`execution_providers` 追加 `kyber` 后，本地路径不可用时改由 KyberSwap 聚合器为 follower 询价
+并构建交易，经 Router 白名单、顶层 calldata 反解、滑点下限和签名前 `eth_call` 模拟四道门禁后
+执行（见 `docs/OPERATOR_RUNBOOK.md`）。`mainnet_live` 还要求 MySQL
 配置/账本、逐条 enabled live relationship、全局 stop file 和签名/广播前的 MySQL 配置快照复核；
 普通启动仍然不会签名或广播。Relay 自动关联需显式传 `--relay-auto-associate`，它只使用订单
 做归因，再从同一回执发现并验证本地池，不复用源 calldata。confirmed live 回执会按规范块与

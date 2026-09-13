@@ -14,6 +14,9 @@ from .quotes import QuotePolicy, assess_market_quote, assess_quote
 from .rpc import RpcError
 
 RATIO_SCALE = 1_000_000
+AGGREGATOR_PROVIDERS = frozenset({"kyber"})
+SUPPORTED_EXECUTION_PROVIDERS = frozenset({"local", *AGGREGATOR_PROVIDERS})
+AGGREGATOR_ROUTERS = {"kyber": R.KYBER_META_AGGREGATION_ROUTER_V2}
 TRIGGER_MODES = frozenset({
     "feed_intent", "receipt_success", "swap_evidenced",
     "relay_sell_evidenced", "relay_buy_evidenced", "evidenced",
@@ -86,6 +89,20 @@ def signal_route_key(signal: Signal) -> str | None:
         return None
 
 
+def aggregator_route_definition(token_in: str, token_out: str, provider: str) -> dict:
+    """Describe an aggregator-provided execution pair; the route itself is quoted live."""
+    if provider not in AGGREGATOR_PROVIDERS:
+        raise ValueError("unsupported aggregator provider")
+    token_in, token_out = address(token_in), address(token_out)
+    if token_in == token_out or R.NATIVE in {token_in, token_out}:
+        raise ValueError("aggregator execution requires two distinct ERC-20 assets")
+    return {
+        "protocol": provider, "assets": [token_in, token_out], "provider": provider,
+        "router": AGGREGATOR_ROUTERS[provider],
+        "route_discovery": "aggregator_provider",
+    }
+
+
 def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
                            output_asset: str | None = None) -> Signal:
     """Select one validated local quote route without changing source attribution."""
@@ -112,7 +129,13 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
             "paper_execution_source_protocol": source.protocol,
             "paper_execution_route": deepcopy(definition),
         })
-        if protocol == "v2":
+        if protocol in AGGREGATOR_PROVIDERS:
+            if (len(assets) != 2 or definition.get("provider") != protocol
+                    or address(definition.get("router", "")) != AGGREGATOR_ROUTERS[protocol]):
+                continue
+            evidence["aggregator_provider"] = protocol
+            contract = AGGREGATOR_ROUTERS[protocol]
+        elif protocol == "v2":
             evidence["route"] = ordered_assets
             contract = R.V2_ROUTER
         elif protocol == "v3":
@@ -293,9 +316,15 @@ class PaperEngine:
                  wallet_contexts: dict[str, dict] | None = None,
                  config_snapshot_hash: str | None = None,
                  execution_routes: tuple[dict, ...] | None = None,
-                 shadow_only: bool = False):
+                 shadow_only: bool = False,
+                 execution_providers: tuple[str, ...] = ("local",)):
         if trigger_mode not in TRIGGER_MODES or not strategy_version:
             raise ValueError("invalid paper engine configuration")
+        providers = tuple(execution_providers)
+        if (not providers or providers[0] != "local"
+                or len(providers) != len(set(providers))
+                or not set(providers) <= SUPPORTED_EXECUTION_PROVIDERS):
+            raise ValueError("invalid execution providers")
         self.store = store
         self.quoter = quoter
         self.quote_policy = quote_policy
@@ -309,10 +338,38 @@ class PaperEngine:
         self.config_snapshot_hash = config_snapshot_hash
         self.execution_routes = execution_routes
         self.shadow_only = shadow_only
+        self.execution_providers = providers
 
     def _scope_reason(self, signal: Signal) -> str | None:
         return scope_reason(
             signal, self.allowed_protocols, self.allowed_assets, self.allowed_routes)
+
+    def _available_aggregators(self) -> tuple[str, ...]:
+        configured = getattr(self.quoter, "aggregators", {}) or {}
+        return tuple(provider for provider in self.execution_providers
+                     if provider in AGGREGATOR_PROVIDERS and provider in configured)
+
+    async def _select_buy_execution_signal(self, signal: Signal, amount: str) -> Signal:
+        """Local verified routes first, then the configured aggregator providers."""
+        failures = []
+        try:
+            return execution_quote_signal(signal, self.execution_routes)
+        except ValueError as exc:
+            failures.append(f"local: {exc}")
+        discover = getattr(self.quoter, "discover_v3_route", None)
+        if signal.protocol == "relay_solver" and callable(discover):
+            try:
+                signal.evidence["local_execution_route"] = await discover(signal, amount)
+                self.store.put(signal)
+                return execution_quote_signal(signal, self.execution_routes)
+            except (RpcError, ValueError) as exc:
+                failures.append(f"v3_discovery: {exc}")
+        for provider in self._available_aggregators():
+            signal.evidence["local_execution_route"] = aggregator_route_definition(
+                signal.token_in, signal.token_out, provider)
+            self.store.put(signal)
+            return execution_quote_signal(signal, self.execution_routes)
+        raise ValueError("; ".join(failures) or "no execution route")
 
     def _id(self, signal: Signal, kind: str) -> str:
         relationship = self.wallet_contexts.get(signal.wallet, {}).get("relationship_id", "")
@@ -394,20 +451,13 @@ class PaperEngine:
             return self._decision(
                 signal, False, bucket_or_reason, {"source_signal": signal.to_dict()})
         try:
-            try:
-                quote_signal = execution_quote_signal(signal, self.execution_routes)
-            except ValueError:
-                discover = getattr(self.quoter, "discover_v3_route", None)
-                if signal.protocol != "relay_solver" or not callable(discover):
-                    raise
-                signal.evidence["local_execution_route"] = await discover(signal, amount)
-                self.store.put(signal)
-                quote_signal = execution_quote_signal(signal, self.execution_routes)
+            quote_signal = await self._select_buy_execution_signal(signal, amount)
             quote, reference, gas_price = await self.quoter.quote_with_reference(
                 quote_signal, amount)
         except (RpcError, ValueError) as exc:
             return self._decision(signal, False, "quote_unavailable", {
                 "source_signal": signal.to_dict(), "quote_error_type": type(exc).__name__,
+                "quote_error": str(exc)[:500],
             })
         accepted, reason, risk = assess_quote(
             signal, quote, reference, self.quote_policy, gas_price, now)
@@ -415,6 +465,9 @@ class PaperEngine:
             "quote": quote.to_dict(), "reference_quote": reference.to_dict(),
             "gas_price_wei": gas_price, "risk": risk,
             "execution_signal": quote_signal.to_dict(),
+            "execution_provider": (quote_signal.protocol
+                                   if quote_signal.protocol in AGGREGATOR_PROVIDERS
+                                   else "local"),
         }
         if not accepted:
             return self._decision(signal, False, reason, {
@@ -490,9 +543,17 @@ class PaperEngine:
                     self._ledger_wallet(signal), signal.token_in,
                     principal_asset, amount)
                 if route is None:
-                    return self._decision(signal, False, route_reason, {
-                        "source_signal": signal.to_dict(),
-                    })
+                    aggregators = self._available_aggregators()
+                    if not aggregators or route_reason in {
+                            "attributed_position_insufficient",
+                            "attributed_buy_execution_route_ambiguous"}:
+                        return self._decision(signal, False, route_reason, {
+                            "source_signal": signal.to_dict(),
+                        })
+                    # The attributed lots exist but carry no reusable local route;
+                    # the configured aggregator can still sell the exact holding.
+                    route = aggregator_route_definition(
+                        signal.token_in, principal_asset, aggregators[0])
                 signal.evidence["local_execution_route"] = route
                 quote_signal = execution_quote_signal(
                     signal, self.execution_routes, principal_asset)
@@ -501,6 +562,7 @@ class PaperEngine:
         except (RpcError, ValueError) as exc:
             return self._decision(signal, False, "quote_unavailable", {
                 "source_signal": signal.to_dict(), "quote_error_type": type(exc).__name__,
+                "quote_error": str(exc)[:500],
             })
         if principal_asset == signal.token_out:
             accepted, reason, risk = assess_quote(
@@ -513,6 +575,9 @@ class PaperEngine:
             "quote": quote.to_dict(), "reference_quote": reference.to_dict(),
             "gas_price_wei": gas_price, "risk": risk,
             "execution_signal": quote_signal.to_dict(),
+            "execution_provider": (quote_signal.protocol
+                                   if quote_signal.protocol in AGGREGATOR_PROVIDERS
+                                   else "local"),
         }
         if not accepted:
             return self._decision(signal, False, reason, {
@@ -618,13 +683,16 @@ class PaperExecutor:
 
 def reverse_quote_signal(source: Signal, principal_asset: str) -> Signal:
     """Build only a verified route reversal for marking an attributed open lot."""
-    if (source.protocol not in {"v2", "v3", "v4"} or not source.token_in
+    if (source.protocol not in {"v2", "v3", "v4", *AGGREGATOR_PROVIDERS}
+            or not source.token_in
             or not source.token_out or source.token_in != principal_asset):
         raise ValueError("source route cannot value this lot")
     evidence = deepcopy(source.evidence)
     evidence.pop("actual_input_debit_raw", None)
     evidence.pop("actual_output_credit_raw", None)
-    if source.protocol == "v2":
+    if source.protocol in AGGREGATOR_PROVIDERS:
+        pass  # aggregator pairs are quoted live in either direction
+    elif source.protocol == "v2":
         route = evidence.get("route")
         if not isinstance(route, list) or len(route) < 2:
             raise ValueError("V2 valuation route missing")

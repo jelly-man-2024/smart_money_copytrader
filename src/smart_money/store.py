@@ -15,6 +15,21 @@ STAGE_RANK = {"intent": 0, "execution_observed": 1, "needs_review": 1,
 MAX_CANDIDATE_ATTEMPTS = 8
 
 
+RELEASED_NONCE_SENTINEL_BASE = 1 << 62
+
+
+def released_nonce_sentinel(reservation_id: str) -> int:
+    """Non-colliding placeholder nonce for a released, never-signed reservation.
+
+    Released rows must keep existing (execution plans reference them) yet must not
+    occupy the real nonce in the unique (wallet, chain, nonce) key, because the
+    network still expects that nonce next. The sentinel sits far above any real
+    account nonce and within BIGINT UNSIGNED range.
+    """
+    digest = hashlib.sha256(f"released:{reservation_id}".encode()).digest()
+    return RELEASED_NONCE_SENTINEL_BASE + int.from_bytes(digest[:7], "big")
+
+
 def _execution_plan_integrity(plan_id: str, proposal_id: str, follower_wallet: str,
                               relationship_id: str, config_snapshot_hash: str,
                               nonce_reservation_id: str, plan_payload: str,
@@ -386,6 +401,112 @@ class Store:
             self.connection.rollback()
             raise
 
+    def cancel_prepared_execution_plan(self, proposal_id: str, reason: str) -> bool:
+        """Release a plan that was prepared but never signed, freeing its nonce.
+
+        Only the ``prepared`` state is cancellable: nothing was signed, so no raw
+        transaction can exist anywhere and the reserved nonce can safely return to
+        the pool. Signed or broadcast plans keep the operator-review path.
+        """
+        if not reason:
+            raise ValueError("cancellation reason is required")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            plan = self.connection.execute("""SELECT plan_id,status,nonce_reservation_id
+                FROM execution_plans WHERE proposal_id=?""", (proposal_id,)).fetchone()
+            if plan is None or plan[1] != "prepared":
+                self.connection.rollback()
+                return False
+            plan_id, _, reservation_id = plan
+            nonce = self.connection.execute("""SELECT status FROM execution_nonce_reservations
+                WHERE reservation_id=?""", (reservation_id,)).fetchone()
+            attempts = self.connection.execute(
+                "SELECT COUNT(*) FROM execution_attempts WHERE plan_id=?",
+                (plan_id,)).fetchone()[0]
+            if nonce is None or nonce[0] != "reserved" or int(attempts) != 0:
+                self.connection.rollback()
+                return False
+            released_nonce = int(self.connection.execute(
+                "SELECT nonce FROM execution_nonce_reservations WHERE reservation_id=?",
+                (reservation_id,)).fetchone()[0])
+            self.connection.execute("""UPDATE execution_plans SET status='cancelled',
+                final_review_payload=?,updated_at=CURRENT_TIMESTAMP WHERE plan_id=?""",
+                (json.dumps({"cancelled": True, "reason": reason[:300],
+                             "signed": False, "broadcast_performed": False,
+                             "released_nonce": released_nonce,
+                             "released_reservation_id": reservation_id},
+                            sort_keys=True), plan_id))
+            # The plan keeps its foreign key to this row, so the row stays; its nonce
+            # moves to a non-colliding sentinel because the network still expects the
+            # original nonce next and the unique (wallet, chain, nonce) key must let
+            # the following plan reserve it again.
+            self.connection.execute("""UPDATE execution_nonce_reservations
+                SET status='released',nonce=?,updated_at=CURRENT_TIMESTAMP
+                WHERE reservation_id=? AND status='reserved'""",
+                (released_nonce_sentinel(reservation_id), reservation_id))
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def cancel_unbroadcast_signed_execution_plan(self, proposal_id: str,
+                                                 reason: str) -> bool:
+        """Release a signed plan whose bytes were never handed to a broadcaster.
+
+        Callers must only use this when they know no broadcast was attempted: the
+        pre-broadcast reviewer rejected the in-memory bytes, which are then dropped.
+        The plan keeps its signed hash in ``final_review`` for history, its lone
+        never-observed ``signed`` attempt row is removed, and the nonce returns to
+        the pool exactly as for a prepared plan.
+        """
+        if not reason:
+            raise ValueError("cancellation reason is required")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            plan = self.connection.execute("""SELECT plan_id,status,nonce_reservation_id,
+                signed_tx_hash,final_review_payload FROM execution_plans
+                WHERE proposal_id=?""", (proposal_id,)).fetchone()
+            if plan is None or plan[1] != "signed" or not plan[3]:
+                self.connection.rollback()
+                return False
+            plan_id, _, reservation_id, signed_hash, review_payload = plan
+            nonce_row = self.connection.execute("""SELECT status,nonce
+                FROM execution_nonce_reservations WHERE reservation_id=?""",
+                (reservation_id,)).fetchone()
+            attempts = self.connection.execute("""SELECT tx_hash,status,replaces_tx_hash
+                FROM execution_attempts WHERE plan_id=?""", (plan_id,)).fetchall()
+            if (nonce_row is None or nonce_row[0] != "signed" or len(attempts) != 1
+                    or attempts[0][0] != signed_hash or attempts[0][1] != "signed"
+                    or attempts[0][2] is not None):
+                self.connection.rollback()
+                return False
+            released_nonce = int(nonce_row[1])
+            try:
+                signing_review = json.loads(review_payload) if review_payload else None
+            except (TypeError, ValueError):
+                signing_review = None
+            self.connection.execute(
+                "DELETE FROM execution_attempts WHERE plan_id=? AND tx_hash=? AND status='signed'",
+                (plan_id, signed_hash))
+            self.connection.execute("""UPDATE execution_plans SET status='cancelled',
+                final_review_payload=?,updated_at=CURRENT_TIMESTAMP WHERE plan_id=?""",
+                (json.dumps({"cancelled": True, "reason": reason[:300], "signed": True,
+                             "broadcast_performed": False,
+                             "signed_tx_hash_never_broadcast": signed_hash,
+                             "released_nonce": released_nonce,
+                             "released_reservation_id": reservation_id,
+                             "signing_review": signing_review}, sort_keys=True), plan_id))
+            self.connection.execute("""UPDATE execution_nonce_reservations
+                SET status='released',nonce=?,updated_at=CURRENT_TIMESTAMP
+                WHERE reservation_id=? AND status='signed'""",
+                (released_nonce_sentinel(reservation_id), reservation_id))
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
     def execution_attempts(self, plan_id: str) -> list[dict]:
         names = ("tx_hash", "replaces_tx_hash", "nonce", "status", "public_payload",
                  "block_number", "block_hash", "created_at", "updated_at")
@@ -530,9 +651,18 @@ class Store:
             if reservation["status"] not in allowed_nonce_status:
                 issues.append({"proposal_id": proposal_id,
                                "reason": "plan_nonce_status_mismatch"})
+            planned_nonce = int(plan["transaction"]["nonce"])
+            released_review = plan.get("final_review") or {}
+            nonce_matches = reservation["nonce"] == planned_nonce or (
+                status == "cancelled" and reservation["status"] == "released"
+                and released_review.get("cancelled") is True
+                and released_review.get("broadcast_performed") is False
+                and released_review.get("released_nonce") == planned_nonce
+                and reservation["nonce"] == released_nonce_sentinel(
+                    reservation["reservation_id"]))
             if (reservation["relationship_id"] != plan["relationship_id"]
                     or reservation["follower_wallet"] != plan["follower_wallet"]
-                    or reservation["nonce"] != int(plan["transaction"]["nonce"])):
+                    or not nonce_matches):
                 issues.append({"proposal_id": proposal_id,
                                "reason": "plan_nonce_identity_mismatch"})
             if status == "prepared" and attempts:
@@ -1268,11 +1398,16 @@ class Store:
             try:
                 protocol = route.get("protocol")
                 assets = tuple(address(item) for item in route.get("assets", []))
-                if (protocol not in {"v2", "v3", "v4"} or len(assets) < 2
+                if (protocol not in {"v2", "v3", "v4", "kyber"} or len(assets) < 2
                         or {assets[0], assets[-1]}
                         != {token.lower(), principal_asset.lower()}):
                     return None, "attributed_buy_execution_route_invalid"
-                if protocol == "v2":
+                if protocol == "kyber":
+                    if (len(assets) != 2 or route.get("provider") != protocol
+                            or not isinstance(route.get("router"), str)):
+                        return None, "attributed_buy_execution_route_invalid"
+                    parameters = ("aggregator", address(route["router"]))
+                elif protocol == "v2":
                     parameters = ()
                 elif protocol == "v3":
                     fees = route.get("fees")

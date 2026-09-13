@@ -8,11 +8,26 @@ import json
 from pathlib import Path
 
 from .models import address
-from .paper import AmountRule, BUDGET_BUCKETS, TRIGGER_MODES, normalized_route_key
+from .paper import (
+    AmountRule, BUDGET_BUCKETS, SUPPORTED_EXECUTION_PROVIDERS, TRIGGER_MODES,
+    normalized_route_key,
+)
 from .quotes import QuotePolicy
 
 SUPPORTED_PROTOCOLS = frozenset({"v2", "v3", "v4", "0x", "kyber", "relay_solver"})
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
+DEFAULT_EXECUTION_PROVIDERS = ("local",)
+
+
+def _execution_providers(value) -> tuple[str, ...]:
+    if value is None:
+        return DEFAULT_EXECUTION_PROVIDERS
+    if (not isinstance(value, list) or not value
+            or any(not isinstance(item, str) for item in value)
+            or len(value) != len(set(value)) or value[0] != "local"
+            or not set(value) <= SUPPORTED_EXECUTION_PROVIDERS):
+        raise ValueError("invalid execution providers")
+    return tuple(value)
 
 
 def _fields(value: dict, allowed: set[str], required: set[str], context: str) -> None:
@@ -44,6 +59,7 @@ class WalletPaperPolicy:
     allowed_routes: frozenset[str]
     route_definitions: tuple[dict, ...]
     snapshot_hash: str
+    execution_providers: tuple[str, ...] = DEFAULT_EXECUTION_PROVIDERS
 
     @property
     def ledger_scope(self) -> str:
@@ -194,8 +210,9 @@ def load_paper_config(path: str | Path) -> PaperConfig:
     relationship_keys = set()
     for row in wallet_rows:
         _fields(row, {"wallet", "label", "follower_wallet", "relationship_id", "run_mode",
-                      "budget_limits", "buy_rules", "sell_rule"},
+                      "budget_limits", "buy_rules", "sell_rule", "execution_providers"},
                 {"wallet", "budget_limits", "buy_rules", "sell_rule"}, "wallet policy")
+        execution_providers = _execution_providers(row.get("execution_providers"))
         wallet = address(row["wallet"])
         if wallet == ZERO_ADDRESS:
             raise ValueError("zero smart wallet is forbidden")
@@ -238,6 +255,7 @@ def load_paper_config(path: str | Path) -> PaperConfig:
             _amount_rule(row["sell_rule"]), strategy, trigger, tuple(shadows),
             quote_policy, frozenset(protocols), frozenset(normalized_assets),
             frozenset(route_keys), tuple(deepcopy(route_rows)), "",
+            execution_providers,
         )
         relationship_key = (follower, relationship_id, wallet)
         if relationship_key in relationship_keys:
@@ -255,6 +273,7 @@ def load_paper_config(path: str | Path) -> PaperConfig:
         policy.strategy_version, policy.trigger_mode, policy.shadow_trigger_modes,
         policy.quote_policy, policy.allowed_protocols, policy.allowed_assets,
         policy.allowed_routes, policy.route_definitions, snapshot_hash,
+        policy.execution_providers,
     ) for policy in relationships]
     wallets = {}
     for policy in relationships:

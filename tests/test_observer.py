@@ -4357,5 +4357,503 @@ class SafetyTests(unittest.TestCase):
                 R.load_watchlist(path)
 
 
+class AggregatorExecutionTests(unittest.TestCase):
+    """Kyber execution provider: allowlisted router, decoded recipient, simulation gate."""
+
+    FIXTURE = ROOT / 'data/kyber_route_build_sample_2026-09-13.json'
+    FOLLOWER = '0x3004ab92565deeea0a2eaa27e40e297bb457e1a6'
+    TOKEN_OUT = '0x462dff4be800c77a61e69dc2ea6010e4237f674d'
+
+    def _documents(self):
+        sample = json.loads(self.FIXTURE.read_text())
+        return {'routes': sample['routes'], 'route/build': sample['build']}
+
+    def _client(self, documents):
+        from smart_money.kyber import KyberAggregatorClient
+        client = KyberAggregatorClient()
+        client._request = lambda path, query=None, body=None: deepcopy(documents[path])
+        return client
+
+    def _swap(self, documents=None, follower=None):
+        from smart_money.kyber import KyberAggregatorClient  # noqa: F401
+        documents = documents or self._documents()
+        client = self._client(documents)
+
+        async def scenario():
+            route = await client.route(R.USDG, self.TOKEN_OUT, '100000')
+            return await client.build(route, follower or self.FOLLOWER, 300, 4102444800)
+        return asyncio.run(scenario())
+
+    def _signal(self, protocol='kyber', **overrides):
+        values = dict(
+            stage='relay_buy_evidenced', execution_status='success', exact_in=True,
+            token_in=R.USDG, token_out=self.TOKEN_OUT, protocol=protocol,
+            evidence={'actual_input_debit_raw': '2000000',
+                      'actual_output_credit_raw': '3000000000000000000000'})
+        values.update(overrides)
+        return Signal(TXHASH, A, 'third_party', 'BUY', 'incoming',
+                      R.RELAY_PROXY, '0x0a2b8f36', **values)
+
+    def test_kyber_client_verifies_router_pair_amount_and_recipient(self):
+        from smart_money.kyber import KyberApiError, decode_kyber_swap
+        swap = self._swap()
+        self.assertEqual(swap.to, R.KYBER_META_AGGREGATION_ROUTER_V2)
+        self.assertEqual((swap.input_asset, swap.output_asset, swap.amount_in_raw,
+                          swap.recipient, swap.value_raw),
+                         (R.USDG, self.TOKEN_OUT, '100000', self.FOLLOWER, '0'))
+        self.assertLessEqual(int(swap.minimum_amount_out_raw), int(swap.amount_out_raw))
+        decoded = decode_kyber_swap(swap.data)
+        self.assertEqual((decoded['src_token'], decoded['dst_token'], decoded['dst_receiver'],
+                          decoded['amount_raw'], decoded['minimum_amount_out_raw']),
+                         (R.USDG, self.TOKEN_OUT, self.FOLLOWER, '100000',
+                          swap.minimum_amount_out_raw))
+        self.assertEqual(swap.public_evidence()['provider'], 'kyber')
+        self.assertNotIn('data', swap.public_evidence())
+        bad_router = self._documents()
+        bad_router['routes']['data']['routerAddress'] = R.V3_ROUTER
+        with self.assertRaisesRegex(KyberApiError, 'allowlist'):
+            self._swap(bad_router)
+        bad_amount = self._documents()
+        bad_amount['routes']['data']['routeSummary']['amountIn'] = '100001'
+        with self.assertRaisesRegex(KyberApiError, 'input does not match'):
+            self._swap(bad_amount)
+        with self.assertRaisesRegex(KyberApiError, 'calldata does not match'):
+            self._swap(follower=B)
+        bad_value = self._documents()
+        bad_value['route/build']['data']['transactionValue'] = '1'
+        with self.assertRaisesRegex(KyberApiError, 'native value'):
+            self._swap(bad_value)
+        bad_selector = self._documents()
+        bad_selector['route/build']['data']['data'] = (
+            '0xdeadbeef' + bad_selector['route/build']['data']['data'][10:])
+        with self.assertRaisesRegex(KyberApiError, 'not a Kyber router swap'):
+            self._swap(bad_selector)
+        bad_out = self._documents()
+        bad_out['route/build']['data']['amountOut'] = '1'
+        with self.assertRaisesRegex(KyberApiError, 'calldata does not match'):
+            self._swap(bad_out)
+
+    def test_execution_quote_signal_selects_only_matching_aggregator_definition(self):
+        from smart_money.paper import aggregator_route_definition
+        signal = self._signal(protocol='relay_solver')
+        signal.evidence['local_execution_route'] = aggregator_route_definition(
+            R.USDG, self.TOKEN_OUT, 'kyber')
+        selected = execution_quote_signal(signal, None)
+        self.assertEqual((selected.protocol, selected.contract, selected.exact_in),
+                         ('kyber', R.KYBER_META_AGGREGATION_ROUTER_V2, True))
+        self.assertEqual(selected.evidence['aggregator_provider'], 'kyber')
+        self.assertIsNone(scope_reason(
+            selected, frozenset({'kyber', 'relay_solver'}), frozenset({R.USDG})))
+        tampered = deepcopy(signal)
+        tampered.evidence['local_execution_route']['router'] = R.V3_ROUTER
+        with self.assertRaisesRegex(ValueError, 'does not select one'):
+            execution_quote_signal(tampered, None)
+        with self.assertRaisesRegex(ValueError, 'unsupported aggregator'):
+            aggregator_route_definition(R.USDG, self.TOKEN_OUT, 'okx')
+        with self.assertRaisesRegex(ValueError, 'ERC-20'):
+            aggregator_route_definition(R.NATIVE, self.TOKEN_OUT, 'kyber')
+        reversed_signal = reverse_quote_signal(selected, R.USDG)
+        self.assertEqual((reversed_signal.behavior, reversed_signal.token_in,
+                          reversed_signal.token_out), ('SELL', self.TOKEN_OUT, R.USDG))
+
+    def test_paper_engine_falls_back_to_kyber_only_when_enabled(self):
+        token = self.TOKEN_OUT
+
+        class Quoter:
+            def __init__(self, enabled):
+                self.aggregators = {'kyber': object()} if enabled else {}
+
+            async def discover_v3_route(self, signal, amount):
+                raise ValueError('no verified quotable direct V3 pool')
+
+            async def quote_with_reference(self, signal, amount):
+                per_unit = 1_500_000_000_000_000
+                return (Quote(signal.protocol, R.KYBER_META_AGGREGATION_ROUTER_V2, 10,
+                              '0x' + 'ab' * 32, 100.0, R.USDG, token, amount,
+                              str(int(amount) * per_unit), '356167'),
+                        Quote(signal.protocol, R.KYBER_META_AGGREGATION_ROUTER_V2, 10,
+                              '0x' + 'ab' * 32, 100.0, R.USDG, token, '1000',
+                              str(1000 * per_unit), '356167'), '100000000')
+
+        def scenario(providers, enabled):
+            store = Store(':memory:')
+            store.start_paper_budget_cycle('cycle', 'test')
+            store.configure_paper_budget(A, 'USDG', '1000000')
+            signal = self._signal(protocol='relay_solver')
+            store.put(signal)
+            engine = PaperEngine(
+                store, Quoter(enabled), QuotePolicy(), 'agg-v1', 'evidenced',
+                frozenset({'kyber', 'relay_solver', 'v3'}), frozenset({R.USDG}),
+                frozenset(), execution_providers=providers)
+            decision = asyncio.run(engine.propose_buy(
+                signal, AmountRule('fixed', fixed_amount_raw='100000'), now=100.5))
+            payload = store.connection.execute(
+                'SELECT payload FROM paper_decisions WHERE decision_id=?',
+                (decision.decision_id,)).fetchone()[0]
+            proposal = (store.paper_proposal(decision.proposal_id)
+                        if decision.proposal_id else None)
+            store.close()
+            return decision, json.loads(payload), proposal
+
+        decision, payload, proposal = scenario(('local', 'kyber'), True)
+        self.assertTrue(decision.accepted, decision.reason)
+        self.assertEqual(payload['execution_provider'], 'kyber')
+        self.assertEqual(payload['execution_signal']['protocol'], 'kyber')
+        self.assertEqual(proposal['attribution']['local_execution_route']['provider'], 'kyber')
+        self.assertEqual(proposal['amount_in_raw'], '100000')
+        decision, payload, _ = scenario(('local',), True)
+        self.assertEqual((decision.accepted, decision.reason), (False, 'quote_unavailable'))
+        self.assertIn('no verified quotable direct V3 pool', payload['quote_error'])
+        decision, payload, _ = scenario(('local', 'kyber'), False)
+        self.assertEqual((decision.accepted, decision.reason), (False, 'quote_unavailable'))
+        with self.assertRaisesRegex(ValueError, 'execution providers'):
+            PaperEngine(Store(':memory:'), Quoter(True), QuotePolicy(), 'agg-v1',
+                        'evidenced', execution_providers=('kyber',))
+
+    def test_aggregator_plan_requires_router_recipient_and_minimum_floor(self):
+        from smart_money.execution_prep import build_aggregator_execution_plan
+        swap = self._swap()
+        signal = self._signal()
+        quote = Quote('kyber', R.KYBER_META_AGGREGATION_ROUTER_V2, 10, '0x' + 'ab' * 32,
+                      100.0, R.USDG, self.TOKEN_OUT, '100000', swap.amount_out_raw, '356167')
+        floor = str(int(swap.minimum_amount_out_raw) - 1)
+        plan = build_aggregator_execution_plan(
+            signal, self.FOLLOWER, '2', 'proposal-agg', quote, floor, swap, 600000,
+            '200', '0', frozenset({'kyber'}), frozenset({R.USDG}), frozenset())
+        self.assertEqual((plan.to, plan.execution_provider, plan.value_raw,
+                          plan.minimum_amount_out_raw, plan.deadline),
+                         (R.KYBER_META_AGGREGATION_ROUTER_V2, 'kyber', '0',
+                          swap.minimum_amount_out_raw, 4102444800))
+        plan.validate(frozenset({R.KYBER_META_AGGREGATION_ROUTER_V2}), now=100.5)
+        rounding_floor = str(int(swap.minimum_amount_out_raw) + 1)
+        self.assertEqual(build_aggregator_execution_plan(
+            signal, self.FOLLOWER, '2', 'proposal-agg', quote, rounding_floor, swap,
+            600000, '200', '0', frozenset({'kyber'}), frozenset({R.USDG}),
+            frozenset()).minimum_amount_out_raw, swap.minimum_amount_out_raw)
+        with self.assertRaisesRegex(ValueError, 'below the plan slippage floor'):
+            build_aggregator_execution_plan(
+                signal, self.FOLLOWER, '2', 'proposal-agg', quote,
+                str(int(swap.minimum_amount_out_raw) + 2), swap, 600000, '200', '0',
+                frozenset({'kyber'}), frozenset({R.USDG}), frozenset())
+        with self.assertRaisesRegex(ValueError, 'does not match the execution plan'):
+            build_aggregator_execution_plan(
+                signal, B, '2', 'proposal-agg', quote, floor, swap, 600000, '200', '0',
+                frozenset({'kyber'}), frozenset({R.USDG}), frozenset())
+        with self.assertRaisesRegex(ValueError, 'not allowlisted'):
+            build_aggregator_execution_plan(
+                signal, self.FOLLOWER, '2', 'proposal-agg', quote, floor,
+                replace(swap, to=R.V3_ROUTER), 600000, '200', '0',
+                frozenset({'kyber'}), frozenset({R.USDG}), frozenset())
+        with self.assertRaisesRegex(ValueError, 'protocol_not_allowed'):
+            build_aggregator_execution_plan(
+                signal, self.FOLLOWER, '2', 'proposal-agg', quote, floor, swap, 600000,
+                '200', '0', frozenset({'v3'}), frozenset({R.USDG}), frozenset())
+        local_plan = replace(plan, execution_provider='local')
+        with self.assertRaisesRegex(ValueError, 'targets an aggregator router'):
+            local_plan.validate(frozenset({R.KYBER_META_AGGREGATION_ROUTER_V2}), now=100.5)
+
+    def test_aggregator_simulation_gate_fails_closed(self):
+        from smart_money.execution_prep import (
+            build_aggregator_execution_plan, simulate_aggregator_execution,
+        )
+        from smart_money.rpc import RpcError
+        swap = self._swap()
+        signal = self._signal()
+        quote = Quote('kyber', R.KYBER_META_AGGREGATION_ROUTER_V2, 10, '0x' + 'ab' * 32,
+                      100.0, R.USDG, self.TOKEN_OUT, '100000', swap.amount_out_raw, '356167')
+        plan = build_aggregator_execution_plan(
+            signal, self.FOLLOWER, '2', 'proposal-agg', quote, swap.minimum_amount_out_raw,
+            swap, 600000, '200', '0', frozenset({'kyber'}), frozenset({R.USDG}), frozenset())
+        minimum = int(plan.minimum_amount_out_raw)
+
+        class Rpc:
+            def __init__(self, result=None, error=None):
+                self.result, self.error, self.calls = result, error, []
+
+            async def call(self, method, params=None):
+                self.calls.append((method, params))
+                if self.error:
+                    raise self.error
+                return self.result
+
+        rpc = Rpc('0x' + encode(['uint256', 'uint256'], [minimum, 300000]).hex())
+        evidence = asyncio.run(simulate_aggregator_execution(rpc, plan))
+        self.assertEqual(evidence['simulated_return_amount_raw'], str(minimum))
+        self.assertEqual(rpc.calls[0][0], 'eth_call')
+        self.assertEqual(rpc.calls[0][1][0]['from'], self.FOLLOWER)
+        self.assertEqual(rpc.calls[0][1][0]['to'], R.KYBER_META_AGGREGATION_ROUTER_V2)
+        with self.assertRaisesRegex(ValueError, 'below the minimum'):
+            asyncio.run(simulate_aggregator_execution(
+                Rpc('0x' + encode(['uint256', 'uint256'], [minimum - 1, 1]).hex()), plan))
+        with self.assertRaisesRegex(ValueError, 'reverted'):
+            asyncio.run(simulate_aggregator_execution(
+                Rpc(error=RpcError('execution reverted')), plan))
+        with self.assertRaisesRegex(ValueError, 'no output'):
+            asyncio.run(simulate_aggregator_execution(Rpc('0x'), plan))
+        with self.assertRaisesRegex(ValueError, 'only defined for aggregator'):
+            asyncio.run(simulate_aggregator_execution(
+                rpc, replace(plan, execution_provider='local', to=R.V3_ROUTER)))
+
+    def test_execution_providers_config_validation_and_snapshot(self):
+        def load(providers):
+            document = {
+                'version': 1, 'strategy_version': 'agg-v1', 'trigger_mode': 'evidenced',
+                'quote_policy': {}, 'allowed_protocols': ['v3', 'kyber', 'relay_solver'],
+                'allowed_assets': [R.USDG], 'allowed_routes': [],
+                'wallets': [{'wallet': A, 'budget_limits': {'USDG': '1000'},
+                             'buy_rules': {'USDG': {'mode': 'fixed',
+                                                    'fixed_amount_raw': '10'}},
+                             'sell_rule': {'mode': 'proportional', 'ratio_ppm': 1000000}}],
+            }
+            if providers is not None:
+                document['wallets'][0]['execution_providers'] = providers
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as stream:
+                json.dump(document, stream)
+            try:
+                return load_paper_config(stream.name)
+            finally:
+                os.unlink(stream.name)
+
+        default = load(None)
+        self.assertEqual(default.relationships[0].execution_providers, ('local',))
+        enabled = load(['local', 'kyber'])
+        self.assertEqual(enabled.relationships[0].execution_providers, ('local', 'kyber'))
+        self.assertNotEqual(default.snapshot_hash, enabled.snapshot_hash)
+        for invalid in (['kyber'], ['local', 'okx'], ['local', 'local'], []):
+            with self.assertRaisesRegex(ValueError, 'execution providers'):
+                load(invalid)
+
+    def test_mysql_rows_default_to_local_execution_when_column_missing(self):
+        row = {
+            'id': 7, 'follower_wallet': B, 'smart_wallet': A, 'smart_wallet_label': 'x',
+            'run_mode': 'mainnet_live', 'strategy_version': 'agg-v1',
+            'trigger_mode': 'evidenced', 'shadow_trigger_modes': '[]',
+            'quote_policy': '{}', 'allowed_protocols': '["v3","kyber"]',
+            'allowed_assets': json.dumps([R.USDG]), 'allowed_routes': '[]',
+            'usdg_rule_mode': 'fixed', 'usdg_fixed_amount_raw': '100000',
+            'usdg_ratio_ppm': None, 'usdg_budget_limit_raw': '10000000',
+            'eth_rule_mode': 'fixed', 'eth_fixed_amount_raw': '1', 'eth_ratio_ppm': None,
+            'eth_budget_limit_raw': '1', 'sell_rule_mode': 'proportional',
+            'sell_fixed_amount_raw': None, 'sell_ratio_ppm': 1000000,
+        }
+        document = rows_to_document([dict(row)])
+        self.assertEqual(document['wallets'][0]['execution_providers'], ['local'])
+        document = rows_to_document([{**row, 'execution_providers': '["local","kyber"]'}])
+        self.assertEqual(document['wallets'][0]['execution_providers'], ['local', 'kyber'])
+
+    def test_approval_spender_allowlist_includes_kyber_router(self):
+        policy = SimpleNamespace(
+            run_mode='mainnet_live', follower_wallet=B, relationship_id='1', wallet=A,
+            snapshot_hash='ab' * 32, quote_policy=QuotePolicy(),
+            allowed_assets=frozenset({R.USDG}), budget_limits={'USDG': '10000000'})
+
+        class Rpc:
+            async def call(self, method, params=None):
+                return {'eth_getCode': '0x6001', 'eth_call': hex(10 ** 30)}[method]
+
+        class Gate:
+            def validate(self, *values):
+                pass
+
+        result = asyncio.run(approve_relationship_usdg(
+            policy, Rpc(), Gate(), None, minimum_required_raw='100000',
+            spender=R.KYBER_META_AGGREGATION_ROUTER_V2))
+        self.assertEqual((result.submitted, result.spender, result.amount_raw),
+                         (False, R.KYBER_META_AGGREGATION_ROUTER_V2, str(10000000 * 200)))
+        with self.assertRaisesRegex(ValueError, 'not eligible for approval'):
+            asyncio.run(approve_relationship_token(
+                policy, Rpc(), Gate(), None, R.USDG, '1', spender=A))
+
+    def test_prepared_plan_can_be_cancelled_and_nonce_released(self):
+        async def scenario():
+            store = Store(':memory:')
+            store.start_paper_budget_cycle('cycle', 'test')
+            store.configure_paper_budget(A, 'USDG', '1000')
+            signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                            stage='swap_evidenced', execution_status='success', exact_in=True,
+                            token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                            evidence={'route': [R.USDG, TOKEN],
+                                      'actual_input_debit_raw': '100',
+                                      'actual_output_credit_raw': '200'})
+            store.put(signal)
+            store.reserve_paper_proposal({
+                'proposal_id': 'proposal-cancel', 'source_event_id': signal.event_id,
+                'source_tx_hash': TXHASH, 'wallet': A,
+                'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+                'input_asset': R.USDG, 'output_asset': TOKEN,
+                'budget_bucket': 'USDG', 'amount_in_raw': '100',
+                'attribution': {'smart_wallet': A, 'follower_wallet': B,
+                                'relationship_id': '42',
+                                'config_snapshot_hash': 'ab' * 32},
+            })
+
+            class Quoter:
+                async def quote_with_reference(self, source, amount):
+                    return (Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, TOKEN, amount, '198'),
+                            Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, TOKEN, '1', '2'), '100')
+
+            class Rpc:
+                async def call(self, method, params=None):
+                    return {'eth_getTransactionCount': hex(7),
+                            'eth_getBalance': hex(100000000),
+                            'eth_gasPrice': '0x64', 'eth_call': '0x64'}[method]
+
+            policy = QuotePolicy(max_adverse_deviation_bps=200,
+                                 max_price_impact_bps=200,
+                                 max_gas_cost_wei='30000000')
+            prepared = await ExecutionPreparer(
+                store, Quoter(), Rpc(), policy, frozenset({'v2'}),
+                frozenset({R.USDG, TOKEN}), frozenset({signal_route_key(signal)}),
+                'ab' * 32).prepare(signal, 'proposal-cancel', now=101)
+            self.assertEqual(store.execution_nonce_reservation(
+                'proposal-cancel')['status'], 'reserved')
+            self.assertTrue(store.cancel_prepared_execution_plan(
+                'proposal-cancel', 'live_sign_rejected: adverse_price_deviation_exceeded'))
+            self.assertFalse(store.cancel_prepared_execution_plan('proposal-cancel', 'again'))
+            plan = store.execution_plan('proposal-cancel')
+            self.assertEqual((plan['status'], plan['final_review']['reason'],
+                              plan['final_review']['broadcast_performed'],
+                              plan['final_review']['released_nonce']),
+                             ('cancelled', 'live_sign_rejected: adverse_price_deviation_exceeded',
+                              False, 7))
+            released = store.execution_nonce_reservation('proposal-cancel')
+            self.assertEqual(released['status'], 'released')
+            self.assertGreaterEqual(released['nonce'], 1 << 62)
+            self.assertTrue(store.cancel_paper_proposal('proposal-cancel', 'live_sign_rejected'))
+            self.assertEqual(store.paper_budget(A, 'USDG')['reserved_raw'], '0')
+            audit = store.execution_audit()
+            self.assertTrue(audit['healthy'], audit['issues'])
+            # A later plan for the same follower reuses the released nonce.
+            nonce, status = store.reserve_execution_nonce(
+                'reservation-next', B, '42', 'proposal-next', R.CHAIN_ID, 7)
+            self.assertEqual((nonce, status), (7, 'reserved'))
+            self.assertEqual(prepared.nonce, 7)
+            store.close()
+
+        asyncio.run(scenario())
+
+    def test_signed_but_unbroadcast_plan_can_be_cancelled(self):
+        async def scenario():
+            account = Account.create()
+            follower = account.address.lower()
+            store = Store(':memory:')
+            store.start_paper_budget_cycle('cycle', 'test')
+            store.configure_paper_budget(A, 'USDG', '1000')
+            signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER, '0x',
+                            stage='swap_evidenced', execution_status='success', exact_in=True,
+                            token_in=R.USDG, token_out=TOKEN, protocol='v2',
+                            evidence={'route': [R.USDG, TOKEN],
+                                      'actual_input_debit_raw': '100',
+                                      'actual_output_credit_raw': '200'})
+            store.put(signal)
+            store.reserve_paper_proposal({
+                'proposal_id': 'proposal-signed-cancel', 'source_event_id': signal.event_id,
+                'source_tx_hash': TXHASH, 'wallet': A,
+                'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
+                'input_asset': R.USDG, 'output_asset': TOKEN,
+                'budget_bucket': 'USDG', 'amount_in_raw': '100',
+                'attribution': {'smart_wallet': A, 'follower_wallet': follower,
+                                'relationship_id': '42',
+                                'config_snapshot_hash': 'ab' * 32},
+            })
+
+            class Quoter:
+                async def quote_with_reference(self, source, amount):
+                    return (Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, TOKEN, amount, '198'),
+                            Quote('v2', R.V2_ROUTER, 10, '0x' + 'ab' * 32,
+                                  100.0, R.USDG, TOKEN, '1', '2'), '100')
+
+            class Rpc:
+                async def call(self, method, params=None):
+                    return {'eth_getTransactionCount': hex(7),
+                            'eth_getBalance': hex(100000000),
+                            'eth_gasPrice': '0x64', 'eth_call': '0x64'}[method]
+
+            class Signer:
+                def __init__(self, expected):
+                    pass
+
+                def sign_transaction(self, transaction):
+                    return bytes(account.sign_transaction(transaction).raw_transaction)
+
+            class Gate:
+                def validate(self, *values):
+                    pass
+
+            policy = QuotePolicy(max_adverse_deviation_bps=200,
+                                 max_price_impact_bps=200,
+                                 max_gas_cost_wei='30000000')
+            await ExecutionPreparer(
+                store, Quoter(), Rpc(), policy, frozenset({'v2'}),
+                frozenset({R.USDG, TOKEN}), frozenset({signal_route_key(signal)}),
+                'ab' * 32).prepare(signal, 'proposal-signed-cancel', now=101)
+            with patch.dict(os.environ, OFFLINE_ENV):
+                signed = await OfflineExecutionSigner(
+                    store, Quoter(), Rpc(), policy, 'ab' * 32,
+                    signer_factory=Signer, relationship_gate=Gate()).sign(
+                        signal, 'proposal-signed-cancel', now=101)
+            self.assertEqual(len(store.execution_attempts(
+                store.execution_plan('proposal-signed-cancel')['plan_id'])), 1)
+            self.assertFalse(store.cancel_prepared_execution_plan(
+                'proposal-signed-cancel', 'not prepared any more'))
+            self.assertTrue(store.cancel_unbroadcast_signed_execution_plan(
+                'proposal-signed-cancel', 'live_review_rejected: pending nonce mismatch'))
+            plan = store.execution_plan('proposal-signed-cancel')
+            self.assertEqual(plan['status'], 'cancelled')
+            self.assertEqual(plan['final_review']['signed_tx_hash_never_broadcast'],
+                             signed.signed_tx_hash)
+            self.assertEqual(plan['final_review']['released_nonce'], 7)
+            self.assertTrue(plan['final_review']['signing_review']['read_only'])
+            self.assertEqual(store.execution_attempts(plan['plan_id']), [])
+            self.assertEqual(store.execution_nonce_reservation(
+                'proposal-signed-cancel')['status'], 'released')
+            self.assertTrue(store.cancel_paper_proposal(
+                'proposal-signed-cancel', 'live_review_rejected'))
+            audit = store.execution_audit()
+            self.assertTrue(audit['healthy'], audit['issues'])
+            self.assertEqual(audit['attempts'], 0)
+            nonce, status = store.reserve_execution_nonce(
+                'reservation-after-signed', follower, '42', 'proposal-next', R.CHAIN_ID, 7)
+            self.assertEqual((nonce, status), (7, 'reserved'))
+            store.close()
+
+        asyncio.run(scenario())
+
+    def test_store_recovers_kyber_sell_route_from_attributed_lot(self):
+        from smart_money.paper import aggregator_route_definition
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('cycle', 'test')
+        store.configure_paper_budget(A, 'USDG', '1000000')
+        signal = self._signal(protocol='relay_solver')
+        signal.evidence['local_execution_route'] = aggregator_route_definition(
+            R.USDG, self.TOKEN_OUT, 'kyber')
+        store.put(signal)
+        reserved, reason = store.reserve_paper_proposal({
+            'proposal_id': 'proposal-kyber-buy', 'source_event_id': signal.event_id,
+            'source_tx_hash': TXHASH, 'wallet': A, 'trigger_mode': 'evidenced',
+            'strategy_version': 'agg-v1', 'input_asset': R.USDG,
+            'output_asset': self.TOKEN_OUT, 'budget_bucket': 'USDG',
+            'amount_in_raw': '100000',
+            'attribution': {'smart_wallet': A, 'follower_wallet': B,
+                            'relationship_id': '2', 'config_snapshot_hash': 'ab' * 32},
+        })
+        self.assertTrue(reserved, reason)
+        self.assertTrue(store.fill_paper_buy('proposal-kyber-buy', {
+            'order_id': 'order-1', 'fill_id': 'fill-1', 'lot_id': 'lot-1',
+            'amount_out_raw': '150000000000000000000', 'fee_asset': self.TOKEN_OUT,
+            'fee_amount_raw': '0', 'gas_cost_wei': '1',
+            'quote_observed_at': '2026-09-13T00:00:00+00:00',
+            'filled_at': '2026-09-13T00:00:01+00:00',
+        }))
+        route, status = store.paper_sell_execution_route(
+            A, self.TOKEN_OUT, R.USDG, '150000000000000000000')
+        self.assertEqual((status, route['protocol'], route['provider'], route['router']),
+                         ('selected', 'kyber', 'kyber', R.KYBER_META_AGGREGATION_ROUTER_V2))
+        store.close()
+
+
 if __name__ == '__main__':
     unittest.main()

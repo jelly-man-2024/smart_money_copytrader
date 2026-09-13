@@ -37,9 +37,10 @@ from .mysql_config import (
 )
 from .mysql_store import MySqlStore
 from .native_flows import verify_native_flows
+from .kyber import KyberAggregatorClient
 from .paper import (
-    PaperEngine, PaperExecutor, PaperValuator, budget_bucket,
-    execution_quote_signal, scope_reason,
+    AGGREGATOR_PROVIDERS, AGGREGATOR_ROUTERS, PaperEngine, PaperExecutor,
+    PaperValuator, budget_bucket, execution_quote_signal, scope_reason,
 )
 from .paper_config import load_paper_config
 from .pools import discover_v3_execution_route, verify_signal_pools
@@ -282,6 +283,7 @@ def relationship_status(args):
         "allowed_protocols": sorted(policy.allowed_protocols),
         "trusted_assets": sorted(policy.allowed_assets),
         "route_definitions": policy.route_definitions,
+        "execution_providers": list(policy.execution_providers),
         "budget_limits": policy.budget_limits,
         "config_snapshot_hash": policy.snapshot_hash,
         "live_risk_accepted_at": (
@@ -357,7 +359,18 @@ async def monitor(args):
         report("paper_cycle_initialized" if cycle_created else "paper_cycle_reused",
                cycle_id=cycle_id, wallets=len(paper_config.relationships),
                automatic=args.paper_cycle_action == "auto", live_trading=False)
-        quoter = LiveQuoter(rpc)
+        aggregators = {}
+        for policy in paper_config.relationships:
+            for provider in policy.execution_providers:
+                if provider == "kyber" and provider not in aggregators:
+                    aggregators[provider] = KyberAggregatorClient()
+        quoter = LiveQuoter(rpc, aggregators)
+        if aggregators:
+            report("execution_providers_ready", providers=sorted(aggregators),
+                   relationships=sum(1 for policy in paper_config.relationships
+                                     if any(p in aggregators
+                                            for p in policy.execution_providers)),
+                   live_trading=False)
         paper_executor = {}
         relationship_gate = MySqlRelationshipGate() if live_policies else None
         broadcaster = MainnetBroadcaster() if live_policies else None
@@ -391,6 +404,7 @@ async def monitor(args):
                     policy.snapshot_hash,
                     execution_routes=policy.route_definitions,
                     shadow_only=mode != policy.trigger_mode,
+                    execution_providers=policy.execution_providers,
                 )
     timings = LatencySamples()
     wake_dispatcher = asyncio.Event()
@@ -498,11 +512,18 @@ async def monitor(args):
         proposal = store.paper_proposal(proposal_id)
         quote_signal = execution_quote_signal(
             signal, policy.route_definitions, proposal["output_asset"])
-        if quote_signal.protocol not in {"v2", "v3", "v4"}:
+        if quote_signal.protocol in AGGREGATOR_PROVIDERS:
+            if quote_signal.protocol not in policy.execution_providers:
+                raise ValueError("aggregator execution is not enabled for this relationship")
+            report("route_provider_selected", proposal_id=proposal_id,
+                   provider=quote_signal.protocol,
+                   router=AGGREGATOR_ROUTERS[quote_signal.protocol],
+                   relationship_id=policy.relationship_id, live_trading=True)
+        elif quote_signal.protocol not in {"v2", "v3", "v4"}:
             raise ValueError("live execution route is not a verified V2/V3/V4 path")
         preparer, signer, reviewer, broadcaster, _ = live_pipelines[policy.ledger_scope]
         if quote_signal.token_in != NATIVE:
-            spender = {"v2": V2_ROUTER, "v3": V3_ROUTER}.get(
+            spender = {"v2": V2_ROUTER, "v3": V3_ROUTER, **AGGREGATOR_ROUTERS}.get(
                 quote_signal.protocol)
             if spender is None:
                 raise ValueError("live token input route has no verified approval spender")
@@ -515,10 +536,11 @@ async def monitor(args):
                     policy, rpc, relationship_gate, broadcaster,
                     quote_signal.token_in, approval_amount, spender,
                     minimum_required_raw=proposal["amount_in_raw"])
-            elif quote_signal.token_in == USDG and spender == V3_ROUTER:
+            elif quote_signal.token_in == USDG and spender in {
+                    V3_ROUTER, *AGGREGATOR_ROUTERS.values()}:
                 approval = await approve_relationship_usdg(
                     policy, rpc, relationship_gate, broadcaster,
-                    minimum_required_raw=proposal["amount_in_raw"])
+                    minimum_required_raw=proposal["amount_in_raw"], spender=spender)
             else:
                 approval = await approve_relationship_token(
                     policy, rpc, relationship_gate, broadcaster,
@@ -536,12 +558,43 @@ async def monitor(args):
                 report("live_approval_confirmed", proposal_id=proposal_id,
                        relationship_id=policy.relationship_id,
                        live_trading=True, **confirmation)
-        prepared = await preparer.prepare(quote_signal, proposal_id)
-        stats["live_prepared"] += 1
-        signed = await signer.sign(quote_signal, proposal_id)
-        stats["live_signed"] += 1
-        reviewed = await reviewer.review(
-            quote_signal, proposal_id, signed.raw_transaction)
+        stage = "prepare"
+        try:
+            prepared = await preparer.prepare(quote_signal, proposal_id)
+            stats["live_prepared"] += 1
+            stage = "sign"
+            signed = await signer.sign(quote_signal, proposal_id)
+            stats["live_signed"] += 1
+            stage = "review"
+            reviewed = await reviewer.review(
+                quote_signal, proposal_id, signed.raw_transaction)
+        except (ValueError, RpcError) as exc:
+            # A rejected requote, gate or simulation before any broadcast must not
+            # leave a reserved nonce behind, or every later live plan for this
+            # follower would be built one nonce ahead of the network and fail its
+            # pre-broadcast nonce check. Only never-signed plans are released here.
+            plan = store.execution_plan(proposal_id)
+            plan_released = False
+            if plan is not None and plan["status"] == "prepared":
+                plan_released = store.cancel_prepared_execution_plan(
+                    proposal_id, f"live_{stage}_rejected: {str(exc)[:200]}")
+            elif (plan is not None and plan["status"] == "signed"
+                    and stage == "review"):
+                # The reviewer rejected bytes that only ever existed in this
+                # process; the broadcaster was not called, so the signed hash can
+                # never reach the network and its nonce must return to the pool.
+                plan_released = store.cancel_unbroadcast_signed_execution_plan(
+                    proposal_id, f"live_{stage}_rejected: {str(exc)[:200]}")
+            proposal_released = False
+            if plan is None or plan_released:
+                proposal_released = store.cancel_paper_proposal(
+                    proposal_id, f"live_{stage}_rejected")
+            report("live_execution_abandoned", proposal_id=proposal_id, stage=stage,
+                   error_type=type(exc).__name__, error=str(exc)[:300],
+                   plan_released=plan_released, proposal_released=proposal_released,
+                   operator_review_required=not (plan is None or plan_released),
+                   relationship_id=policy.relationship_id, live_trading=True)
+            raise
         result = await broadcaster.broadcast(
             reviewed, signed.raw_transaction,
             follower_wallet=policy.follower_wallet,
@@ -601,12 +654,16 @@ async def monitor(args):
                 stats["paper_accepted" if decision.accepted else "paper_rejected"] += 1
                 if decision.accepted and engine.shadow_only:
                     stats["paper_shadow_accepted"] += 1
+                selected_route = signal.evidence.get("local_execution_route")
                 report("paper_decision", decision_id=decision.decision_id,
                        source_event_id=signal.event_id, trigger_mode=mode,
                        relationship_id=policy.relationship_id,
                        follower_wallet=policy.follower_wallet,
                        shadow_only=engine.shadow_only, accepted=decision.accepted,
                        reason=decision.reason, proposal_id=decision.proposal_id,
+                       execution_provider=(
+                           selected_route.get("provider", "local")
+                           if isinstance(selected_route, dict) else "local"),
                        live_trading=policy.run_mode == "mainnet_live")
                 if decision.accepted and decision.proposal_id and not engine.shadow_only:
                     execution_started = time.monotonic()
@@ -643,7 +700,8 @@ async def monitor(args):
                 report("copy_execution_error", source_event_id=signal.event_id,
                        relationship_id=policy.relationship_id,
                        follower_wallet=policy.follower_wallet,
-                       error_type=type(result).__name__, live_trading=live)
+                       error_type=type(result).__name__,
+                       error=str(result)[:300], live_trading=live)
 
     async def account_impl(wallet, block="latest", strict=False):
         try:

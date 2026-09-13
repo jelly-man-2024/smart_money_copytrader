@@ -10,9 +10,12 @@ from eth_utils import keccak, to_checksum_address
 from .execution_pipeline import ReadOnlyBroadcastReview
 from .key_source import LiveDatabaseSigner
 from .models import address, number
-from .registry import CHAIN_ID, NATIVE, USDG, V2_ROUTER, V3_ROUTER
+from .registry import (
+    CHAIN_ID, KYBER_META_AGGREGATION_ROUTER_V2, NATIVE, USDG, V2_ROUTER, V3_ROUTER,
+)
 
 USDG_BUDGET_APPROVAL_MULTIPLIER = 200
+APPROVAL_SPENDERS = frozenset({V2_ROUTER, V3_ROUTER, KYBER_META_AGGREGATION_ROUTER_V2})
 
 
 @dataclass(frozen=True)
@@ -40,7 +43,7 @@ async def approve_relationship_token(
             or policy.relationship_id is None):
         raise ValueError("relationship is not eligible for token approval")
     token, spender = address(token), address(spender)
-    if token == NATIVE or spender not in {V2_ROUTER, V3_ROUTER}:
+    if token == NATIVE or spender not in APPROVAL_SPENDERS:
         raise ValueError("token or spender is not eligible for approval")
     if (not isinstance(amount_raw, str) or not amount_raw.isdecimal()
             or int(amount_raw) <= 0 or int(amount_raw) >= 2 ** 256):
@@ -145,8 +148,8 @@ async def confirm_relationship_token_approval(
 
 async def approve_relationship_usdg(policy, rpc, relationship_gate, broadcaster,
                                     signer_factory=LiveDatabaseSigner, *,
-                                    minimum_required_raw: str | None = None
-                                    ) -> ApprovalResult:
+                                    minimum_required_raw: str | None = None,
+                                    spender: str = V3_ROUTER) -> ApprovalResult:
     """Approve a bounded multiple of one relationship's USDG budget."""
     if USDG not in policy.allowed_assets:
         raise ValueError("relationship is not eligible for USDG approval")
@@ -158,5 +161,5 @@ async def approve_relationship_usdg(policy, rpc, relationship_gate, broadcaster,
         raise ValueError("relationship USDG approval exceeds uint256")
     return await approve_relationship_token(
         policy, rpc, relationship_gate, broadcaster, USDG, str(amount_value),
-        V3_ROUTER, signer_factory,
+        spender, signer_factory,
         minimum_required_raw=minimum_required_raw)
