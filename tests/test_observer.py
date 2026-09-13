@@ -33,8 +33,8 @@ from smart_money.backfill import BlockScanner, ReorgDetected
 from smart_money.broadcast import MainnetBroadcaster
 from smart_money.cli import (
     LatencySamples, coverage_summary, dispatch_pending, execution_track,
-    monitoring_watchlist, parser as cli_parser, prepare_runtime_budget_cycle,
-    relay_associate,
+    live_wallet_execution_locks, monitoring_watchlist, parser as cli_parser,
+    prepare_runtime_budget_cycle, relay_associate, validate_live_relationships,
 )
 from smart_money.config import load_endpoint_env
 from smart_money.decode import (
@@ -3356,6 +3356,53 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'below occupied budget'):
             prepare_runtime_budget_cycle(store, lowered, 'auto')
         store.close()
+
+    def test_database_run_validates_every_live_relationship_and_locks_per_follower(self):
+        first = SimpleNamespace(
+            follower_wallet=B, relationship_id='7', snapshot_hash='ab' * 32)
+        same_follower = SimpleNamespace(
+            follower_wallet=B, relationship_id='8', snapshot_hash='cd' * 32)
+        other_follower = SimpleNamespace(
+            follower_wallet=TOKEN, relationship_id='9', snapshot_hash='ef' * 32)
+        policies = (first, same_follower, other_follower)
+        with patch('smart_money.cli.require_mainnet_broadcast_enabled') as gate, patch(
+                'smart_money.cli.live_key_record_status', return_value={
+                    'found': True, 'enabled': True, 'private_key_read': False,
+                }) as key_status:
+            self.assertEqual(validate_live_relationships(policies), policies)
+        self.assertEqual(gate.call_count, 3)
+        self.assertEqual(key_status.call_count, 3)
+        gate.assert_any_call(B, '7', 'ab' * 32)
+        gate.assert_any_call(B, '8', 'cd' * 32)
+        gate.assert_any_call(TOKEN, '9', 'ef' * 32)
+
+        with patch('smart_money.cli.require_mainnet_broadcast_enabled'), patch(
+                'smart_money.cli.live_key_record_status', side_effect=(
+                    {'found': True, 'enabled': True},
+                    {'found': False, 'enabled': False},
+                )), self.assertRaisesRegex(ValueError, 'relationship 8'):
+            validate_live_relationships((first, same_follower))
+
+        async def exercise_locks():
+            locks = live_wallet_execution_locks(policies)
+            self.assertEqual(set(locks), {B, TOKEN})
+            active = Counter()
+            maxima = Counter()
+
+            async def work(wallet, group):
+                async with locks[wallet]:
+                    active[group] += 1
+                    maxima[group] = max(maxima[group], active[group])
+                    await asyncio.sleep(0.01)
+                    active[group] -= 1
+
+            await asyncio.gather(work(B, 'same'), work(B, 'same'))
+            await asyncio.gather(work(B, 'different'), work(TOKEN, 'different'))
+            return maxima
+
+        maxima = asyncio.run(exercise_locks())
+        self.assertEqual(maxima['same'], 1)
+        self.assertEqual(maxima['different'], 2)
 
     def test_same_smart_wallet_relationships_have_isolated_budget_and_proposals(self):
         async def scenario():

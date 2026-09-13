@@ -122,6 +122,27 @@ def prepare_runtime_budget_cycle(store, config, action, cycle_id=None, reason=No
     return active, created
 
 
+def validate_live_relationships(live_policies):
+    """Fail startup unless every enabled live relationship and follower key is ready."""
+    ready = []
+    for policy in live_policies:
+        require_mainnet_broadcast_enabled(
+            policy.follower_wallet, policy.relationship_id, policy.snapshot_hash)
+        key_status = live_key_record_status(
+            policy.follower_wallet, policy.relationship_id, policy.snapshot_hash)
+        if not key_status["found"] or not key_status["enabled"]:
+            raise ValueError(
+                f"enabled follower signing key is unavailable for relationship "
+                f"{policy.relationship_id}")
+        ready.append(policy)
+    return tuple(ready)
+
+
+def live_wallet_execution_locks(live_policies):
+    """Serialize approval/nonce/broadcast for one follower, not across followers."""
+    return {policy.follower_wallet: asyncio.Lock() for policy in live_policies}
+
+
 def require_existing_sqlite(args):
     if not getattr(args, "ledger_mysql", False) and not Path(args.db).is_file():
         raise ValueError("database does not exist")
@@ -314,6 +335,7 @@ async def monitor(args):
     paper_executor = None
     live_pipelines = {}
     live_tracking_tasks = set()
+    live_wallet_locks = {}
     if paper_config:
         live_policies = [policy for policy in paper_config.relationships
                          if policy.run_mode == "mainnet_live"]
@@ -321,18 +343,14 @@ async def monitor(args):
             if not args.paper_mysql or not args.ledger_mysql:
                 raise ValueError(
                     "mainnet_live requires the MySQL configuration and ledger")
-            if len(live_policies) != 1:
-                raise ValueError("exactly one mainnet_live relationship is supported per process")
-            policy = live_policies[0]
-            require_mainnet_broadcast_enabled(
-                policy.follower_wallet, policy.relationship_id, policy.snapshot_hash)
-            key_status = live_key_record_status(
-                policy.follower_wallet, policy.relationship_id, policy.snapshot_hash)
-            if not key_status["found"] or not key_status["enabled"]:
-                raise ValueError("enabled follower signing key is unavailable")
-            report("live_key_ready", relationship_id=policy.relationship_id,
-                   follower_wallet=policy.follower_wallet,
-                   private_key_read=False, live_trading=True)
+            validate_live_relationships(live_policies)
+            live_wallet_locks = live_wallet_execution_locks(live_policies)
+            for policy in live_policies:
+                report("live_key_ready", relationship_id=policy.relationship_id,
+                       follower_wallet=policy.follower_wallet,
+                       private_key_read=False, live_trading=True)
+            report("live_relationships_ready", relationships=len(live_policies),
+                   follower_wallets=len(live_wallet_locks), live_trading=True)
         cycle_id, cycle_created = prepare_runtime_budget_cycle(
             store, paper_config, args.paper_cycle_action,
             args.paper_cycle_id, args.paper_cycle_reason)
@@ -476,7 +494,7 @@ async def monitor(args):
             await asyncio.sleep(1)
         report("live_tracking_timeout", proposal_id=proposal_id, live_trading=True)
 
-    async def execute_live(policy, signal, proposal_id):
+    async def execute_live_serialized(policy, signal, proposal_id):
         proposal = store.paper_proposal(proposal_id)
         quote_signal = execution_quote_signal(
             signal, policy.route_definitions, proposal["output_asset"])
@@ -538,10 +556,19 @@ async def monitor(args):
         live_tracking_tasks.add(task)
         task.add_done_callback(live_tracking_tasks.discard)
 
-    async def paper_observe(signal):
+    async def execute_live(policy, signal, proposal_id):
+        # Approval transactions and copy transactions share the follower's
+        # account nonce. Keep that entire sequence atomic per follower while
+        # allowing distinct follower wallets to proceed concurrently.
+        async with live_wallet_locks[policy.follower_wallet]:
+            await execute_live_serialized(policy, signal, proposal_id)
+
+    async def paper_observe(signal, policies=None):
         if not paper_config or signal.wallet not in paper_config.wallets:
             return
-        for policy in paper_config.policies_for(signal.wallet):
+        selected = (paper_config.policies_for(signal.wallet)
+                    if policies is None else policies)
+        for policy in selected:
             if signal.behavior in {"BUY", "TOKEN_SWAP"}:
                 bucket = budget_bucket(signal.token_in) if signal.token_in else None
                 rule = policy.buy_rules.get(bucket)
@@ -600,15 +627,23 @@ async def monitor(args):
                                         time.monotonic() - execution_started)
 
     async def safe_paper_observe(signal):
-        try:
-            await paper_observe(signal)
-        except Exception as exc:
-            live = any(policy.run_mode == "mainnet_live"
-                       for policy in paper_config.policies_for(signal.wallet)) \
-                if paper_config else False
-            stats["live_errors" if live else "paper_errors"] += 1
-            report("copy_execution_error", source_event_id=signal.event_id,
-                   error_type=type(exc).__name__, live_trading=live)
+        if not paper_config or signal.wallet not in paper_config.wallets:
+            return
+        policies = paper_config.policies_for(signal.wallet)
+        results = await asyncio.gather(
+            *(paper_observe(signal, (policy,)) for policy in policies),
+            return_exceptions=True,
+        )
+        for policy, result in zip(policies, results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                live = policy.run_mode == "mainnet_live"
+                stats["live_errors" if live else "paper_errors"] += 1
+                report("copy_execution_error", source_event_id=signal.event_id,
+                       relationship_id=policy.relationship_id,
+                       follower_wallet=policy.follower_wallet,
+                       error_type=type(result).__name__, live_trading=live)
 
     async def account_impl(wallet, block="latest", strict=False):
         try:

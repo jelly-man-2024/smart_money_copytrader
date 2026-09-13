@@ -23,6 +23,9 @@
 
 同一个聪明钱可以被多个跟单钱包跟随；每一行都有独立 relationship ID、配置快照、额度、
 proposal、持仓 lot 和收益归因。某行 `enabled=false` 时只保留配置，不参与监听后的纸面决策。
+一个进程会加载全部 enabled 实盘关系。相同 follower 的授权与交易发送共用账户 nonce，因此按
+follower 串行；不同 follower 可并行执行。同一聪明钱匹配多条关系时逐条决策，单条错误不会阻断
+其他关系。
 
 当前主要配置字段：
 

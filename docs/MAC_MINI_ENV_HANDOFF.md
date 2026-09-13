@@ -120,7 +120,7 @@ python3 -m venv .venv
 .venv/bin/sm-copy replay --extra-fixture data/bulk_distribution.json --db :memory:
 ```
 
-当前参考值是176项 unittest全部通过、13笔历史回放，所有信号保持 `copy_eligible=false`。后续提交
+当前参考值是177项 unittest全部通过、13笔历史回放，所有信号保持 `copy_eligible=false`。后续提交
 可能增加测试，以实际 discover 数量为准。回放必须继续保留 UNKNOWN、被动入账和其他负例；不能
 放宽断言或改锁定依赖来制造通过。Apple Silicon 如遇某个 pin 没有 wheel/无法构建，记录 Python
 版本、`uname -m`、包名和错误类型，不自动换版本、不修改 `requirements.lock`。

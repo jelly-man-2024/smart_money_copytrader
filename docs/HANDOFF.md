@@ -36,7 +36,7 @@ Feed 是已排序交易，领先 RPC 不意味着可以抢在已排序目标交�
 - 2026-09-11 新服务器基线和首个 P0 小步见
   `SERVER_VALIDATION_2026-09-11.md`：候选已改为先持久化再进入有界队列，支持重启恢复和
   最多 8 次持久回执退避；关键零值 counters、候选状态与阶段延迟分位数已进入健康日志。
-  当前共 176 项测试。保守分类和 `copy_eligible=false` 均未改变。
+  当前共 177 项测试。保守分类和 `copy_eligible=false` 均未改变。
 - 意向、执行、规范链状态已拆为独立字段，Feed 来源单独标记；第三方入账不归属为目标意向。
   SQLite 已有独立 `canonical_l2` 区块游标。RPC safe-head 扫描器已完成首版：首次锚定而不
   扫全链，之后有界逐块续扫，补抓标为 backfill/fresh=false；父哈希不连续时停止。显式重组
@@ -590,8 +590,11 @@ enabled 状态、密钥 enabled 状态、配置快照、报价/余额/Gas/allowa
 MySQL 配置与账本、Relay 关联、复用活动额度周期，
 第一次才创建周期；新增 relationship 自动初始化独立额度，修改额度保留 invested/reserved，低于已
 占用值时拒绝启动。enabled relationship 中的 smart wallet 自动并入监听集合，不再另改 CSV。
-当前仍限制每进程恰好一条 enabled `mainnet_live` relationship。
+固定入口现会加载全部 enabled `mainnet_live` relationship。启动时逐条检查数据库确认、配置快照
+和对应 follower 的 key 元数据；任一 enabled 实盘关系不合格会整体失败关闭。同一 follower 的
+allowance、nonce、签名与广播使用进程内钱包锁串行，不同 follower 可并行。同一聪明钱关联多条
+关系时分别执行，单条失败会带 relationship/follower 记录且不阻断其他关系。
 
 本机原 relationship 78 monitor 已按使用者要求停止，`var/EXECUTION_STOP` 已恢复且权限为0600；账本
-审计10/10 attempts confirmed，无 pending/signed/orphaned/reverted。改造后176/176 unittest、13笔回放、
+审计10/10 attempts confirmed，无 pending/signed/orphaned/reverted。改造后177/177 unittest、13笔回放、
 `pip check`、compileall 和 diff check 通过；未读取真实私钥、未签名或广播新交易。

@@ -43,7 +43,7 @@ python3 -m venv .venv
 离线回放包含 11 笔历史样本、1 笔真实 feed 存款样本和可选的 230 地址批量分发。
 不需要网络、付费 RPC 或私钥。信号输出到 stdout（JSONL），统计输出到 stderr。
 SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信号。
-目前单元测试共 176 项。服务器首次验证顺序为安装、单元测试、离线回放，
+目前单元测试共 177 项。服务器首次验证顺序为安装、单元测试、离线回放，
 再执行下面的 60 秒实时只读监听；完整历史验证记录见 [VALIDATION](docs/VALIDATION.md)。
 
 ## 实时只读监听
@@ -76,7 +76,7 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 取得固定区块的实时报价；只有第二次报价仍通过原始 `minOut`、时效、偏离、价格冲击和 Gas
 门控，才写入本地 paper fill。`run_mode=paper` 全过程没有签名、广播或真实订单。显式的
 `mainnet_live` 测试模式只执行最终能严格验证为本地 V2/V3/V4 的路径，并且还要求 MySQL
-配置/账本、单条 enabled live relationship、全局 stop file 和签名/广播前的 MySQL 配置快照复核；
+配置/账本、逐条 enabled live relationship、全局 stop file 和签名/广播前的 MySQL 配置快照复核；
 普通启动仍然不会签名或广播。Relay 自动关联需显式传 `--relay-auto-associate`，它只使用订单
 做归因，再从同一回执发现并验证本地池，不复用源 calldata。confirmed live 回执会按规范块与
 follower ERC-20 净差额结算收益 lot；当前仍不能用于无人值守运行。具体见
@@ -173,8 +173,9 @@ export SMART_MONEY_MYSQL_SSL_CA=/etc/ssl/certs/数据库服务端CA.pem
 ```
 
 一个 monitor 进程可加载多个跟单钱包，也允许同一个聪明钱分别配置给多个跟单钱包；额度、
-提案、仓位和跟卖额度恢复按 relationship 隔离。私钥不在 `copy_relationships` 中；当前版本
-仍不读取主网私钥、不签名或广播主网交易。
+提案、仓位和跟卖额度恢复按 relationship 隔离。实盘启动会逐条校验关系与对应 key 元数据；
+同一 follower 的授权、nonce、签名和广播串行，不同 follower 可并行。私钥不在
+`copy_relationships` 中，只在通过逐关系门禁后从独立 key MySQL 按 follower 精确读取。
 
 业务 MySQL 还包含 `003_runtime_ledger.sql` 定义的运行与收益账本。将既有 SQLite 搬入 MySQL 时，
 必须先停止该 SQLite 的写入进程，确认没有非空 `-wal` 文件，再由操作员核对源文件 SHA-256：

@@ -1,8 +1,7 @@
 # 实盘风险控制清单
 
 本文是实盘功能的硬门槛，不是无人值守上线授权。所有项目未完成并留下可复核证据前，必须保持
-`copy_eligible=false`；只有人工看守的单 relationship 小额测试可在逐项门禁匹配后读取对应密钥、
-签名和广播。
+`copy_eligible=false`；只有人工看守的小额实盘关系可在逐项门禁匹配后读取对应密钥、签名和广播。
 
 ## 数据源与权限
 
@@ -48,7 +47,8 @@
   在构建后 ABI 回归核验的 calldata 中，关系配置 snapshot hash 也在签名前匹配当前配置。
 - [x] 使用 pending nonce 并持久化 nonce reservation；同一 proposal 幂等，并发事务和重启恢复
   已覆盖。只读生命周期协调已能发现外部广播的原交易和同 nonce replacement，replacement
-  必须保持 from/to/calldata/value/gas/chain/type 并逐次提高 EIP-1559 费用。
+  必须保持 from/to/calldata/value/gas/chain/type 并逐次提高 EIP-1559 费用。多关系实盘对同一
+  follower 的 allowance、nonce、签名与广播进行进程内串行，不同 follower 可并行。
 - [ ] 广播前再次检查余额、Gas、报价年龄、滑点、价格偏离、流动性和额度。当前已完成未签名
   plan 的余额、Router allowance、Gas、报价年龄和目标 allowlist 只读预检；离线签名前已重新
   报价并复查上述状态、pending nonce、BUY budget reservation 或 SELL position reservation。

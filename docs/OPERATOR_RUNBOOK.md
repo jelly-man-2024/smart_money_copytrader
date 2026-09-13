@@ -126,7 +126,7 @@ bundle 中他人的 Swap 不归给目标钱包，claim + swap 仍分别保留。
 
 ## 小额 mainnet_live 测试入口
 
-当前一个进程只允许一条 enabled `mainnet_live` relationship，且必须满足：
+当前一个进程会加载全部 enabled `mainnet_live` relationship，且每一条都必须满足：
 
 - 配置来自 `--paper-mysql`，运行账本使用 `--ledger-mysql`；
 - `run_mode='mainnet_live'`、`trigger_mode='evidenced'`；
@@ -159,7 +159,10 @@ execution/signing/broadcast/chain ID 环境开关，也不再准备风险 JSON�
 ```
 
 该命令固定使用 MySQL 配置、MySQL 账本、自动复用额度周期和 Relay 关联；enabled relationship 中的
-smart wallet 会自动加入监听集合，不再维护额外 watchlist。修改 `copy_relationships` 时在同一条
+smart wallet 会自动加入监听集合，不再维护额外 watchlist。启动时任何一条 enabled 实盘关系的
+确认、快照或 key 元数据不合格都会整体失败关闭，避免静默漏跟。运行时同一 follower 的授权、
+nonce、签名和广播按钱包串行，不同 follower 可并行；单条关系的执行错误会记录该 relationship
+与 follower，不会阻断同一信号对应的其他关系。修改 `copy_relationships` 时在同一条
 SQL 刷新 `live_risk_accepted_at`，或修改 `wallet_keys` 后，重启同一命令即可生效。
 
 MySQL 配置 snapshot、关系 enabled/run_mode 状态、密钥 enabled 状态、余额、allowance、Gas、nonce、报价或
