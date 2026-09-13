@@ -531,3 +531,25 @@ invested/reserved 均归零，realized PnL 为 `-1810` raw USDG（不含 Gas）�
 执行审计4笔历史 swap attempt 全部 confirmed 且无 issue。修复后174/174单测、pip check、diff check
 通过。结束状态仍为 relationship 78 disabled、stop file active、无 monitor；公开 hash、区块、Gas、
 最终余额及日志见 `docs/SERVER_VALIDATION_2026-09-13.md`。
+
+第三轮继续验证了 Kyber 来源的 Relay SELL。源 SELL 的 Token debit 与 Relay USDG deposit 均严格
+闭合，但 relationship 78 初始遗漏 `kyber`，系统先按 `protocol_not_allowed` 安全拒绝且没有广播。
+补入 Kyber 后 snapshot 变为
+`f51aa692e2535866c6c6eae8b448a479b556e88ccf2800f223e220765a22ed58`；decision/proposal/账本 source
+幂等键现同时绑定配置 snapshot，允许配置修正后安全重放同一事件并保留原拒绝记录。修复提交
+`24faa62` 已推送，175/175 tests 与 `pip check` 通过。
+
+重放没有执行 Kyber calldata，而是反转 BUY lot 中已验证的 V3 fee=10000本地路径。follower 的
+Token approve 与 SELL 分别为
+`0x3baa61de842a5a65d391f57557ae6c62def0962b7a9ff964389de77fe9a6a611`、
+`0x4bc67f6160424387e5d2c6d03a6102ce69abf7853c6e3113f1127c2a250a4ea8`；全部归因 Token 卖出后收回
+`1918286` raw USDG，lot closed，10 USDG预算全部恢复，realized PnL 为 -0.081714 USDG（不含 Gas）。
+执行审计6个 plan/attempt 全部 confirmed 且无 issue，链上 Token余额/allowance 均为0。
+
+按使用者要求，monitor 当前继续常驻于 screen
+`smart_money_mainnet_live_78_kyber_retry2`，日志
+`var/mainnet_live_78_20260913_kyber_retry2.log`；relationship 78 enabled，急停文件暂存为
+`var/EXECUTION_STOP.continuous-kyber-20260913`。启动时必须显式传
+`--watchlist data/mainnet_test_watchlist.csv`，否则默认 watchlist 不包含测试 smart wallet，进程会在
+任何签名之前退出。运维接手前应重新检查 screen/PID、日志最后一条 health、执行审计、余额/nonce；
+需要停止时先恢复 `var/EXECUTION_STOP`，再禁用 relationship 78 并终止精确 monitor PID。

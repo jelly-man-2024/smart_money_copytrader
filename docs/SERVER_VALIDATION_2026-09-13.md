@@ -277,3 +277,55 @@ shadow：feed intent 因动态目标尚未证实而 `asset_not_allowed`，receip
 恢复、monitor 已退出。代码补充了主动路线验证健康计数，下一次同类事件会记录
 `local_v3_route_discovered`；本次既有日志中的 counter=0 是修复前的观测缺口，不表示路线未验证。
 所有 signal 继续保持 `copy_eligible=false`，本次结果不代表盈利或无人值守上线验收。
+
+## 第三轮常驻测试：Kyber 来源跟卖
+
+在提交并推送 `00c1536` 后，常驻 monitor 捕获源 BUY
+`0xfc8877462d4ff5f92b39e511c15d12ab36c79fc9abc2300283f86286bdbad517`。Relay 唯一订单关联完成后，
+系统按实际2 USDG输入发现并验证 V3 fee=10000 直接池
+`0xe547c18f46db55ab788343bcc503f9cf0bd7d564`；follower BUY
+`0x9712426141fd285fc2dfd62a47b43d86fa3deb794b46c2e40f2e292885a17d94`
+支付 `2000000` raw USDG，收到 `6806140178764240342` raw Token
+`0x2e8c31162b855a2ffa90f6f8634643ad6f111e18`。BUY 后预算 invested/available 为
+`2000000/8000000` raw USDG。
+
+smart wallet 随后的源 SELL
+`0xcf1d3ed1d46d674f809c9eed02ae37b33439650054322effc4c9b4ea458a2aab`
+严格闭合了 wallet Token debit `9547457307005586297` raw 与 Relay USDG deposit
+`2722464` raw，但来源聚合器被识别为 `kyber`。relationship 78 当时的 `allowed_protocols` 遗漏
+Kyber，主执行路径以 `protocol_not_allowed` 拒绝，没有 proposal、签名或广播；follower lot 保持
+完整。发现后先禁用 relationship、恢复急停并停止 monitor。
+
+全局协议解析本来已支持 Kyber，本次只把 relationship 78 的准入集合改为
+`[v2,v3,v4,0x,kyber,relay_solver]`。同时修正重放幂等键：decision、proposal 和账本 source key
+都绑定 `config_snapshot_hash`，因此同一源事件在配置变更后可形成新决策，又不会覆盖旧的安全拒绝
+证据。新 snapshot 为
+`f51aa692e2535866c6c6eae8b448a479b556e88ccf2800f223e220765a22ed58`，仓库外0600风险文件同步绑定；
+修复提交 `24faa62` 已推送。`pip check` 通过；停机文件存在时全量测试有7项按设计被急停拦截，随后在
+relationship disabled 状态下由 shell trap 临时挪开并恢复急停，最终175/175通过。
+
+重放前执行审计 `healthy=true/issues=[]`，链上 Token余额/allowance、latest/pending nonce 为
+`6806140178764240342/0/8/8`，与唯一 open lot 完全一致。第一次启动因遗漏专用
+`data/mainnet_test_watchlist.csv` 立即退出，急停自动恢复，审计确认未产生 plan、签名或广播。第二次
+使用正确 watchlist 后接受 proposal
+`99742296cfb0b06900966c3bbfefd7d690f1d5e00a4ccd409c234b2041ed1299`，从该 lot 恢复并反转此前验证的
+V3 fee=10000路径，没有复用 Kyber 源 calldata。
+
+Token 有界 approve
+`0x3baa61de842a5a65d391f57557ae6c62def0962b7a9ff964389de77fe9a6a611`
+授权精确归因持仓 `6806140178764240342` raw，在规范区块61660652成功；gasUsed=48653、
+effectiveGasPrice=`89492000` wei。follower SELL
+`0x4bc67f6160424387e5d2c6d03a6102ce69abf7853c6e3113f1127c2a250a4ea8`
+在规范区块61660679成功，实际卖出全部归因 Token，收到 `1918286` raw USDG；gasUsed=129106、
+effectiveGasPrice=`90424000` wei，Gas=`11674280944000` wei。fill
+`ef17ca913ae03b6f016c04e8bd94be542251bcbee1cb9c004a14fe4b9ee33b00`
+已结算，lot closed，budget reserved/invested/available 为 `0/0/10000000`；realized PnL 为
+`-81714` raw USDG（-0.081714 USDG，不含 approve/SELL 的 ETH Gas）。
+
+链上最终复核 follower 的 USDG/Token余额为 `19702567/0` raw，USDG/Token V3 allowance 为
+`1994000000/0` raw，ETH余额 `4842894815770556` wei，latest/pending nonce 均为10。执行审计共6个
+plan/attempt，全部 confirmed，`healthy=true/issues=[]`；候选 complete，队列与 pending/retry/failed
+均为0。monitor 继续运行于 screen `smart_money_mainnet_live_78_kyber_retry2`，证据日志为
+`var/mainnet_live_78_20260913_kyber_retry2.log`；relationship 78 保持 enabled，急停文件暂存为
+`var/EXECUTION_STOP.continuous-kyber-20260913`。这是使用者要求的人工看守常驻状态，不代表无人值守
+上线验收或盈利保证。
