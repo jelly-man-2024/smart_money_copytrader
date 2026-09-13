@@ -598,3 +598,11 @@ allowance、nonce、签名与广播使用进程内钱包锁串行，不同 follo
 本机原 relationship 78 monitor 已按使用者要求停止，`var/EXECUTION_STOP` 已恢复且权限为0600；账本
 审计10/10 attempts confirmed，无 pending/signed/orphaned/reverted。改造后177/177 unittest、13笔回放、
 `pip check`、compileall 和 diff check 通过；未读取真实私钥、未签名或广播新交易。
+
+## 2026-09-13 跟单流程文档 v2.0
+
+`docs/COPYTRADING_FLOW.md` 已按提交 `20f2512` 重写为当前实现，不再把实盘流水线描述为未来工作，
+也不再保留单 relationship、本机旧数据库状态和“monitor 不自动授权”等过期说明。新版从
+`sm-copy run` 启动开始，覆盖全部 enabled 关系加载、逐关系门禁、多 follower 分发、同 follower
+nonce/授权串行、纸面/实盘分支、有界授权、签名广播、回执结算、行为矩阵和当前代码入口；同时
+明确进程内锁不能保护重复实例，以及路由、V4/Permit2、复杂结算和深重组等剩余边界。

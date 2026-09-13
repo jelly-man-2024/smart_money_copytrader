@@ -1,15 +1,20 @@
 # 当前跟单流程与行为矩阵
 
-更新时间：2026-09-13。
+文档版本：v2.0
 
-本文说明当前代码如何从聪明钱链上活动产生信号，以及业务 MySQL 中一条
-`copy_relationships` 配置会让跟单钱包采取什么动作。`run_mode=paper` 的“跟买、跟卖、成交”均为
-使用实时 RPC 报价写入业务账本的纸面操作。`run_mode=mainnet_live` 已增加一条显式测试入口，只允许
-单 relationship、MySQL 配置/账本和 `evidenced` 的严格本地 V2/V3/V4 路径；全部门禁同时打开时才读取
-该 follower 的独立 key MySQL 记录、签名并广播。所有来源信号仍保持 `copy_eligible=false`；live
-资格由独立策略与运行门禁决定，不能根据该字段推断可广播。
+更新时间：2026-09-13
 
-## 1. 一条跟单关系代表什么
+适用代码：`main` 分支 `20f2512` 及后续提交。
+
+本文描述当前数据库驱动的纸面/实盘跟单流程。v2.0 已替换早期“仅纸面、单条实盘关系、签名广播
+属于未来 M3”的说明；当前固定入口 `.venv/bin/sm-copy run` 会加载业务 MySQL 中全部 enabled
+关系，其中 `run_mode=paper` 写纸面成交，`run_mode=mainnet_live` 在全部门禁通过后可读取对应
+follower 的独立 key MySQL 记录、签名并广播真实交易。
+
+观察信号的 `copy_eligible` 仍固定为 `false`。它表示观察层不自行授权交易；实盘资格来自独立的
+relationship 配置、证据等级、风险检查和签名/广播门禁，不能通过修改信号字段开启实盘。
+
+## 1. 配置、钱包和运行边界
 
 一行 `copy_relationships` 唯一表示：
 
@@ -21,302 +26,317 @@
 这一对钱包唯一采用的一套策略
 ```
 
-同一个聪明钱可以被多个跟单钱包跟随；每一行都有独立 relationship ID、配置快照、额度、
-proposal、持仓 lot 和收益归因。某行 `enabled=false` 时只保留配置，不参与监听后的纸面决策。
-一个进程会加载全部 enabled 实盘关系。相同 follower 的授权与交易发送共用账户 nonce，因此按
-follower 串行；不同 follower 可并行执行。同一聪明钱匹配多条关系时逐条决策，单条错误不会阻断
-其他关系。
+同一个聪明钱可以被多个跟单钱包跟随；同一个跟单钱包也可以跟随多个聪明钱。每条关系拥有独立
+relationship ID、配置快照、额度、proposal、归因持仓 lot 和收益记录。
 
-当前主要配置字段：
+一个 `sm-copy run` 进程会加载全部 enabled 关系：
+
+- 启动时逐条校验 enabled 实盘关系的运行模式、数据库确认时间、配置快照和 follower key 元数据；
+- 任一 enabled 实盘关系启动校验失败，整个进程失败关闭，不静默遗漏配置；
+- 同一聪明钱匹配多条关系时，各关系分别计算金额、额度、报价和归因；
+- 单条关系运行时失败会记录 relationship/follower，其他关系仍继续；
+- 同一个 follower 的授权、nonce、签名和广播使用同一把进程内钱包锁串行；
+- 不同 follower 使用不同钱包锁，可以并行执行。
+
+进程内锁不等于跨进程分布式锁。同一部署不得同时启动两个操作相同 follower 的 `sm-copy run`
+进程，否则授权交易和外部 nonce 变化仍可能竞争。
+
+主要数据库配置字段：
 
 | 配置 | 当前含义 |
 |---|---|
-| `trigger_mode` | 主触发点，只能是 `feed_intent`、`receipt_success` 或 `swap_evidenced` |
-| `shadow_trigger_modes` | 只记录比较结果，不占额度、不产生成交 |
-| `usdg_rule_*` | 聪明钱以 USDG 买入时，跟单使用固定金额或输入金额比例 |
-| `eth_rule_*` | 聪明钱以 ETH/WETH 买入时，跟单使用固定金额或输入金额比例 |
-| `sell_rule_*` | 聪明钱卖出时，跟单使用固定 token 数量或聪明钱实际卖出数量比例 |
-| `*_budget_limit_raw` | 本手动周期内、按聪明钱关系隔离的 USDG 与 ETH/WETH 累计投入上限 |
-| `allowed_protocols` | 当前策略允许报价的 V2/V3/V4 协议集合 |
-| `allowed_assets` | 可信本金/结算币和中间路由币；不是目标 meme token 白名单 |
-| `allowed_routes` | 可选的预配置本地路径及 V3 fee、V4 fee/tickSpacing/hook/hookData |
-| `quote_policy` | 报价年龄、价格偏离、价格影响、滑点、Gas 和最小输出限制 |
-| `strategy_version` | 写入历史归因的策略版本；修改配置不会倒推改写旧成交 |
+| `enabled` | 是否由固定任务加载；false 只保留配置和历史 |
+| `run_mode` | `paper` 写纸面成交；`mainnet_live` 可进入真实执行分支 |
+| `live_risk_accepted_at` | 实盘逐关系确认时间，必须不早于当前行 `updated_at` |
+| `trigger_mode` | 主触发点；实盘只接受 `swap_evidenced` 或统一的 `evidenced` |
+| `shadow_trigger_modes` | 只记录比较结果，不占额度、不创建真实执行 |
+| `usdg_rule_*` | 聪明钱以 USDG 买入时，使用固定金额或输入金额比例 |
+| `eth_rule_*` | 聪明钱以 ETH/WETH 买入时，使用固定金额或输入金额比例 |
+| `sell_rule_*` | 按固定数量或聪明钱已验证卖出比例计算本地跟卖量 |
+| `*_budget_limit_raw` | 按 relationship 隔离的净累计投入上限 |
+| `allowed_protocols` | 允许作为信号来源/本地执行依据的协议集合 |
+| `allowed_assets` | 可信本金、结算币和中间路由币；不是目标 meme token 白名单 |
+| `allowed_routes` | 可选本地路径以及 V3 fee、V4 PoolKey/hook 参数 |
+| `quote_policy` | 报价时效、偏离、价格影响、滑点、Gas 和最小输出限制 |
+| `strategy_version` | 写入交易归因的策略版本，不倒推改写历史成交 |
 
-金额始终按链上原始整数处理并以十进制字符串保存。`ratio_ppm=100000` 表示 10%，
-`ratio_ppm=500000` 表示 50%，`ratio_ppm=1000000` 表示 100%。
+原始金额始终使用整数，并作为十进制字符串保存。`ratio_ppm=100000` 表示 10%，
+`ratio_ppm=1000000` 表示 100%。
 
-对于 `swap_evidenced` / Relay 严格兑换证据，BUY 的输出 token 是动态目标，不要求预先写进
-`allowed_assets`；SELL 的输入 token 同样动态，但后续必须能匹配该 relationship 的已有归因 lot。
-本金/结算端和每一个中间 token 仍必须在 `allowed_assets`。例如 `USDG→MEME` 可放行，
-`USDG→未知中间币→MEME` 会拒绝，除非该中间币明确配置为可信；只有 feed intent、收币 Transfer、
-UNKNOWN 或 needs_review 都不会因此获得目标 token 放行。
-
-### 本机数据库当前实际状态
-
-2026-09-12 UTC 只读查询本机业务 MySQL：`copy_relationships` 共 67 行，`enabled=true` 为 0 行，
-`enabled=false` 为 67 行。因此服务器当前虽然持续观察清单地址，但没有任何一条正在生效的跟单
-关系；聪明钱发生任何行为都只会进入观察账本，不会创建 paper proposal 或 paper fill。
-
-本文后续所称“当前跟单动作”，是指某行经过使用者核对并设置 `enabled=true` 后，现有代码会按照
-该行配置采取的动作。README 中的 `config/paper.example.json` 只是示例，不是本机当前启用策略。
-
-## 2. 从聪明钱交易到当前纸面成交
+## 2. 启动流程
 
 ```text
-Feed 实时意向 [N1] ───────────┐
-                              ├─ 恢复真实发送者/解智能账户和 UserOp [N3]
-RPC 独立区块补漏 [N2] ────────┘
+                         .venv/bin/sm-copy run [N0]
                                       ↓
-                         解码行为与内部调用路径 [N4]
+                  从 MySQL 加载全部 enabled relationship [N1]
                                       ↓
-                      RPC 回执、池归属和资金流核对 [N5-N8]
+              合并聪明钱监听集合 + 校验 Robinhood chain ID [N2]
                                       ↓
-               intent / execution_observed / swap_evidenced
-                         / needs_review / failed [N9]
+             逐实盘关系检查 STOP、确认时间、快照和 key 元数据 [N3]
                                       ↓
-                  查询所有 enabled 的匹配 relationship [N10]
+            自动复用额度周期；为新 relationship 初始化独立额度 [N4]
                                       ↓
-              触发档 + 协议/资产/路由 + 金额规则检查 [N11-N13]
+                为每条关系创建 Engine/执行流水线和钱包锁 [N5]
                                       ↓
-                  决策时实时报价及第一轮风险检查 [N14-N15]
-                                      ↓
-              在业务账本事务中创建 proposal 并预留额度 [N16]
-                                      ↓
-                    成交前第二次报价及同一套风控 [N17]
-                                      ↓
-             当前：写 paper order/fill/position/收益归因 [N18-N20]
-             未来 M3：准备/签名/广播/跟踪 [N21-N24]
+                       启动 Feed、RPC 补洞和候选 worker
 ```
 
-Feed 和 RPC 不是二选一。Feed 用于更早观察意向；RPC 用于补洞、取得回执和核对链上事实。
-主触发点决定何时尝试跟单，不能取消后续重新报价和风险检查。
+`sm-copy run` 固定使用 MySQL 配置、MySQL 运行账本、Relay 自动关联和自动额度周期。enabled
+relationship 的 smart wallet 会自动加入 CSV 基础监听集合，不再为每个新关系维护独立 watchlist。
 
-### 流程节点代码索引
+重启默认复用活动额度周期，不重置累计投入。新增 relationship 会创建新的独立额度 scope；修改额度
+会保留 invested/reserved，若新上限小于当前占用值则拒绝启动。
 
-下面的行号对应当前提交附近的位置；后续改代码后行号可能变化，优先按类名/函数名搜索。
+实盘关系必须同时满足：
 
-| 节点 | 实现入口 | 具体职责 |
+1. `enabled=TRUE`；
+2. `run_mode='mainnet_live'`；
+3. `live_risk_accepted_at >= updated_at`；
+4. follower 在独立 `wallet_keys` 中存在且 `enabled=TRUE`；
+5. 全局 `var/EXECUTION_STOP` 不存在；
+6. 业务 MySQL、key MySQL、RPC、余额、Gas、allowance、nonce、报价和路由检查通过。
+
+修改 `copy_relationships` 后必须在同一条 SQL 中刷新
+`live_risk_accepted_at=CURRENT_TIMESTAMP(6)`，然后重启。运行中的旧进程在签名前重新加载该行；配置
+快照已经变化时会拒绝旧执行。修改 `wallet_keys` 后重启即可。
+
+## 3. 信号监听、补洞和证据确认
+
+```text
+Feed 实时交易意向 [N6] ───────────┐
+                                  ├─ 恢复 sender、智能账户与 UserOp 身份 [N8]
+RPC 独立区块游标补洞 [N7] ────────┘
+                                              ↓
+                              解码行为和内部调用路径 [N9]
+                                              ↓
+                   RPC 回执 + UserOp + 池归属 + ERC-20/ETH 资金流 [N10]
+                                              ↓
+             intent / execution_observed / swap_evidenced / needs_review / failed
+                                              ↓
+                         持久化 signal、候选状态和规范链证据 [N11]
+```
+
+Feed 和 RPC 不是二选一：Feed 提供更早的意向，RPC 独立游标负责重启/断线补洞、回执、规范区块和
+资金流证据。Feed 意向即使可解码，也不代表交易最终执行成功。
+
+RPC 补洞按 safe head 前进持久化游标；父块不匹配时寻找共同祖先、孤立旧规范链证据并重新处理
+候选。超过自动深度的重组需要显式 `reconcile-reorg`，不能静默把旧块继续当规范链。
+
+关键归属原则不变：
+
+- 收到 Transfer 本身不是买入；
+- 转出 Transfer 本身不是卖出；
+- bundle 中别人的 Swap 不归给目标聪明钱；
+- claim 与 swap 是两个动作，不能为了简化而丢弃 swap；
+- 未知 selector、账户实现、池、hook、recipient 或资金流保持 `UNKNOWN/needs_review`。
+
+## 4. 从信号到每条跟单关系
+
+```text
+严格信号证据
+     ↓
+查找这个 smart_wallet 的全部 enabled relationship [N12]
+     ↓
+每条关系独立检查 trigger / protocol / asset / route [N13]
+     ↓
+按固定金额或比例计算跟单输入 [N14]
+     ↓
+固定区块实时报价 + 偏离/冲击/滑点/Gas 检查 [N15]
+     ↓
+事务化创建 proposal，并预留 BUY 额度或 SELL 归因持仓 [N16]
+     ↓
+                 ┌── run_mode=paper ── 二次报价后写 paper fill [N17]
+                 │
+                 └── run_mode=mainnet_live ── 进入真实执行 [N18-N24]
+```
+
+多条匹配关系会分别运行上述决策。不同 follower 可以并行；相同 follower 可以先分别形成独立
+proposal，但进入真实授权和交易发送时会按 follower 串行。
+
+主触发语义：
+
+| 触发点 | 含义 | 实盘状态 |
 |---|---|---|
-| N0 进程总入口 | [`cli.py:155 monitor()`](../src/smart_money/cli.py#L155) | 组装 RPC、Feed、Decoder、队列、Store、PaperEngine 和后台任务 |
-| N1 Feed 接收 | [`cli.py:471 receive()`](../src/smart_money/cli.py#L471)、[`feed.py:127 envelopes()`](../src/smart_money/feed.py#L127) | 接收 WSS 帧、拆 Nitro envelope、检查序号缺口与消息新鲜度 |
-| N1 原始交易恢复 | [`feed.py:24 signed_transactions()`](../src/smart_money/feed.py#L24)、[`feed.py:57 decode_raw()`](../src/smart_money/feed.py#L57) | 解析签名交易、恢复真实 sender；不使用 header sender 代替钱包身份 |
-| N2 RPC 区块补洞 | [`cli.py:436 backfill()`](../src/smart_money/cli.py#L436)、[`backfill.py:57 BlockScanner.scan_once()`](../src/smart_money/backfill.py#L57) | 按独立 safe-head 游标扫描完整区块和目标 Transfer 日志，补 Feed/重启缺口 |
-| N2 重组处理 | [`backfill.py:130 BlockScanner.reconcile_reorg()`](../src/smart_money/backfill.py#L130)、[`cli.py:544 reconcile_reorg()`](../src/smart_money/cli.py#L544) | 找共同祖先、标记孤块信号并重新核对候选；深重组需要显式命令 |
-| N3 候选持久化/调度 | [`store.py:1321 put_candidate()`](../src/smart_money/store.py#L1321)、[`cli.py:100 dispatch_pending()`](../src/smart_money/cli.py#L100) | 先落盘再入有界队列，支持重启恢复和有界重试 |
-| N3/N4 身份与行为解码 | [`decode.py:52 Decoder`](../src/smart_money/decode.py#L52)、[`decode.py:57 Decoder.decode()`](../src/smart_money/decode.py#L57) | 区分 direct/self account/bundled/third party，递归解析已知账户、Router 与内部调用 |
-| N4 BUY/SELL 判定 | [`decode.py:21 side()`](../src/smart_money/decode.py#L21) | 依据报价资产方向区分 BUY、SELL、TOKEN_SWAP；不是看到 Swap 字样就判断 |
-| N5 候选处理主链 | [`cli.py:334 worker()`](../src/smart_money/cli.py#L334) | 解码 intent、查询回执、执行 prestate/池/资金流核验并保存升级后的信号 |
-| N6 池归属验证 | [`pools.py:28 verify_signal_pools()`](../src/smart_money/pools.py#L28) | 验证 factory、池地址、token 对、V4 manager/PoolKey/hook 等证据 |
-| N7 ETH 资金流 | [`native_flows.py:8 verify_native_flows()`](../src/smart_money/native_flows.py#L8) | 使用只读状态差分/trace 分开实际原生币流、退款与 Gas |
-| N8 回执归属与资产流 | [`receipts.py:29 transfers()`](../src/smart_money/receipts.py#L29)、[`receipts.py:55 operation_scopes()`](../src/smart_money/receipts.py#L55)、[`receipts.py:76 enrich()`](../src/smart_money/receipts.py#L76) | 计算钱包 ERC-20 delta、隔离各 UserOperation 日志、生成第三方入账/分发并决定证据等级 |
-| N9 信号模型与 ID | [`models.py:35 Signal`](../src/smart_money/models.py#L35)、[`store.py:1502 put()`](../src/smart_money/store.py#L1502) | 保存 intent/execution/canonical 状态、原始整数字符串、理由和证据；禁止高证据被低证据覆盖 |
-| N10 MySQL 关系加载 | [`mysql_config.py:125 load_mysql_paper_config()`](../src/smart_money/mysql_config.py#L125)、[`paper_config.py:125 load_paper_config()`](../src/smart_money/paper_config.py#L125) | 只加载 enabled 行，逐 relationship 严格校验并生成配置快照 |
-| N10 业务 MySQL 后端 | [`mysql_store.py:99 MySqlStore`](../src/smart_money/mysql_store.py#L99)、[`cli.py:52 runtime_store()`](../src/smart_money/cli.py#L52) | 让既有 Store 合约运行于业务 MySQL；`--ledger-mysql` 时启用 |
-| N11 信号分派到关系 | [`cli.py:263 paper_observe()`](../src/smart_money/cli.py#L263) | 找出该聪明钱的全部 relationship，选择 BUY/SELL 规则并分别执行主/影子触发 |
-| N12 触发档判断 | [`paper.py:135 trigger_allowed()`](../src/smart_money/paper.py#L135) | 检查 feed_intent、receipt_success、swap_evidenced、relay_buy_evidenced、relay_sell_evidenced 的精确条件及孤块/失败状态 |
-| N12 路径范围判断 | [`paper.py:30 signal_route_key()`](../src/smart_money/paper.py#L30)、[`paper.py:154 scope_reason()`](../src/smart_money/paper.py#L154) | 将协议、完整资产路径、fee/hook 参数与 relationship allowlist 精确匹配 |
-| N13 跟单金额 | [`paper.py:83 budget_bucket()`](../src/smart_money/paper.py#L83)、[`paper.py:115 planned_input_amount()`](../src/smart_money/paper.py#L115) | 选择 USDG 或 ETH/WETH 桶，按固定金额或聪明钱已验证实际输入比例计算 |
-| N14 实时报价 | [`paper.py:89 execution_quote_signal()`](../src/smart_money/paper.py#L89)、[`quotes.py:159 LiveQuoter`](../src/smart_money/quotes.py#L159) | 在固定区块取得 V2/V3/V4 报价；聚合器源信号唯一映射到本地允许路径，不复用聪明钱 calldata 或成交价 |
-| N15 风控评估 | [`quotes.py:72 validate_quote()`](../src/smart_money/quotes.py#L72)、[`quotes.py:108 assess_quote()`](../src/smart_money/quotes.py#L108) | 检查年龄、资产、源价格偏离、价格影响、滑点、Gas 与最小输出 |
-| N16 BUY 决策/预留 | [`paper.py:266 PaperEngine.propose_buy()`](../src/smart_money/paper.py#L266)、[`store.py:680 reserve_paper_proposal()`](../src/smart_money/store.py#L680) | 保存 decision，并在同一事务创建 proposal、检查和预留对应额度 |
-| N16 SELL 决策/预留 | [`paper.py:401 PaperEngine.propose_sell()`](../src/smart_money/paper.py#L401)、[`store.py:1082 reserve_paper_sell()`](../src/smart_money/store.py#L1082)、[`store.py:1155 paper_sell_principal_asset()`](../src/smart_money/store.py#L1155) | 只预留同 relationship、同 token 的可用 lot；唯一选择原本金资产并以该资产作为退出和收益单位 |
-| N17 二次报价/纸面成交 | [`paper.py:385 PaperExecutor`](../src/smart_money/paper.py#L385)、[`paper.py:397 execute()`](../src/smart_money/paper.py#L397) | 对 reserved proposal 再报价；恶化或异常则取消，满足条件才写纸面 fill |
-| N18 BUY 订单与持仓 | [`store.py:882 fill_paper_buy()`](../src/smart_money/store.py#L882) | 原子写 BUY order/fill/position lot，额度由 reserved 转为 invested |
-| N19 SELL 与本金恢复 | [`store.py:1153 fill_paper_sell()`](../src/smart_money/store.py#L1153) | 消耗 lot reservation、按卖出比例减少持仓、恢复原本金并写 realized PnL |
-| N20 收益与归因导出 | [`store.py:1023 paper_trades()`](../src/smart_money/store.py#L1023)、[`store.py:1265 paper_realized_pnl()`](../src/smart_money/store.py#L1265) | 导出 smart/follower/relationship/source signal/策略快照及 BUY/SELL 收益明细 |
-| N21 未签名交易准备 | [`execution_prep.py:36 build_execution_plan()`](../src/smart_money/execution_prep.py#L36)、[`execution_pipeline.py:120 ExecutionPreparer.prepare()`](../src/smart_money/execution_pipeline.py#L120) | 为有限受支持路径构建 follower 自己的 calldata，检查 nonce/余额/allowance/Gas；当前未接 monitor |
-| N22 离线测试签名 | [`execution_pipeline.py:184 OfflineExecutionSigner`](../src/smart_money/execution_pipeline.py#L184) | 只在三重 `offline_test` 门禁下测试；主网密钥读取和主网签名仍拒绝 |
-| N23 广播前复核 | [`execution_pipeline.py:281 ReadOnlyPreBroadcastReviewer`](../src/smart_money/execution_pipeline.py#L281) | 对内存 signed bytes 重查关系、额度、报价、交易字段和 nonce，固定不广播 |
-| N24 公开交易跟踪 | [`execution_receipts.py:42 ReadOnlyExecutionTracker`](../src/smart_money/execution_receipts.py#L42)、[`execution_receipts.py:88 observe()`](../src/smart_money/execution_receipts.py#L88) | 对外部提供的 tx hash 跟踪 pending/confirmed/reverted/replaced/orphaned；没有发送函数 |
+| `feed_intent` | 新鲜 Feed 中已解出的意向，可能最终失败 | 仅适合 paper/shadow |
+| `receipt_success` | 目标交易/UserOp 成功，但未必已有完整兑换闭环 | 仅适合 paper/shadow |
+| `swap_evidenced` | 池、钱包扣款、输出入账和 Swap 形成严格闭环 | 支持 |
+| `evidenced` | 接受 direct swap、严格 Relay BUY 或 Relay SELL 证据 | 支持 |
 
-阅读主线时建议先看 N0、N1、N3/N4、N5、N8、N11、N16、N17、N18/N19；再按需要深入池验证、
-补洞/重组和尚未接入的 execution preparation。完整数据库表定义在
-[`docker/mysql/init/001_copy_relationships.sql`](../docker/mysql/init/001_copy_relationships.sql) 和
-[`docker/mysql/init/003_runtime_ledger.sql`](../docker/mysql/init/003_runtime_ledger.sql)。
+## 5. 真实执行分支
 
-### 对照阅读的回归测试
+```text
+获得 follower 钱包锁 [N18]
+       ↓
+把来源交易映射为跟单钱包自己的本地 V2/V3/V4 路径 [N19]
+       ↓
+检查 Router allowance；不足时发送有界 approve 并等待规范回执 [N20]
+       ↓
+再次报价，构建 immutable transaction，检查余额/Gas/allowance/nonce [N21]
+       ↓
+持久化 nonce reservation 和 execution plan
+       ↓
+重新查询 relationship + 读取对应 key + 签名 + 恢复 sender [N22]
+       ↓
+广播前再次核对关系、额度、报价、交易字段和 pending nonce [N23]
+       ↓
+独立 MainnetBroadcaster 发送 eth_sendRawTransaction 并核对返回 hash [N24]
+       ↓
+释放 follower 钱包锁，后台跟踪 pending/confirmed/reverted/orphaned [N25]
+       ↓
+confirmed 后按规范 receipt 的 follower ERC-20 净差额结算 lot/PnL [N26]
+```
 
-| 想验证的规则 | 测试位置 |
-|---|---|
-| 真实样本 BUY/SELL | [`test_observer.py:627`](../tests/test_observer.py#L627)、[`test_observer.py:635`](../tests/test_observer.py#L635) |
-| claim + swap 不丢 swap | [`test_observer.py:200`](../tests/test_observer.py#L200) |
-| bundle 中他人的 Swap 不归因 | [`test_observer.py:395`](../tests/test_observer.py#L395) |
-| 被动收币不算买入 | [`test_observer.py:427`](../tests/test_observer.py#L427) |
-| 230 地址分发只生成一条负例 | [`test_observer.py:692`](../tests/test_observer.py#L692) |
-| 报价、决策与额度原子预留 | [`test_observer.py:868`](../tests/test_observer.py#L868) |
-| 多 follower 跟同一 smart 时隔离 | [`test_observer.py:2220`](../tests/test_observer.py#L2220) |
-| BUY fill 与归因 lot | [`test_observer.py:2579`](../tests/test_observer.py#L2579) |
-| SELL 只卖归因 lot 并恢复本金 | [`test_observer.py:2610`](../tests/test_observer.py#L2610) |
-| 重组保留 intent、撤销规范链证据 | [`test_observer.py:2945`](../tests/test_observer.py#L2945) |
-| 本地链地址/chain ID 安全边界 | [`test_local_copytrade.py:18`](../tests/test_local_copytrade.py#L18)、[`test_local_copytrade.py:43`](../tests/test_local_copytrade.py#L43) |
+钱包锁覆盖授权到跟单交易广播的完整 nonce 敏感区间。授权确认后才构建并签署跟单交易；不同钱包
+互不等待。广播后下一笔同钱包交易可使用 RPC pending nonce 和持久 nonce reservation 继续排队，
+回执跟踪在后台进行。
 
-### 三种触发档
+来源是 0x、Kyber 或 Relay/Solver，不代表跟单钱包复制聚合器 calldata。当前只把严格来源证据映射
+为自己的已验证 V2/V3/V4 exact-input 路径；无法找到支持路径就拒绝。Relay 被动交付还必须先唯一
+关联订单/付款/recipient，再验证本地池，不能把普通收币升级成买入。
 
-| 主触发点 | 何时允许进入决策 | 当前风险和用途 |
+当前授权策略：
+
+- USDG allowance 不足本笔 BUY 时，目标授权额为该 relationship USDG 预算上限的 200 倍；
+- 200 倍 allowance 不会放大软件预算，BUY proposal 仍受 relationship 净累计投入上限限制；
+- SELL 的 meme token allowance 不足时，只授权该 relationship 当前全部归因 open position；
+- 链上 allowance 属于 `钱包 × Token × Router`，多个 relationship 可能共享，但账本额度和持仓
+  仍严格按 relationship 隔离；
+- 不使用无限授权；现有 allowance 足够本笔输入时不重复发送 approve。
+
+## 6. BUY、额度和 SELL 归因
+
+BUY 先按输入资产选择额度桶：USDG 使用 USDG 桶，ETH/WETH 共用 ETH/WETH 桶。目标 meme token
+不需要预先写入 `allowed_assets`；本金、结算币和所有中间币必须在其中。
+
+固定金额示例：`usdg_fixed_amount_raw=2000000` 且 USDG 为 6 位小数时，每次计划买入 2 USDG，
+不随聪明钱成交规模变化。
+
+比例示例：聪明钱经回执确认实际投入 0.8 ETH，`ratio_ppm=100000`，计划输入为 0.08 ETH。比例基数
+是已验证的实际输入，不是 calldata 最大值或钱包总资产。
+
+额度表示 relationship 的净累计投入：
+
+```text
+可用额度 = 上限 - invested - reserved
+```
+
+BUY 预留后减少可用额度；BUY confirmed 后 reserved 转为 invested。SELL confirmed 后只按实际卖出
+占该归因 lot 的比例恢复原始本金，不按卖出收入或利润扩大额度。
+
+例如跟买 8 USDG，之后卖出该 lot 的 75%，恢复 6 USDG，本关系 invested 为 2 USDG，可继续投入
+8 USDG。Router allowance 是另一层链上授权，卖出不会恢复 USDG allowance；下一次 BUY 会检查
+现有 allowance，不足时先补到有界目标。
+
+每次 BUY lot 保存 follower、relationship、smart wallet、源 signal/tx、策略快照、本金资产、
+投入金额和获得 token。SELL 只能使用同一 relationship、同一 token 的 open lot，不会卖出：
+
+- 另一个聪明钱关系产生的同名 token；
+- 用户自行持有的 token；
+- 被动入账但没有严格 BUY 归因的 token。
+
+## 7. 聪明钱行为矩阵
+
+| 聪明钱情况 | 信号/证据 | 当前动作 |
 |---|---|---|
-| `feed_intent` | Feed 中已解出新鲜、明确的 exact-input 交易意图 | 最快，但聪明钱可能最终失败；当前适合作影子比较 |
-| `receipt_success` | 目标交易或目标 UserOperation 已成功，且不是模糊/待复核行为 | 比 Feed 稳妥，但不一定已有完整资产交换证据 |
-| `swap_evidenced` | 池、Swap、钱包输入扣款和输出入账形成当前支持范围内的闭环 | 当前默认主触发，也是最保守的第一版选择 |
+| 支持的 V2/V3/V4 路径买入，扣款和入账闭环 | `BUY/swap_evidenced` | 每条关系独立报价；paper 写纸面成交，live 走本地验证路径真实买入 |
+| 0x/Kyber 聚合器交易且回执闭环 | `BUY/SELL` 严格证据 | 不复制源 calldata；存在本地 V2/V3/V4 路径才执行 |
+| Relay/Solver BUY，源付款与目标交付唯一关联 | `relay_buy_evidenced` | 按本地已验证路径跟买；只有入账而无订单关联则拒绝 |
+| Relay/Solver SELL，token debit 与结算存款唯一闭合 | `relay_sell_evidenced` | 只卖该关系已有归因 lot，并使用本地退出路径 |
+| 卖出此前归因 token | `SELL` 严格证据 | 按固定/比例规则跟卖，不超过本关系可用 lot |
+| 卖出超过该关系持仓 | 持仓不足 | `attributed_position_insufficient`，不动其他资产 |
+| 单纯收币、空投或批量分发 | Transfer/Distribution | 不跟买 |
+| 单纯转出 token | Transfer | 不跟卖 |
+| claim 后又 swap | `CLAIM` + 独立 Swap | claim 不操作；swap 满足证据与策略时可跟 |
+| ETH/WETH wrap/unwrap | `WRAP_NATIVE/UNWRAP_NATIVE` | 不作为买卖，额度桶不重复计算 |
+| approve/Permit2 | `APPROVAL/AUTHORIZATION` | 不复制聪明钱授权 |
+| 加减流动性/NFT 头寸 | `LIQUIDITY` | 不按普通买卖跟单 |
+| bundle 中他人的 Swap | 目标 UserOp 无对应资金流 | 不归因、不跟单 |
+| 外层成功但目标 UserOp 失败 | `failed` | 不跟单 |
+| 池、token、recipient、hook 或资金流不一致 | `needs_review` | 不跟单 |
+| 未知聚合器/selector/账户实现 | `UNKNOWN` | 不猜测、不跟单 |
+| 来源交易进入孤块 | `canonical_status=orphaned` | 不创建新执行；撤销规范链证据并重新核对 |
 
-示例配置的主触发是 `swap_evidenced`，`feed_intent` 和 `receipt_success` 是 shadow。也就是说，
-前两档即使判断“可以”，也只写影子 decision；只有证据闭环档可以预留额度并写纸面成交。
+## 8. 当前代码索引
 
-## 3. 聪明钱发生不同交易时，跟单钱包怎么处理
+行号对应 v2.0 更新时的代码；后续修改后优先搜索表中的函数或类名。
 
-| 聪明钱链上情况 | 系统分类/证据 | 当前跟单动作 |
+| 节点 | 代码入口 | 职责 |
 |---|---|---|
-| 使用支持的 Router 买币，实际支出 USDG 并收到目标 token | `BUY/swap_evidenced` | 读取 USDG 买入规则，报价和风控通过后按固定金额或比例纸面跟买，占用 USDG 桶额度 |
-| 使用支持的 Router 买币，实际支出 ETH/WETH 并收到目标 token | `BUY/swap_evidenced` | 读取 ETH/WETH 买入规则，ETH 与 WETH 共用一个额度桶；wrap 本身不新增额度 |
-| token A 明确兑换 token B，业务上不能归成普通报价币买卖 | `TOKEN_SWAP/swap_evidenced` | 只有输入资产属于已配置买入桶且协议/资产/路由允许时才按买入逻辑处理，否则不创建 proposal |
-| 卖出此前买入的 token，收到 USDG 或 ETH/WETH | `SELL/swap_evidenced` | 按 sell rule 计算数量，只预留这条 relationship 归因的 open lot；没有足够归因持仓就拒绝 |
-| 只卖出一部分 | `SELL/swap_evidenced` | 按实际卖出比例减少对应 lot，只恢复该部分原始投入本金；不按卖出收入或利润放大额度 |
-| 卖出数量超过跟单钱包由该聪明钱产生的持仓 | `SELL`，但持仓不足 | `attributed_position_insufficient`，不卖其他聪明钱或用户自己持有的 token |
-| 单纯收到 token、空投或批量分发 | `INCOMING_TRANSFER` 或 `BULK_DISTRIBUTION` | 不跟买；收币不是买入证据 |
-| 单纯向外转 token | `TRANSFER` | 不跟卖；转账不是卖出证据 |
-| 领取奖励，没有兑换 | `CLAIM` | 不操作 |
-| 同一批调用先 claim 后 swap | `CLAIM` + 独立的 BUY/SELL/TOKEN_SWAP | 保留两个动作；claim 不跟，满足证据和策略的 swap 可进入决策 |
-| ETH↔WETH 包装/解包 | `WRAP_NATIVE` / `UNWRAP_NATIVE` | 不视为买卖，不产生跟单；ETH/WETH 额度仍属于同一桶 |
-| approve、Permit2 或其他授权 | `APPROVAL` / `AUTHORIZATION` | 不跟单，也不会因为聪明钱授权而替跟单钱包自动无限授权 |
-| 加减流动性、NFT 头寸操作 | `LIQUIDITY` / `LIQUIDITY_OR_POSITION_CALL` | 不按普通买卖跟单 |
-| Relay/Solver 源链存款 | `INTENT_DEPOSIT` | 不跟买；存入报价资产不能证明最终买了什么 |
-| 目标链只看到 Solver 向聪明钱交付 token | `EXTERNAL_DELIVERY_CANDIDATE` 或 `needs_review` | 未有唯一订单、付款和目标成交归属时不跟买 |
-| bundle 中别人的 UserOperation 发生 Swap | 目标 UserOp 没有对应 Swap/资金流 | 不归给目标聪明钱，不跟单 |
-| 外层交易成功，但目标 UserOperation 失败 | `failed` | 不跟单 |
-| 有 Swap 日志，但池、token、recipient 或钱包资金流不一致 | `needs_review` | 不跟单，等待增加解析支持或人工调查 |
-| 未知聚合器、未知 selector、未知账户实现或未知 hook | `UNKNOWN/needs_review` | 不猜测、不跟单 |
-| 聪明钱交易已进入孤块 | `canonical_status=orphaned` | 不创建新 proposal；尚未成交的纸面预留在恢复检查时释放，历史观察意向仍保留 |
+| N0 固定任务 | [`cli.py:1169 main()`](../src/smart_money/cli.py#L1169)、[`cli.py:317 monitor()`](../src/smart_money/cli.py#L317) | 解析 `run` 并组装全部组件 |
+| N1 MySQL 配置 | [`mysql_config.py:126 load_mysql_paper_config()`](../src/smart_money/mysql_config.py#L126) | 加载全部 enabled 行并逐行生成 snapshot |
+| N2 自动监听集合 | [`cli.py:79 monitoring_watchlist()`](../src/smart_money/cli.py#L79) | 合并 CSV 来源与 enabled smart wallets |
+| N3 实盘启动门禁 | [`cli.py:125 validate_live_relationships()`](../src/smart_money/cli.py#L125)、[`execution_controls.py:34 _risk_acceptance()`](../src/smart_money/execution_controls.py#L34)、[`key_source.py:89 live_key_record_status()`](../src/smart_money/key_source.py#L89) | 逐关系确认、快照和 key 元数据检查 |
+| N4 额度周期 | [`cli.py:92 prepare_runtime_budget_cycle()`](../src/smart_money/cli.py#L92) | 自动复用周期并初始化/更新关系额度 |
+| N5 钱包锁与流水线 | [`cli.py:141 live_wallet_execution_locks()`](../src/smart_money/cli.py#L141)、[`cli.py:346`](../src/smart_money/cli.py#L346) | 同 follower 串行，不同 follower 隔离 |
+| N6 Feed 接收 | [`cli.py:879 receive()`](../src/smart_money/cli.py#L879)、[`feed.py:127 envelopes()`](../src/smart_money/feed.py#L127) | 接收 WSS、检查 frame/sequence/freshness |
+| N7 RPC 补洞/重组 | [`cli.py:844 backfill()`](../src/smart_money/cli.py#L844)、[`backfill.py:57 scan_once()`](../src/smart_money/backfill.py#L57)、[`backfill.py:130 reconcile_reorg()`](../src/smart_money/backfill.py#L130) | 独立游标、Transfer 日志、规范链回查 |
+| N8/N9 身份与解码 | [`feed.py:24 signed_transactions()`](../src/smart_money/feed.py#L24)、[`decode.py:56 Decoder`](../src/smart_money/decode.py#L56) | 恢复 sender，隔离账户/UserOp 并解析行为 |
+| N10 回执证据 | [`receipts.py:76 enrich()`](../src/smart_money/receipts.py#L76)、[`pools.py:94 verify_signal_pools()`](../src/smart_money/pools.py#L94)、[`native_flows.py:8 verify_native_flows()`](../src/smart_money/native_flows.py#L8) | 回执、池、ERC-20 与 ETH 资金流核验 |
+| N11 候选/信号持久化 | [`store.py:1492 put_candidate()`](../src/smart_money/store.py#L1492)、[`store.py:1673 put()`](../src/smart_money/store.py#L1673)、[`cli.py:661 worker()`](../src/smart_money/cli.py#L661) | 重试、幂等、证据升级和规范状态 |
+| N12 多关系分发 | [`paper_config.py:71 policies_for()`](../src/smart_money/paper_config.py#L71)、[`cli.py:629 safe_paper_observe()`](../src/smart_money/cli.py#L629) | 将一个信号独立分发给全部匹配关系并隔离错误 |
+| N13-N16 策略决策 | [`paper.py:211 trigger_allowed()`](../src/smart_money/paper.py#L211)、[`paper.py:238 scope_reason()`](../src/smart_money/paper.py#L238)、[`paper.py:379 propose_buy()`](../src/smart_money/paper.py#L379)、[`paper.py:445 propose_sell()`](../src/smart_money/paper.py#L445) | 触发、路径、金额、报价和额度/持仓预留 |
+| N17 纸面成交 | [`paper.py:552 PaperExecutor`](../src/smart_money/paper.py#L552)、[`store.py:884 fill_paper_buy()`](../src/smart_money/store.py#L884)、[`store.py:1303 fill_paper_sell()`](../src/smart_money/store.py#L1303) | 二次报价及纸面 lot/PnL |
+| N18 同钱包串行 | [`cli.py:559 execute_live()`](../src/smart_money/cli.py#L559) | 获取 follower 锁后执行完整 nonce 敏感区间 |
+| N19 本地执行路径 | [`paper.py:89 execution_quote_signal()`](../src/smart_money/paper.py#L89)、[`quotes.py:162 LiveQuoter`](../src/smart_money/quotes.py#L162) | 将严格来源证据映射到本地报价路径 |
+| N20 有界授权 | [`approval.py:33 approve_relationship_token()`](../src/smart_money/approval.py#L33)、[`approval.py:146 approve_relationship_usdg()`](../src/smart_money/approval.py#L146) | 检查 allowance、发送 approve 并确认规范回执 |
+| N21 交易准备/nonce | [`execution_pipeline.py:94 ExecutionPreparer`](../src/smart_money/execution_pipeline.py#L94)、[`store.py:224 reserve_execution_nonce()`](../src/smart_money/store.py#L224) | 二次报价、preflight、计划和 nonce reservation |
+| N22 主网签名 | [`execution_pipeline.py:289 LiveExecutionSigner`](../src/smart_money/execution_pipeline.py#L289)、[`key_source.py:185 LiveDatabaseSigner`](../src/smart_money/key_source.py#L185) | 重查关系、精确读取 key、签名并恢复 sender |
+| N23 广播前复核 | [`execution_pipeline.py:385 LivePreBroadcastReviewer`](../src/smart_money/execution_pipeline.py#L385) | 重查关系、预算、报价、字段和 pending nonce |
+| N24 独立广播 | [`broadcast.py:28 MainnetBroadcaster`](../src/smart_money/broadcast.py#L28) | 仅在最终门禁后发送并核对本地/远端 hash |
+| N25 回执跟踪 | [`cli.py:462 track_live()`](../src/smart_money/cli.py#L462)、[`execution_receipts.py:42 ReadOnlyExecutionTracker`](../src/smart_money/execution_receipts.py#L42) | 跟踪 pending、confirmed、reverted、replacement、orphaned |
+| N26 实盘结算 | [`live_settlement.py:38 settle_confirmed_execution()`](../src/smart_money/live_settlement.py#L38) | 按规范 receipt 的 follower 净差额更新 lot/PnL |
 
-## 4. BUY 金额如何决定
+核心多关系回归：
 
-先根据聪明钱实际输入资产选择桶：USDG 使用 `usdg_rule_*`，ETH/WETH 使用
-`eth_rule_*`。没有对应桶或实际输入金额无法闭环时不生成 proposal。
+- `test_mysql_relationship_rows_reuse_strict_paper_validation`
+- `test_same_smart_wallet_relationships_have_isolated_budget_and_proposals`
+- `test_database_run_validates_every_live_relationship_and_locks_per_follower`
+- `test_nonce_reservations_are_persistent_idempotent_and_gap_free`
+- `test_usdg_approval_is_200x_budget_bounded_and_relationship_gated`
+- `test_dynamic_sell_token_approval_is_position_bounded_and_confirmed`
 
-### 固定金额
+测试文件：[`tests/test_observer.py`](../tests/test_observer.py)。
 
-假设配置：
+## 9. 日常配置和运行
 
-```text
-usdg_rule_mode = fixed
-usdg_fixed_amount_raw = 1000000
+新增或修改关系后，在同一条 SQL 中设置确认时间：
+
+```sql
+UPDATE copy_relationships
+SET enabled = TRUE,
+    run_mode = 'mainnet_live',
+    live_risk_accepted_at = CURRENT_TIMESTAMP(6)
+WHERE id = ?
+  AND follower_wallet = '0x跟单钱包'
+  AND smart_wallet = '0x聪明钱钱包';
 ```
 
-如果 USDG 是 6 位小数，每次符合条件的 USDG 买入计划使用 1 USDG；聪明钱买 100 USDG 或
-10,000 USDG 都不改变本次计划金额。实际仍受剩余额度和报价风控限制。
+启动前逐关系核对：
 
-### 比例金额
-
-假设配置 `eth_ratio_ppm=100000`（10%）：
-
-```text
-聪明钱经回执确认实际投入 0.8 ETH
-跟单计划金额 = 0.8 × 10% = 0.08 ETH
+```bash
+.venv/bin/sm-copy relationship-status --relationship-id ID
 ```
 
-比例基数是该笔交易中已经验证的钱包实际输入，不是聪明钱总资产，也不是 calldata 中未经执行
-确认的最大值。
+输出应显示 `live_risk_acceptance_current=true`。后台启动、重启和日志查看见
+[`OPERATOR_RUNBOOK.md`](OPERATOR_RUNBOOK.md)。固定前台命令是：
 
-如果计划金额超过该 relationship 当前桶的可用额度，当前实现拒绝该 proposal，不能通过减少
-安全检查强行成交。手动周期重启选择 `reuse` 时沿用已用/预留额度；选择 `reset` 时建立新周期，
-旧成交和归因不会删除。有未确定在途预留时禁止重置。
-
-## 5. SELL 如何保护不同来源持仓
-
-每次纸面 BUY 都创建独立 position lot，并保存：
-
-- 跟单钱包与 relationship ID；
-- 聪明钱地址、标签和源 signal/tx；
-- 原始投入资产与本金；
-- 实际获得 token 数量；
-- 策略版本和额度周期。
-
-聪明钱卖出时，当前系统只从同一 ledger scope、相同 token、相同本金桶的 open lot 中按时间顺序
-预留。跟卖成交后按 `卖出 token 数量 ÷ 该 lot 卖出前 token 数量` 计算应恢复的原始本金。
-
-例如跟买 lot 使用 0.05 ETH 获得 50 token；之后跟卖 25 token：
-
-```text
-剩余 token = 25
-恢复 ETH 额度 = 0.025 ETH
-继续占用的原始本金 = 0.025 ETH
+```bash
+.venv/bin/sm-copy run
 ```
 
-卖出实际收到 0.02、0.025 或 0.03 ETH，都只恢复 0.025 ETH 原始本金；差额进入 realized PnL，
-不会改变额度恢复数量。Gas 单独记录，不混入 token 数量。
+启动日志应为每条关系输出 `live_key_ready`，并输出一次 `live_relationships_ready`，其中包含
+relationship 数量和不同 follower 数量。
 
-## 6. 协议、资产和路径配置如何影响动作
+## 10. 当前限制和剩余风险
 
-聪明钱信号覆盖面可以宽于实际跟单范围。系统可能确认聪明钱确实通过某个聚合器买了 token，
-但只要当前 relationship 没允许其协议、资产或完整路径，就以相应原因拒绝：
+- 只有进程内 follower 锁，没有跨主机/跨进程租约；禁止重复启动操作相同钱包的实例。
+- 主动本地执行仅覆盖已实现且验证的 V2/V3/V4 路径；`allowed_protocols` 不等于自动实现所有寻路。
+- 0x、Kyber、Relay/Solver 当前主要是来源归因，不能直接复制其 calldata；OKX 客户端尚未接入
+  monitor 动态执行。
+- V4 token-input/Permit2、复杂 native 结算、手续费币和非标准 ERC-20 仍不是完整支持路径。
+- pending 超时、外部钱包交易、replacement 和长时间 RPC 故障仍需要执行审计与人工处置。
+- 自动重组恢复有深度上限，深重组需要显式规范链对账。
+- 实盘回执结算当前以受支持 ERC-20 exact-input 净差额为主，复杂费用和资产流仍可能拒绝为
+  `needs_review`。
 
-- `protocol_not_allowed`；
-- `asset_not_allowed`；
-- `route_not_allowed`。
-
-当前纸面实现使用信号对应的允许路径做实时固定区块报价，不会把聪明钱历史成交价当作跟单成交
-价。未来主网可以进一步设计“同路径执行”或“在受支持池中重新选最优路径”，但目前没有实现
-跨路径自动寻路，不能把这一计划写成已具备能力。
-
-## 7. 报价失败或市场变化时
-
-第一次报价通过后，系统事务化预留额度并创建 proposal；纸面成交前会做第二次报价。以下任一
-情况都会拒绝或取消，不写成功 fill，并释放尚未消耗的买入额度/卖出持仓预留：
-
-- 报价缺失或超过 `max_age_seconds`；
-- 相对聪明钱已验证成交价格恶化超过 `max_adverse_deviation_bps`；
-- 价格影响超过 `max_price_impact_bps`；
-- 第二次报价低于第一次计算的 slippage `minimum_amount_out_raw`；
-- 预计 Gas 超过 `max_gas_cost_wei`；
-- 输出小于 `min_amount_out_raw`；
-- 信号在重启恢复时已经缺失、孤块或移出允许范围。
-
-影子触发不会占用额度，因此也不存在需要释放的真实 proposal reservation。
-
-## 8. 当前明确不会做的事情
-
-- 不因为钱包收到 token 就跟买。
-- 不因为钱包转出 token 就跟卖。
-- 不把 bundle 中其他人的 Swap 归给聪明钱。
-- 不复制聪明钱的原始 calldata、nonce、recipient、deadline 或授权。
-- monitor 不自动 approve；独立人工命令最多精确授权该关系的 USDG 周期总额度，绝不无限授权。
-- 不处理未知路径后强行下单。
-- 默认只读模式不读取主网私钥、不签名、不广播；受控 mainnet_live 必须由数据库中 enabled、
-  `mainnet_live` 且行内确认仍为最新的 relationship 明确启用，并在每次签名和广播前重新核对该行及
-  配置快照。
-- 不承诺成交、收益、最终性或所有协议覆盖。
-
-## 9. 当前配置下的一条完整示例
-
-假设一条 enabled relationship 配置如下：
-
-```text
-主触发：evidenced
-影子触发：feed_intent、receipt_success
-ETH/WETH 买入：聪明钱实际输入的 10%
-USDG 买入：固定 5 USDG
-跟卖：聪明钱已验证卖出 token 数量的 10%
-ETH/WETH 周期额度：0.5 ETH
-USDG 周期额度：100 USDG
-允许：V3，WETH/USDG/TOKEN-A，指定 fee 的完整路径
-```
-
-运行结果示例：
-
-1. Feed 看见聪明钱计划用 1 ETH 买 TOKEN-A：只写 `feed_intent` 影子判断，不占额度。
-2. 回执成功但资金流尚未闭环：只写 `receipt_success` 影子判断，不占额度。
-3. 确认聪明钱实际支出 1 ETH、收到 TOKEN-A，且路径完全匹配：重新报价，计划跟买 0.1 ETH。
-4. 0.1 ETH 未超过剩余 0.5 ETH 额度：事务化预留 0.1 ETH 并创建 proposal。
-5. 第二次报价仍满足 minOut、滑点、影响和 Gas：当前写一笔 paper BUY fill 和 position lot。
-6. 聪明钱后来卖出其 40% TOKEN-A；若 10% sell rule 计算出的数量在该 lot 可用范围内，当前只
-   纸面卖出对应归因 lot，不动其他 TOKEN-A。
-7. 跟卖后按该 lot 实际卖出比例恢复原 ETH 本金，卖出收入与成本进入 realized PnL。
-
-如果第 3 步确认聪明钱走的是未允许的池、未知 hook 或 Solver 交付候选，流程停在观察/拒绝，
-不会为了“必须跟上聪明钱”而越过安全边界。
-
-## 10. 从当前纸面流程到主网还缺什么
-
-纸面 fill 不是链上成交。受控 mainnet_live 已具备 V2/V3/V4 构建、独立密钥门禁、精确 USDG
-授权、广播前复核、pending/receipt 跟踪与 ERC-20 余额差分结算，但仍需人工完成风险清单和真实
-小额证据。业务表的 `run_mode=mainnet_live` 仅用于人工看守测试；OKX 动态构建、复杂 native/手续费
-结算、自动重发以及生产级 Relay v3 迁移未完成，不得作为无人值守正式版本。
+这是一套有界、失败关闭的跟单执行流程，不承诺成交速度、协议全覆盖、盈利或 L1 最终性。
