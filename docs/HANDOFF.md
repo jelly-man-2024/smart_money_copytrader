@@ -553,3 +553,17 @@ Token approve 与 SELL 分别为
 `--watchlist data/mainnet_test_watchlist.csv`，否则默认 watchlist 不包含测试 smart wallet，进程会在
 任何签名之前退出。运维接手前应重新检查 screen/PID、日志最后一条 health、执行审计、余额/nonce；
 需要停止时先恢复 `var/EXECUTION_STOP`，再禁用 relationship 78 并终止精确 monitor PID。
+
+第四轮在同一常驻进程中再次完成 Relay BUY→Kyber/Relay SELL 闭环。源 BUY
+`0xf1b298eedcb00ba7bf82261ecea23e9ad8669f915025c6627808589d29693306`
+经两次 RelayNotReady 持久重试后关联成功；follower 以2 USDG通过已验证 V3 fee=3000池买入
+`38533793488645720533` raw Token，交易为
+`0xf1db6b9611e2b6d2843449b9d0b1d6ea9e93817a7901732c0d0f373d95dc81a6`。
+源全卖后，系统从唯一归因 lot 反转同一路径，先做有界 Token approve，再由
+`0x05ef728f046f4269ba534eb107a2e62af664e3cf530994617b48c5efa8e30c7f`
+卖出全部 follower 归因 Token并收回 `1988313` raw USDG。
+
+本轮 realized PnL 为 -0.011687 USDG（不含 Gas），lot closed，10 USDG额度全部恢复，链上目标
+Token余额/allowance均为0，latest/pending nonce均为13；执行审计8/8 confirmed且无 issue。monitor仍
+运行于 `smart_money_mainnet_live_78_kyber_retry2`，relationship 78仍enabled，完整公开证据继续写入
+`var/mainnet_live_78_20260913_kyber_retry2.log`。

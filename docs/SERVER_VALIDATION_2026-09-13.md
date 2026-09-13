@@ -329,3 +329,34 @@ plan/attempt，全部 confirmed，`healthy=true/issues=[]`；候选 complete，�
 `var/mainnet_live_78_20260913_kyber_retry2.log`；relationship 78 保持 enabled，急停文件暂存为
 `var/EXECUTION_STOP.continuous-kyber-20260913`。这是使用者要求的人工看守常驻状态，不代表无人值守
 上线验收或盈利保证。
+
+## 第四轮常驻测试：连续 Relay BUY/SELL
+
+常驻 monitor 捕获源 BUY
+`0xf1b298eedcb00ba7bf82261ecea23e9ad8669f915025c6627808589d29693306`。Relay 公共订单两次暂未就绪后
+经持久候选重试成功唯一关联，源目标入账为 `53440441097412968275` raw Token
+`0x385f4f8ae47651ce5f58f5265395a669f8281e18`。系统按跟单实际输入验证 V3 fee=3000 池
+`0x5d37b1d887b502594414a82d2cf7d4ef774a8027`，follower BUY
+`0xf1db6b9611e2b6d2843449b9d0b1d6ea9e93817a7901732c0d0f373d95dc81a6`
+在规范区块61663171成功；实际支付 `2000000` raw USDG，收到
+`38533793488645720533` raw Token，Gas=`13899377920000` wei。candidate attempts=3后 complete，
+proposal/fill 均已结算，唯一 open lot 与链上余额精确一致；预算 invested/available 为
+`2000000/8000000` raw USDG，执行审计7/7 confirmed且无 issue。
+
+源 SELL
+`0x57d0a6cf52b70ddcc08ddb35d6fa5747adffa0d31d96bc4d003fd8ab462b66fc`
+由 Kyber + Relay 完成，严格证据记录 smart wallet Token debit `53440441097412968275` raw 与 USDG
+deposit `2787250` raw。系统按来源全卖比例映射 follower 的唯一归因 lot，并反转该 lot 保存的 V3
+fee=3000路径。Token有界 approve
+`0x5ac0c870c3ba982f0cb2adae9256e81887fbe9bea6f18356f5f356f127d085e3`
+在规范区块61664128成功，授权精确归因数量 `38533793488645720533` raw；follower SELL
+`0x05ef728f046f4269ba534eb107a2e62af664e3cf530994617b48c5efa8e30c7f`
+在规范区块61664148成功，实际卖出全部归因 Token并收到 `1988313` raw USDG，SELL
+Gas=`11936486600000` wei。
+
+结算后 lot closed，principal/token remaining均为0，预算 reserved/invested/available为
+`0/0/10000000` raw USDG，realized PnL=`-11687` raw USDG（-0.011687 USDG，不含 BUY、approve和
+SELL的ETH Gas）。链上复核 USDG/Token余额为 `19690880/0` raw，Token allowance为0，ETH余额
+`4812658077970556` wei，latest/pending nonce均为13。执行审计8/8 attempt全部confirmed，
+`healthy=true/issues=[]`；候选complete，queue与pending/retry/failed均为0。原 screen、relationship
+和急停暂存状态不变，monitor继续常驻。
