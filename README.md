@@ -70,15 +70,24 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 .venv/bin/python scripts/validate_paper_readonly.py
 ```
 
-默认主触发为 `swap_evidenced`；也可为 Goal 1 的严格订单证据选择
-`relay_buy_evidenced` 或 `relay_sell_evidenced`。Feed 和 receipt 只作影子比较且不占额度。主触发通过后会再次
+默认主触发为 `swap_evidenced`；也可选择统一的 `evidenced`，接受严格的 direct swap、Relay BUY
+或 Relay SELL 证据。Feed 和 receipt 只作影子比较且不占额度。主触发通过后会再次
 取得固定区块的实时报价；只有第二次报价仍通过原始 `minOut`、时效、偏离、价格冲击和 Gas
-门控，才写入本地 paper fill。全过程没有签名、广播或真实订单。
-`allowed_routes` 必须逐条列出 V2 资产路径、V3 路径与 fee，或 V4 路径与
-fee/tickSpacing/hook/hookData；
-路径中的所有中间资产也必须出现在 `allowed_assets`。对 0x、Kyber 或 Relay Solver 源信号，
-同一配置还必须恰好包含一条首尾资产匹配的本地 V2/V3/V4 报价路径；程序保留源协议归因，
-但不会复用聪明钱的聚合器 calldata。路由方向对称，但换 fee、hook 或中间池
+门控，才写入本地 paper fill。`run_mode=paper` 全过程没有签名、广播或真实订单。显式的
+`mainnet_live` 测试模式只执行最终能严格验证为本地 V2/V3/V4 的路径，并且还要求 MySQL
+配置/账本、单条 live relationship、CLI 开关、三层进程开关和绑定配置快照的风险验收文件；
+普通启动仍然不会签名或广播。Relay 自动关联需显式传 `--relay-auto-associate`，它只使用订单
+做归因，再从同一回执发现并验证本地池，不复用源 calldata。confirmed live 回执会按规范块与
+follower ERC-20 净差额结算收益 lot；当前仍不能用于无人值守运行。具体见
+`docs/OPERATOR_RUNBOOK.md`。
+`allowed_assets` 是可信本金、结算币和中间路由币集合，不是可以买入的 token 白名单。
+对于回执已经形成严格兑换证据的 BUY，目标 token 动态放行；SELL 的来源 token 只有存在该
+relationship 的归因持仓 lot 才能卖。路径中的其他端点和所有中间资产仍必须出现在
+`allowed_assets`，未确认的 feed 意向不能获得动态放行。`allowed_routes` 可为空；其中列出的
+V2/V3/V4 路径只作为预配置本地路由（含 fee/tickSpacing/hook/hookData）。严格证据中的动态目标
+直连池或仅经过可信中间币的池不要求事先枚举 meme token 合约。对 0x、Kyber 或 Relay Solver 源信号，
+同一配置必须能得到唯一的本地 V2/V3/V4 报价路径；它既可来自预配置，也可来自同一 receipt
+经 factory 验证的唯一方向匹配池。程序保留源协议归因，但不会复用聪明钱的聚合器 calldata。路由方向对称，但换 fee、hook 或中间池
 都会得到不同 key 并被拒绝。
 
 跟卖只处置该 relationship 归因形成的 position lot。退出资产取该 lot 的原始本金资产：例如
@@ -220,12 +229,13 @@ VALUES ('0x公开地址', '0x私钥', FALSE);
 
 运行账号只拥有三列的 SELECT 权限。远程连接需设置
 `SMART_MONEY_KEY_MYSQL_HOST/PORT/USER/PASSWORD/DATABASE/SSL_CA`，非本机连接缺少 CA 会拒绝。
-远程 key MySQL 同样要求上述六项全部显式提供，不会回退到本机默认凭据。数据源当前需要同时
+远程 key MySQL 同样要求上述六项全部显式提供，不会回退到本机默认凭据。离线检查需要同时
 显式设置 `SMART_MONEY_EXECUTION_MODE=offline_test`、
 `SMART_MONEY_SIGNING_MODE=offline_test` 和 `SMART_MONEY_EMERGENCY_STOP=0` 才能访问，并且每次
 签名前检查 `SMART_MONEY_EMERGENCY_STOP_FILE`（默认 `var/EXECUTION_STOP`）不存在。运行期间创建
-该文件即可阻止下一次离线密钥读取/签名。只允许 chain ID 4663 的 type-2 离线签名；这些开关
-不要写进项目 `.env`。主网模式无论环境变量如何组合都固定拒绝，也没有广播入口。完整门槛见
+该文件即可阻止下一次密钥读取/签名。只允许 chain ID 4663 的 type-2 签名；这些开关不要写进
+项目 `.env`。`mainnet_live` 还需要独立 broadcast mode、chain ID、CLI 开关和绑定具体配置快照的
+风险验收文件，详见 [OPERATOR_RUNBOOK](docs/OPERATOR_RUNBOOK.md) 与
 [LIVE_RISK_CHECKLIST](docs/LIVE_RISK_CHECKLIST.md)。
 
 只检查某个公开钱包在 key DB 中是否存在/启用，而不读取私钥列：

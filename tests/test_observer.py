@@ -6,6 +6,8 @@ from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from dataclasses import replace
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -14,7 +16,7 @@ import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from eth_abi import decode, encode
 from eth_account import Account
@@ -22,7 +24,12 @@ from eth_utils import to_checksum_address
 
 from smart_money import registry as R
 from smart_money.account_state import prestate_implementations
+from smart_money.approval import (
+    approve_relationship_token, approve_relationship_usdg,
+    confirm_relationship_token_approval,
+)
 from smart_money.backfill import BlockScanner, ReorgDetected
+from smart_money.broadcast import MainnetBroadcaster
 from smart_money.cli import (
     LatencySamples, coverage_summary, dispatch_pending, execution_track,
     parser as cli_parser, relay_associate,
@@ -41,10 +48,12 @@ from smart_money.execution_pipeline import (
 )
 from smart_money.execution_receipts import ReadOnlyExecutionTracker
 from smart_money.execution_controls import (
-    require_mainnet_broadcast_enabled, require_offline_signing_enabled,
+    MAINNET_ACKNOWLEDGEMENT, require_mainnet_broadcast_enabled,
+    require_mainnet_signing_enabled, require_offline_signing_enabled,
 )
-from smart_money.key_source import OfflineDatabaseSigner, key_record_status
+from smart_money.key_source import LiveDatabaseSigner, OfflineDatabaseSigner, key_record_status
 from smart_money.ledger_migration import migrate_sqlite_ledger, sqlite_sha256
+from smart_money.live_settlement import settle_confirmed_execution, wallet_erc20_deltas
 from smart_money.models import Signal, Transaction
 from smart_money.mysql_config import (
     MySqlRelationshipGate, import_watchlist_relationships, load_mysql_paper_config,
@@ -52,10 +61,12 @@ from smart_money.mysql_config import (
 )
 from smart_money.mysql_store import MySqlConnectionCompat
 from smart_money.native_flows import verify_native_flows
-from smart_money.pools import verify_signal_pools
+from smart_money.okx import OkxError, OkxSwapClient
+from smart_money.pools import V3_SWAP, discover_v3_execution_route, verify_signal_pools
 from smart_money.paper import (
     AmountRule, PaperEngine, PaperExecutor, PaperValuator, budget_bucket,
-    planned_input_amount, reverse_quote_signal, scope_reason, signal_route_key,
+    execution_quote_signal, planned_input_amount, reverse_quote_signal,
+    scope_reason, signal_route_key,
     trigger_allowed,
 )
 from smart_money.paper_config import load_paper_config
@@ -64,6 +75,7 @@ from smart_money.receipts import (
     BEFORE, DEPOSIT_RECORDED, SWAPS, TRANSFER, USEROP, TRADE_BEHAVIORS, enrich,
 )
 from smart_money.rpc import ReadOnlyRpc
+from smart_money.relay_api import RelayNotReady, RelayPublicClient
 from smart_money.solver import relay_delivery_evidence, relay_passive_buy
 from smart_money.store import MAX_CANDIDATE_ATTEMPTS, Store
 
@@ -740,6 +752,71 @@ class PoolVerificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(checks[signal.event_id]["verified"])
         self.assertEqual(checks[signal.event_id]["pools"][0]["address"], pool)
 
+    async def test_delivery_receipt_selects_one_directional_verified_v3_route(self):
+        pool = "0x" + "44" * 20
+        swap = log(pool, [V3_SWAP, "0x" + "01" * 32, "0x" + "02" * 32],
+                   "0x" + encode(
+                       ["int256", "int256", "uint160", "uint128", "int24"],
+                       [100, -90, 1, 1, 1]).hex())
+
+        async def rpc_call(method, params=None):
+            if method == "eth_getCode":
+                self.assertEqual(params, [pool, "0x1"])
+                return "0x01"
+            target, data = params[0]["to"], params[0]["data"][:10]
+            self.assertEqual(params[1], "0x1")
+            if target == R.V3_FACTORY:
+                return self.encoded_address(pool)
+            if data == "0x0dfe1681":
+                return self.encoded_address(R.USDG)
+            if data == "0xd21220a7":
+                return self.encoded_address(TOKEN)
+            return "0x" + encode(["uint24"], [3000]).hex()
+
+        route = await discover_v3_execution_route(
+            AsyncMock(call=AsyncMock(side_effect=rpc_call)), receipt([swap]),
+            R.USDG, TOKEN, "90")
+        self.assertEqual(route["assets"], [R.USDG, TOKEN])
+        self.assertEqual(route["fees"], [3000])
+        self.assertEqual(route["verified_pool"], pool)
+
+        with self.assertRaisesRegex(ValueError, "does not select one"):
+            await discover_v3_execution_route(
+                AsyncMock(call=AsyncMock(side_effect=rpc_call)), receipt([swap]),
+                TOKEN, R.USDG, "90")
+
+    async def test_confirmed_live_buy_settles_from_canonical_wallet_deltas(self):
+        follower = A
+        tx_hash = TXHASH
+        execution_receipt = receipt([
+            transfer(R.USDG, follower, R.V3_ROUTER, 100),
+            transfer(TOKEN, B, follower, 90),
+        ])
+        execution_receipt.update({"gasUsed": "0x5208", "effectiveGasPrice": "0x2"})
+        header = {"hash": execution_receipt["blockHash"], "timestamp": "0x64"}
+        rpc = AsyncMock(call=AsyncMock(side_effect=[execution_receipt, header]))
+        store = MagicMock()
+        store.paper_proposal.return_value = {
+            "status": "reserved", "input_asset": R.USDG,
+            "output_asset": TOKEN, "amount_in_raw": "100",
+            "attribution": {"follower_wallet": follower, "source_behavior": "BUY"},
+        }
+        store.execution_plan.return_value = {
+            "plan_id": "plan-1", "status": "signed",
+            "unsigned_plan": {"quote_observed_at": 50.0},
+        }
+        store.execution_attempts.return_value = [{
+            "tx_hash": tx_hash, "status": "confirmed",
+            "block_number": 1, "block_hash": execution_receipt["blockHash"],
+        }]
+        store.fill_paper_buy.return_value = True
+        result = await settle_confirmed_execution(store, rpc, "proposal-1", tx_hash)
+        self.assertEqual((result["actual_input_raw"], result["actual_output_raw"]),
+                         ("100", "90"))
+        self.assertEqual(wallet_erc20_deltas(execution_receipt, follower),
+                         {R.USDG: -100, TOKEN: 90})
+        store.fill_paper_buy.assert_called_once()
+
     async def test_forged_pool_token_pair_is_rejected(self):
         signal = Decoder({A: {}}).decode(tx(v2_swap(), R.V2_ROUTER))[0]
         pool = "0x" + "44" * 20
@@ -865,6 +942,30 @@ class FixtureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not owned"):
             relay_passive_buy(document, candidate)
 
+    def test_solana_usdc_relay_buy_uses_top_level_order_data_and_local_usdg(self):
+        candidate = passive_candidate()
+        document = relay_buy_document()
+        request = document["requests"][0]
+        origin = request["protocol"]["deposit"]["origin"]
+        source_tx = "solana-signature-case-sensitive"
+        source_user = "SolanaWalletCaseSensitive"
+        origin.update({
+            "chainId": 792703809,
+            "currency": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "depositor": source_user,
+            "transactionId": source_tx,
+        })
+        request["user"] = source_user
+        request["data"]["inTxs"] = [{
+            "hash": source_tx, "chainId": 792703809, "status": "success",
+        }]
+        request["orderData"] = request["protocol"].pop("orderData")
+        signal = relay_passive_buy(document, candidate)
+        self.assertEqual(signal.token_in, R.USDG)
+        self.assertEqual(signal.evidence["source_currency"], origin["currency"])
+        self.assertEqual(signal.evidence["source_payer"], source_user)
+        self.assertIn("operator_approved", signal.evidence["funding_normalization"])
+
     def test_passive_credit_without_relay_order_remains_candidate(self):
         candidate = passive_candidate()
         with self.assertRaisesRegex(ValueError, "not unique"):
@@ -946,6 +1047,45 @@ class FixtureTests(unittest.TestCase):
 
 
 class QuoteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_evidenced_dynamic_meme_buy_reaches_budget_reservation(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-dynamic', 'test')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        signal = Signal(
+            TXHASH, A, 'direct', 'BUY', 'call', R.V3_ROUTER, '0x',
+            stage='swap_evidenced', execution_status='success', protocol='v3',
+            token_in=R.USDG, token_out=TOKEN, exact_in=True,
+            evidence={
+                'actual_input_debit_raw': '1000',
+                'actual_output_credit_raw': '2000',
+                'hops': [{'token_in': R.USDG, 'token_out': TOKEN, 'fee': 3000}],
+            })
+
+        class Quoter:
+            async def quote_with_reference(self, source, amount):
+                quote = Quote('v3', R.V3_QUOTER, 1, '0x' + 'aa' * 32, 100.0,
+                              R.USDG, TOKEN, amount, '198')
+                reference = Quote('v3', R.V3_QUOTER, 1, '0x' + 'aa' * 32, 100.0,
+                                  R.USDG, TOKEN, '10', '20')
+                return quote, reference, '100'
+
+        engine = PaperEngine(
+            store, Quoter(), QuotePolicy(max_adverse_deviation_bps=200,
+                                         max_price_impact_bps=200,
+                                         max_gas_cost_wei='40000000'),
+            'dynamic-target-v1', 'swap_evidenced', frozenset({'v3'}),
+            frozenset({R.NATIVE, R.WETH, R.USDG}), frozenset(),
+        )
+        decision = await engine.propose_buy(
+            signal, AmountRule('proportional', ratio_ppm=100_000), now=101)
+        self.assertTrue(decision.accepted)
+        proposal = store.paper_proposal(decision.proposal_id)
+        self.assertEqual((proposal['input_asset'], proposal['output_asset'],
+                          proposal['amount_in_raw'], proposal['status']),
+                         (R.USDG, TOKEN, '100', 'reserved'))
+        self.assertEqual(store.paper_budget(A, 'USDG')['reserved_raw'], '100')
+        store.close()
+
     async def test_relay_sell_exits_to_lot_principal_and_restores_that_cap(self):
         store = Store(':memory:')
         store.start_paper_budget_cycle('manual-relay', 'operator_started')
@@ -956,7 +1096,10 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
             'trigger_mode': 'relay_buy_evidenced', 'strategy_version': 'paper-v1',
             'input_asset': R.NATIVE, 'output_asset': TOKEN,
             'budget_bucket': 'ETH_WETH', 'amount_in_raw': '400',
-            'attribution': {'smart_wallet': A},
+            'attribution': {
+                'smart_wallet': A, 'source_event_id': 'relay-buy-event',
+                'source_amount_out_raw': '2000',
+            },
         })
         store.fill_paper_buy('relay-buy-p', {
             'order_id': 'relay-buy-o', 'fill_id': 'relay-buy-f', 'lot_id': 'relay-lot',
@@ -1003,6 +1146,72 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
                          (R.NATIVE, '200', '240', '40'))
         store.close()
 
+    async def test_relay_sell_reuses_verified_route_from_attributed_buy_lot(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-relay-route', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '10000')
+        buy_source = Signal(
+            TXHASH, A, 'third_party', 'BUY', 'incoming', R.RELAY_ROUTER, '0x',
+            stage='relay_buy_evidenced', execution_status='success',
+            token_in=R.USDG, token_out=TOKEN, protocol='relay_solver',
+            evidence={
+                'actual_input_debit_raw': '1500',
+                'actual_output_credit_raw': '3000',
+                'local_execution_route': {
+                    'protocol': 'v3', 'assets': [R.USDG, TOKEN],
+                    'fees': [3000], 'verified_pool': '0x' + '44' * 20,
+                    'verified_block_number': '10',
+                },
+            })
+        store.put(buy_source)
+        store.reserve_paper_proposal({
+            'proposal_id': 'relay-route-buy-p',
+            'source_event_id': buy_source.event_id,
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.USDG, 'output_asset': TOKEN,
+            'budget_bucket': 'USDG', 'amount_in_raw': '1000',
+            'attribution': {
+                'smart_wallet': A, 'source_event_id': buy_source.event_id,
+                'source_amount_out_raw': '3000',
+            },
+        })
+        store.fill_paper_buy('relay-route-buy-p', {
+            'order_id': 'relay-route-buy-o', 'fill_id': 'relay-route-buy-f',
+            'lot_id': 'relay-route-lot', 'amount_out_raw': '2000',
+            'fee_asset': R.USDG, 'fee_amount_raw': '0', 'gas_cost_wei': '1',
+            'quote_observed_at': '2026-09-13T00:00:00Z',
+            'filled_at': '2026-09-13T00:00:01Z',
+        })
+        sell = Signal(
+            '0x' + '77' * 32, A, 'third_party', 'SELL', 'call', R.RELAY_ROUTER,
+            '0x', stage='relay_sell_evidenced', execution_status='success',
+            token_in=TOKEN, token_out=R.USDG, protocol='0x',
+            evidence={'actual_input_debit_raw': '3000',
+                      'actual_output_credit_raw': '1500'})
+
+        class Quoter:
+            async def quote_with_reference(self, source, amount):
+                self.source, self.amount = source, amount
+                return (Quote('v3', R.V3_QUOTER, 10, '0x' + 'ab' * 32, 100.0,
+                              TOKEN, R.USDG, amount, '1000'),
+                        Quote('v3', R.V3_QUOTER, 10, '0x' + 'ab' * 32, 100.0,
+                              TOKEN, R.USDG, '100', '50'), '100')
+
+        quoter = Quoter()
+        decision = await PaperEngine(
+            store, quoter, QuotePolicy(max_price_impact_bps=200,
+                                       max_gas_cost_wei='30000000'),
+            'paper-v1', 'evidenced', execution_routes=()).propose_sell(
+                sell, AmountRule('proportional', ratio_ppm=1_000_000), now=101)
+        self.assertTrue(decision.accepted)
+        self.assertEqual((quoter.source.protocol, quoter.source.token_in,
+                          quoter.source.token_out, quoter.amount),
+                         ('v3', TOKEN, R.USDG, '2000'))
+        self.assertEqual(sell.evidence['local_execution_route']['verified_pool'],
+                         '0x' + '44' * 20)
+        store.close()
+
     async def test_relay_buy_uses_configured_local_v3_route_for_paper_quote(self):
         store = Store(':memory:')
         store.start_paper_budget_cycle('manual-relay', 'operator_started')
@@ -1044,6 +1253,113 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
                          'relay_buy_evidenced')
         self.assertFalse(signal.copy_eligible)
         store.close()
+
+    async def test_relay_buy_discovers_and_persists_bounded_v3_route_for_planned_amount(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-relay-discovery', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '1000')
+        signal = Signal(
+            TXHASH, A, 'third_party', 'BUY', 'incoming', R.RELAY_ROUTER,
+            '0xcd6e13f7', stage='relay_buy_evidenced', execution_status='success',
+            execution_success=True, token_in=R.USDG, token_out=TOKEN,
+            protocol='relay_solver', evidence={
+                'actual_input_debit_raw': '500',
+                'actual_output_credit_raw': '1000',
+            })
+        store.put(signal)
+
+        class Quoter:
+            async def discover_v3_route(self, source, amount):
+                self.discovery = (source.event_id, amount)
+                return {
+                    'protocol': 'v3', 'assets': [R.USDG, TOKEN], 'fees': [500],
+                    'verified_pool': '0x' + '44' * 20,
+                    'verified_block_number': '100',
+                    'route_discovery': 'v3_factory_bounded_best_quote',
+                }
+
+            async def quote_with_reference(self, source, amount):
+                self.source = source
+                return (Quote('v3', R.V3_QUOTER, 100, '0x' + 'ab' * 32, 100.0,
+                              R.USDG, TOKEN, amount, '220'),
+                        Quote('v3', R.V3_QUOTER, 100, '0x' + 'ab' * 32, 100.0,
+                              R.USDG, TOKEN, '1', '2'), '100')
+
+        quoter = Quoter()
+        engine = PaperEngine(
+            store, quoter, QuotePolicy(max_adverse_deviation_bps=200,
+                                       max_price_impact_bps=200,
+                                       max_gas_cost_wei='40000000'),
+            'paper-relay-discovery-v1', 'relay_buy_evidenced',
+            frozenset({'relay_solver'}), frozenset({R.USDG}),
+            execution_routes=())
+        decision = await engine.propose_buy(
+            signal, AmountRule('fixed', fixed_amount_raw='100'), now=101)
+        self.assertTrue(decision.accepted)
+        self.assertEqual(quoter.discovery, (signal.event_id, '100'))
+        self.assertEqual((quoter.source.protocol, quoter.source.evidence['hops']),
+                         ('v3', [{'token_in': R.USDG,
+                                  'token_out': TOKEN, 'fee': 500}]))
+        persisted = store.signal(signal.event_id)
+        self.assertEqual(persisted.evidence['local_execution_route']['verified_pool'],
+                         '0x' + '44' * 20)
+        proposal = store.paper_proposal(decision.proposal_id)
+        self.assertEqual(proposal['attribution']['local_execution_route']['fees'], [500])
+        store.close()
+
+    async def test_live_quoter_discovers_best_verified_direct_v3_standard_fee_pool(self):
+        pool500 = '0x' + '44' * 20
+        pool3000 = '0x' + '55' * 20
+        pools = {500: pool500, 3000: pool3000}
+        calls = []
+
+        class Rpc:
+            async def call(self, method, params=None):
+                calls.append((method, params))
+                if method == 'eth_getBlockByNumber':
+                    return {'number': '0x64', 'hash': '0x' + 'ab' * 32}
+                if method == 'eth_getCode':
+                    return '0x01'
+                target = params[0]['to']
+                data = bytes.fromhex(params[0]['data'][2:])
+                if target == R.V3_FACTORY:
+                    fee = decode(['address', 'address', 'uint24'], data[4:])[2]
+                    if fee == 100:
+                        return '0x'
+                    return '0x' + encode(
+                        ['address'], [pools.get(fee, R.NATIVE)]).hex()
+                if target in pools.values():
+                    if data[:4] == selector('token0()'):
+                        return '0x' + encode(['address'], [TOKEN]).hex()
+                    if data[:4] == selector('token1()'):
+                        return '0x' + encode(['address'], [R.USDG]).hex()
+                    if data[:4] == selector('fee()'):
+                        fee = next(key for key, value in pools.items()
+                                   if value == target)
+                        return '0x' + encode(['uint24'], [fee]).hex()
+                if target == R.V3_QUOTER:
+                    path, amount = decode(['bytes', 'uint256'], data[4:])
+                    fee = int.from_bytes(path[20:23], 'big')
+                    outputs = {500: 220, 3000: 210}
+                    self.amount = amount
+                    return '0x' + encode(['uint256'], [outputs[fee]]).hex()
+                raise AssertionError((method, target, data[:4].hex()))
+
+        rpc = Rpc()
+        signal = Signal(
+            TXHASH, A, 'third_party', 'BUY', 'incoming', R.RELAY_ROUTER, '0x',
+            stage='relay_buy_evidenced', execution_status='success',
+            execution_success=True, token_in=R.USDG, token_out=TOKEN,
+            protocol='relay_solver')
+        route = await LiveQuoter(rpc).discover_v3_route(signal, '100')
+        self.assertEqual((route['fees'], route['verified_pool'],
+                          route['route_discovery_amount_out_raw']),
+                         ([500], pool500, '220'))
+        self.assertEqual(route['evaluated_fee_tiers'], [100, 500, 3000, 10000])
+        self.assertEqual(rpc.amount, 100)
+        block_calls = [params for method, params in calls
+                       if method in {'eth_call', 'eth_getCode'}]
+        self.assertTrue(all(params[-1] == '0x64' for params in block_calls))
 
     async def test_live_quoter_pins_v2_v3_v4_calls_to_observed_block(self):
         calls = []
@@ -1434,7 +1750,10 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
             'trigger_mode': 'swap_evidenced', 'strategy_version': 'paper-v1',
             'input_asset': R.USDG, 'output_asset': TOKEN,
             'budget_bucket': 'USDG', 'amount_in_raw': '250',
-            'attribution': {'smart_wallet': A},
+            'attribution': {
+                'smart_wallet': A, 'source_event_id': 'buy-event',
+                'source_amount_out_raw': '5000',
+            },
         }
         store.reserve_paper_proposal(buy)
         store.fill_paper_buy('buy-p', {
@@ -1474,6 +1793,72 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SafetyTests(unittest.TestCase):
+    @staticmethod
+    def _okx_swap_document(**changes):
+        document = {
+            'code': '0',
+            'data': [{
+                'routerResult': {
+                    'chainIndex': str(R.CHAIN_ID),
+                    'fromTokenAmount': '100', 'toTokenAmount': '200',
+                    'fromToken': {'tokenContractAddress': R.USDG},
+                    'toToken': {'tokenContractAddress': TOKEN},
+                },
+                'tx': {
+                    'from': B, 'to': R.OKX_ROUTER, 'value': '0',
+                    'data': '0x12345678', 'gas': '300000', 'gasPrice': '10',
+                    'minReceiveAmount': '190',
+                },
+            }],
+        }
+        for path, value in changes.items():
+            target = document
+            parts = path.split('__')
+            for part in parts[:-1]:
+                target = target[int(part)] if part.isdecimal() else target[part]
+            target[parts[-1]] = value
+        return document
+
+    def test_okx_swap_response_is_strict_and_credentials_are_not_evidence(self):
+        client = OkxSwapClient('api-key', 'secret-key', 'passphrase')
+        document = self._okx_swap_document()
+        swap = client._parse(
+            document, R.USDG, TOKEN, '100', B, 100.0, 'ab' * 32,
+            frozenset({R.OKX_ROUTER}))
+        self.assertEqual((swap.to, swap.amount_out_raw,
+                          swap.minimum_amount_out_raw, swap.value_raw),
+                         (R.OKX_ROUTER, '200', '190', '0'))
+        serialized = json.dumps(swap.public_evidence(), sort_keys=True)
+        self.assertNotIn('api-key', serialized)
+        self.assertNotIn('secret-key', serialized)
+        self.assertNotIn('passphrase', serialized)
+
+        for change in (
+                {'data__0__tx__from': A},
+                {'data__0__tx__to': A},
+                {'data__0__routerResult__chainIndex': '1'},
+                {'data__0__routerResult__fromTokenAmount': '101'},
+                {'data__0__tx__minReceiveAmount': '201'}):
+            with self.subTest(change=change), self.assertRaises(OkxError):
+                client._parse(
+                    self._okx_swap_document(**change), R.USDG, TOKEN, '100', B,
+                    100.0, 'ab' * 32, frozenset({R.OKX_ROUTER}))
+
+    def test_okx_client_requires_credentials_and_signs_exact_query(self):
+        with patch.dict(os.environ, {}, clear=True), self.assertRaisesRegex(
+                ValueError, 'credentials are incomplete'):
+            OkxSwapClient()
+        client = OkxSwapClient('key', 'secret', 'phrase', 'project')
+        headers = client._headers(
+            '2026-09-13T00:00:00.000Z',
+            '/api/v6/dex/aggregator/swap?chainIndex=4663&amount=100')
+        expected = base64.b64encode(hmac.new(
+            b'secret',
+            b'2026-09-13T00:00:00.000ZGET/api/v6/dex/aggregator/swap?chainIndex=4663&amount=100',
+            hashlib.sha256).digest()).decode()
+        self.assertEqual(headers['OK-ACCESS-SIGN'], expected)
+        self.assertEqual(headers['OK-ACCESS-PROJECT'], 'project')
+
     @staticmethod
     def _signed_execution_store(tx_hash='0x' + '91' * 32, path=':memory:'):
         store = Store(path)
@@ -2250,7 +2635,61 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(status['enabled'])
         self.assertFalse(status['private_key_read'])
 
-    def test_execution_process_controls_require_three_offline_switches_and_never_mainnet(self):
+    def test_live_database_signer_is_bound_to_relationship_snapshot(self):
+        account = Account.create()
+        follower = account.address.lower()
+
+        class Cursor:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def execute(self, sql, params): self.sql, self.params = sql, params
+            def fetchall(self):
+                return [{'private_key_hex': '0x' + account.key.hex()}]
+
+        class Connection:
+            def cursor(self): return Cursor()
+            def close(self): pass
+
+        transaction = {
+            'chainId': R.CHAIN_ID, 'nonce': 0, 'to': to_checksum_address(A),
+            'value': 0, 'data': '0x', 'gas': 21000, 'maxFeePerGas': 2,
+            'maxPriorityFeePerGas': 1, 'type': 2,
+        }
+        signer = LiveDatabaseSigner(follower, '42', 'ab' * 32)
+        with patch.dict(os.environ, {}, clear=True), patch(
+                'smart_money.key_source._key_connection') as connection:
+            with self.assertRaises(PermissionError):
+                signer.sign_transaction(transaction)
+            connection.assert_not_called()
+        with tempfile.TemporaryDirectory() as folder:
+            acceptance = Path(folder) / 'risk.json'
+            acceptance.write_text(json.dumps({
+                'version': 1, 'chain_id': R.CHAIN_ID,
+                'follower_wallet': follower, 'relationship_id': '42',
+                'config_snapshot_hash': 'ab' * 32,
+                'acknowledgement': MAINNET_ACKNOWLEDGEMENT,
+            }))
+            acceptance.chmod(0o600)
+            live = {
+                'SMART_MONEY_EMERGENCY_STOP': '0',
+                'SMART_MONEY_EXECUTION_MODE': 'mainnet_live',
+                'SMART_MONEY_SIGNING_MODE': 'mainnet_live',
+                'SMART_MONEY_MAINNET_CHAIN_ID': str(R.CHAIN_ID),
+                'SMART_MONEY_MAINNET_RISK_ACK_FILE': str(acceptance),
+            }
+            with patch.dict(os.environ, live, clear=True), patch(
+                    'smart_money.key_source._key_connection',
+                    return_value=Connection()):
+                raw = signer.sign_transaction(transaction)
+            self.assertEqual(Account.recover_transaction(raw).lower(), follower)
+            wrong = LiveDatabaseSigner(follower, '43', 'ab' * 32)
+            with patch.dict(os.environ, live, clear=True), patch(
+                    'smart_money.key_source._key_connection') as connection:
+                with self.assertRaisesRegex(PermissionError, 'does not match'):
+                    wrong.sign_transaction(transaction)
+                connection.assert_not_called()
+
+    def test_execution_process_controls_require_explicit_bound_mainnet_acceptance(self):
         with patch.dict(os.environ, {}, clear=False):
             for key in OFFLINE_ENV:
                 os.environ.pop(key, None)
@@ -2273,14 +2712,90 @@ class SafetyTests(unittest.TestCase):
             }, clear=True):
                 with self.assertRaisesRegex(PermissionError, 'stop file'):
                     require_offline_signing_enabled()
-        with patch.dict(os.environ, {
-                'SMART_MONEY_EXECUTION_MODE': 'mainnet',
-                'SMART_MONEY_SIGNING_MODE': 'mainnet',
-                'SMART_MONEY_BROADCAST_ENABLED': '1',
+        with tempfile.TemporaryDirectory() as folder:
+            acceptance = Path(folder) / 'risk.json'
+            acceptance.write_text(json.dumps({
+                'version': 1, 'chain_id': R.CHAIN_ID,
+                'follower_wallet': B, 'relationship_id': '42',
+                'config_snapshot_hash': 'ab' * 32,
+                'acknowledgement': MAINNET_ACKNOWLEDGEMENT,
+            }))
+            acceptance.chmod(0o600)
+            live = {
                 'SMART_MONEY_EMERGENCY_STOP': '0',
-        }, clear=True):
-            with self.assertRaisesRegex(PermissionError, 'not implemented or authorized'):
-                require_mainnet_broadcast_enabled()
+                'SMART_MONEY_EXECUTION_MODE': 'mainnet_live',
+                'SMART_MONEY_SIGNING_MODE': 'mainnet_live',
+                'SMART_MONEY_BROADCAST_MODE': 'mainnet_live',
+                'SMART_MONEY_MAINNET_CHAIN_ID': str(R.CHAIN_ID),
+                'SMART_MONEY_MAINNET_RISK_ACK_FILE': str(acceptance),
+            }
+            for missing in live:
+                values = dict(live)
+                values.pop(missing)
+                with patch.dict(os.environ, values, clear=True):
+                    with self.assertRaises(PermissionError):
+                        require_mainnet_broadcast_enabled(B, '42', 'ab' * 32)
+            with patch.dict(os.environ, live, clear=True):
+                evidence = require_mainnet_signing_enabled(B, '42', 'ab' * 32)
+                self.assertEqual(evidence['follower_wallet'], B)
+                require_mainnet_broadcast_enabled(B, '42', 'ab' * 32)
+                with self.assertRaisesRegex(PermissionError, 'does not match'):
+                    require_mainnet_broadcast_enabled(A, '42', 'ab' * 32)
+
+    def test_mainnet_broadcaster_is_separate_hash_checked_and_default_closed(self):
+        account = Account.create()
+        follower = account.address.lower()
+        transaction = {
+            'chainId': R.CHAIN_ID, 'nonce': 0, 'to': to_checksum_address(A),
+            'value': 0, 'data': '0x', 'gas': 21000, 'maxFeePerGas': 2,
+            'maxPriorityFeePerGas': 1, 'type': 2,
+        }
+        raw = bytes(account.sign_transaction(transaction).raw_transaction)
+        from eth_utils import keccak
+        tx_hash = '0x' + keccak(raw).hex()
+        review = SimpleNamespace(
+            proposal_id='proposal-live', signed_tx_hash=tx_hash,
+            evidence={'broadcast_performed': False})
+        broadcaster = MainnetBroadcaster('https://rpc.example')
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(PermissionError):
+            asyncio.run(broadcaster.broadcast(
+                review, raw, follower_wallet=follower, relationship_id='42',
+                config_snapshot_hash='ab' * 32))
+
+        with tempfile.TemporaryDirectory() as folder:
+            acceptance = Path(folder) / 'risk.json'
+            acceptance.write_text(json.dumps({
+                'version': 1, 'chain_id': R.CHAIN_ID,
+                'follower_wallet': follower, 'relationship_id': '42',
+                'config_snapshot_hash': 'ab' * 32,
+                'acknowledgement': MAINNET_ACKNOWLEDGEMENT,
+            }))
+            acceptance.chmod(0o600)
+            live = {
+                'SMART_MONEY_EMERGENCY_STOP': '0',
+                'SMART_MONEY_EXECUTION_MODE': 'mainnet_live',
+                'SMART_MONEY_SIGNING_MODE': 'mainnet_live',
+                'SMART_MONEY_BROADCAST_MODE': 'mainnet_live',
+                'SMART_MONEY_MAINNET_CHAIN_ID': str(R.CHAIN_ID),
+                'SMART_MONEY_MAINNET_RISK_ACK_FILE': str(acceptance),
+            }
+            with patch.dict(os.environ, live, clear=True), patch(
+                    'smart_money.broadcast.asyncio.to_thread',
+                    new=AsyncMock(return_value=tx_hash)) as send:
+                result = asyncio.run(broadcaster.broadcast(
+                    review, raw, follower_wallet=follower, relationship_id='42',
+                    config_snapshot_hash='ab' * 32))
+            self.assertTrue(result.submitted)
+            self.assertEqual(result.tx_hash, tx_hash)
+            send.assert_awaited_once_with(broadcaster._request, '0x' + raw.hex())
+
+            with patch.dict(os.environ, live, clear=True), patch(
+                    'smart_money.broadcast.asyncio.to_thread',
+                    new=AsyncMock(return_value='0x' + 'ff' * 32)), \
+                    self.assertRaisesRegex(RuntimeError, 'different transaction hash'):
+                asyncio.run(broadcaster.broadcast(
+                    review, raw, follower_wallet=follower, relationship_id='42',
+                    config_snapshot_hash='ab' * 32))
 
     def test_final_execution_review_rejects_secret_or_raw_transaction_fields(self):
         store = Store(':memory:')
@@ -2289,6 +2804,135 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'invalid final execution review'):
                 store.mark_execution_plan_signed('missing', 'missing', tx_hash, evidence)
         store.close()
+
+    def test_usdg_approval_is_200x_budget_bounded_and_relationship_gated(self):
+        policy = SimpleNamespace(
+            run_mode='mainnet_live', follower_wallet=B, relationship_id='42',
+            wallet=A, snapshot_hash='ab' * 32,
+            allowed_assets=frozenset({R.USDG}),
+            budget_limits={'USDG': '10000000'},
+            quote_policy=QuotePolicy(max_gas_cost_wei='1000000000000000'),
+        )
+        gate = MagicMock()
+        broadcaster = SimpleNamespace(broadcast=AsyncMock(return_value=SimpleNamespace(
+            tx_hash='0x' + '99' * 32)))
+
+        class Rpc:
+            async def call(self, method, params=None):
+                if method == 'eth_call' and params[0].get('from'):
+                    return '0x1'
+                return {
+                    'eth_call': '0x0', 'eth_getCode': '0x6000',
+                    'eth_getTransactionCount': '0x3',
+                    'eth_gasPrice': '0x64', 'eth_getBalance': hex(10 ** 18),
+                }[method]
+
+        class Signer:
+            def __init__(self, wallet, relationship, snapshot):
+                self.identity = wallet, relationship, snapshot
+
+            def sign_transaction(self, transaction):
+                self.transaction = transaction
+                return b'signed-approval'
+
+        result = asyncio.run(approve_relationship_usdg(
+            policy, Rpc(), gate, broadcaster, signer_factory=Signer))
+        self.assertTrue(result.submitted)
+        self.assertEqual(result.amount_raw, '2000000000')
+        gate.validate.assert_called_once_with('42', B, A, 'ab' * 32)
+        review, raw = broadcaster.broadcast.await_args.args
+        self.assertEqual(raw, b'signed-approval')
+        self.assertEqual(review.evidence['amount_raw'], '2000000000')
+        self.assertEqual(review.evidence['spender'], R.V3_ROUTER)
+
+        already = AsyncMock(call=AsyncMock(return_value=hex(2000000000)))
+        no_submit = asyncio.run(approve_relationship_usdg(
+            policy, already, gate, broadcaster, signer_factory=Signer))
+        self.assertFalse(no_submit.submitted)
+        self.assertIsNone(no_submit.tx_hash)
+
+        spent_but_sufficient = AsyncMock(
+            call=AsyncMock(return_value=hex(1998000000)))
+        no_top_up = asyncio.run(approve_relationship_usdg(
+            policy, spent_but_sufficient, gate, broadcaster,
+            signer_factory=Signer, minimum_required_raw='2000000'))
+        self.assertFalse(no_top_up.submitted)
+        self.assertEqual((no_top_up.amount_raw, no_top_up.previous_allowance_raw),
+                         ('2000000000', '1998000000'))
+
+    def test_dynamic_sell_token_approval_is_position_bounded_and_confirmed(self):
+        policy = SimpleNamespace(
+            run_mode='mainnet_live', follower_wallet=B, relationship_id='42',
+            wallet=A, snapshot_hash='ab' * 32,
+            quote_policy=QuotePolicy(max_gas_cost_wei='1000000000000000'),
+        )
+        tx_hash = '0x' + '99' * 32
+        block_hash = '0x' + '88' * 32
+        gate = MagicMock()
+        broadcaster = SimpleNamespace(broadcast=AsyncMock(return_value=SimpleNamespace(
+            tx_hash=tx_hash)))
+
+        class Rpc:
+            def __init__(self):
+                self.allowance = 7
+
+            async def call(self, method, params=None):
+                if method == 'eth_getCode':
+                    return '0x6000'
+                if method == 'eth_call' and params[0].get('from'):
+                    return '0x1'
+                if method == 'eth_call':
+                    return hex(self.allowance)
+                if method == 'eth_getTransactionCount':
+                    return '0x3'
+                if method == 'eth_gasPrice':
+                    return '0x64'
+                if method == 'eth_getBalance':
+                    return hex(10 ** 18)
+                if method == 'eth_getBlockByNumber':
+                    return {'hash': block_hash}
+                raise AssertionError(method)
+
+            async def receipt(self, tx, attempts=8, interval=.25):
+                self.allowance = 5000
+                return {'transactionHash': tx, 'status': '0x1',
+                        'blockNumber': '0x12', 'blockHash': block_hash}
+
+        class Signer:
+            def __init__(self, wallet, relationship, snapshot):
+                pass
+
+            def sign_transaction(self, transaction):
+                return b'signed-token-approval'
+
+        rpc = Rpc()
+        result = asyncio.run(approve_relationship_token(
+            policy, rpc, gate, broadcaster, TOKEN, '5000', R.V3_ROUTER,
+            signer_factory=Signer))
+        self.assertTrue(result.submitted)
+        self.assertEqual((result.asset, result.amount_raw,
+                          result.previous_allowance_raw), (TOKEN, '5000', '7'))
+        confirmation = asyncio.run(confirm_relationship_token_approval(
+            rpc, result, B))
+        self.assertEqual((confirmation['allowance_raw'], confirmation['block_number']),
+                         ('5000', 18))
+        gate.validate.assert_called_once_with('42', B, A, 'ab' * 32)
+
+        gate.reset_mock()
+        broadcaster.broadcast.reset_mock()
+        rpc.allowance = 4000
+        no_top_up = asyncio.run(approve_relationship_token(
+            policy, rpc, gate, broadcaster, TOKEN, '5000', R.V3_ROUTER,
+            signer_factory=Signer, minimum_required_raw='1000'))
+        self.assertFalse(no_top_up.submitted)
+        self.assertEqual((no_top_up.amount_raw, no_top_up.previous_allowance_raw),
+                         ('5000', '4000'))
+        broadcaster.broadcast.assert_not_awaited()
+
+        with self.assertRaisesRegex(ValueError, 'minimum allowance'):
+            asyncio.run(approve_relationship_token(
+                policy, rpc, gate, broadcaster, TOKEN, '5000', R.V3_ROUTER,
+                signer_factory=Signer, minimum_required_raw='5001'))
 
     def test_remote_mysql_requires_ca_before_credentials_are_used(self):
         with patch.dict(os.environ, {
@@ -2569,6 +3213,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(document['wallets'][0]['wallet'], '0x' + '22' * 20)
         self.assertEqual(document['wallets'][0]['follower_wallet'], '0x' + '11' * 20)
         self.assertEqual(document['wallets'][0]['relationship_id'], '7')
+        self.assertEqual(document['wallets'][0]['run_mode'], 'paper')
         self.assertEqual(document['wallets'][0]['buy_rules']['USDG'],
                          {'mode': 'fixed', 'fixed_amount_raw': '1000000'})
         with tempfile.TemporaryDirectory() as folder:
@@ -2578,6 +3223,14 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual(len(converted.snapshot_hash), 64)
             self.assertEqual(converted.wallets['0x' + '22' * 20].follower_wallet,
                              '0x' + '11' * 20)
+            self.assertEqual(converted.wallets['0x' + '22' * 20].run_mode, 'paper')
+        live_row = dict(row, run_mode='mainnet_live')
+        live_document = rows_to_document([live_row])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'mysql-live.json'
+            path.write_text(json.dumps(live_document))
+            live = load_paper_config(path)
+        self.assertEqual(live.relationships[0].run_mode, 'mainnet_live')
         second = dict(row, id=8, follower_wallet='0x' + '33' * 20)
         multi = rows_to_document([row, second])
         with tempfile.TemporaryDirectory() as folder:
@@ -2588,6 +3241,15 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(converted.policies_for('0x' + '22' * 20)), 2)
         self.assertNotEqual(converted.relationships[0].ledger_scope,
                             converted.relationships[1].ledger_scope)
+
+        parsed = cli_parser().parse_args([
+            'monitor', '--paper-mysql', '--ledger-mysql', '--enable-mainnet-live',
+            '--paper-cycle-action', 'reuse',
+        ])
+        self.assertTrue(parsed.enable_mainnet_live)
+        status = cli_parser().parse_args([
+            'relationship-status', '--relationship-id', '7'])
+        self.assertEqual(status.relationship_id, '7')
 
     def test_same_smart_wallet_relationships_have_isolated_budget_and_proposals(self):
         async def scenario():
@@ -2709,6 +3371,21 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(policy.buy_rules['USDG'].fixed_amount_raw, '1000000')
 
         document = json.loads((ROOT / 'config/paper.example.json').read_text())
+        document['allowed_routes'] = []
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'dynamic-targets.json'
+            path.write_text(json.dumps(document))
+            dynamic = load_paper_config(path)
+        self.assertEqual(dynamic.allowed_routes, frozenset())
+
+        document['wallets'][0]['run_mode'] = 'mainnet_live'
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'unbound-live.json'
+            path.write_text(json.dumps(document))
+            with self.assertRaisesRegex(ValueError, 'relationship identity'):
+                load_paper_config(path)
+
+        document = json.loads((ROOT / 'config/paper.example.json').read_text())
         document['private_key'] = 'must-never-be-accepted'
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'bad.json'
@@ -2801,6 +3478,8 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(trigger_allowed(buy, 'relay_buy_evidenced'), (True, None))
         self.assertEqual(trigger_allowed(buy, 'swap_evidenced'),
                          (False, 'swap_evidence_required'))
+        self.assertEqual(trigger_allowed(buy, 'evidenced'), (True, None))
+        self.assertEqual(trigger_allowed(sell, 'evidenced'), (True, None))
         buy.stage = 'needs_review'
         self.assertEqual(trigger_allowed(buy, 'relay_buy_evidenced'),
                          (False, 'source_signal_not_eligible'))
@@ -2815,6 +3494,26 @@ class SafetyTests(unittest.TestCase):
             signal, frozenset({'relay_solver'}), frozenset({R.NATIVE, TOKEN}),
             frozenset({signal_route_key(signal)})))
 
+    def test_relay_signal_uses_receipt_verified_dynamic_v3_execution_route(self):
+        signal = Signal(
+            TXHASH, A, 'third_party', 'BUY', 'incoming', R.RELAY_ROUTER,
+            '0xcd6e13f7', stage='relay_buy_evidenced', execution_status='success',
+            protocol='relay_solver', token_in=R.USDG, token_out=TOKEN,
+            evidence={
+                'actual_input_debit_raw': '100',
+                'actual_output_credit_raw': '90',
+                'local_execution_route': {
+                    'protocol': 'v3', 'assets': [R.USDG, TOKEN],
+                    'fees': [3000], 'verified_pool': B,
+                },
+            })
+        execution = execution_quote_signal(signal, ())
+        self.assertEqual(execution.protocol, 'v3')
+        self.assertEqual(execution.evidence['hops'], [{
+            'token_in': R.USDG, 'token_out': TOKEN, 'fee': 3000,
+        }])
+        self.assertEqual(execution.evidence['actual_input_debit_raw'], '100')
+
     def test_paper_asset_allowlist_covers_every_route_intermediate(self):
         middle = '0x' + '44' * 20
         signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V3_ROUTER, '0x',
@@ -2828,6 +3527,41 @@ class SafetyTests(unittest.TestCase):
             'asset_not_allowed')
         self.assertIsNone(scope_reason(
             signal, frozenset({'v3'}), frozenset({R.USDG, middle, TOKEN})))
+
+    def test_evidenced_meme_target_is_dynamic_but_intermediates_remain_bounded(self):
+        middle = '0x' + '44' * 20
+        buy = Signal(
+            TXHASH, A, 'direct', 'BUY', 'call', R.V3_ROUTER, '0x',
+            stage='swap_evidenced', execution_status='success', protocol='v3',
+            token_in=R.USDG, token_out=TOKEN,
+            evidence={'hops': [
+                {'token_in': R.USDG, 'token_out': TOKEN, 'fee': 3000},
+            ]})
+        trusted = frozenset({R.NATIVE, R.WETH, R.USDG})
+        self.assertIsNone(scope_reason(
+            buy, frozenset({'v3'}), trusted, frozenset()))
+        unconfirmed = replace(buy, stage='intent', execution_status='unknown')
+        self.assertEqual(scope_reason(
+            unconfirmed, frozenset({'v3'}), trusted, frozenset()),
+            'asset_not_allowed')
+        multihop = replace(buy, evidence={'hops': [
+            {'token_in': R.USDG, 'token_out': middle, 'fee': 500},
+            {'token_in': middle, 'token_out': TOKEN, 'fee': 3000},
+        ]})
+        self.assertEqual(scope_reason(
+            multihop, frozenset({'v3'}), trusted, frozenset()),
+            'asset_not_allowed')
+        trusted_with_middle = trusted | {middle}
+        self.assertIsNone(scope_reason(
+            multihop, frozenset({'v3'}), trusted_with_middle, frozenset()))
+
+        sell = replace(
+            buy, behavior='SELL', token_in=TOKEN, token_out=R.USDG,
+            evidence={'hops': [
+                {'token_in': TOKEN, 'token_out': R.USDG, 'fee': 3000},
+            ]})
+        self.assertIsNone(scope_reason(
+            sell, frozenset({'v3'}), trusted, frozenset()))
 
     def test_paper_route_allowlist_is_fee_aware_and_direction_symmetric(self):
         config = load_paper_config(ROOT / 'config/paper.example.json')
@@ -3066,6 +3800,38 @@ class SafetyTests(unittest.TestCase):
         retry = dict(sell, proposal_id='sell-retry', source_event_id='sell-retry-event',
                      amount_in_raw='2500')
         self.assertEqual(store.reserve_paper_sell(retry), (True, 'reserved'))
+        store.close()
+
+    def test_proportional_sell_maps_source_fraction_to_local_attributed_quantity(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-1', 'operator_started')
+        store.configure_paper_budget(A, 'USDG', '10000000')
+        store.reserve_paper_proposal({
+            'proposal_id': 'buy-map', 'source_event_id': 'source-buy-map',
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'relay_buy_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.USDG, 'output_asset': TOKEN,
+            'budget_bucket': 'USDG', 'amount_in_raw': '2000000',
+            'attribution': {
+                'smart_wallet': A, 'source_event_id': 'source-buy-map',
+                'source_amount_out_raw': '69405773920665976786',
+            },
+        })
+        store.fill_paper_buy('buy-map', {
+            'order_id': 'buy-map-o', 'fill_id': 'buy-map-f', 'lot_id': 'buy-map-lot',
+            'amount_out_raw': '50303912913447597330', 'fee_asset': R.USDG,
+            'fee_amount_raw': '0', 'gas_cost_wei': '1',
+            'quote_observed_at': '2026-09-13T00:00:00Z',
+            'filled_at': '2026-09-13T00:00:01Z',
+        })
+        half, reason = store.paper_proportional_sell_amount(
+            A, TOKEN, '34702886960332988393', 1_000_000)
+        self.assertEqual((half, reason), ('25151956456723798665', 'selected'))
+        full, reason = store.paper_proportional_sell_amount(
+            A, TOKEN, '69405773920665976786', 1_000_000)
+        self.assertEqual((full, reason), ('50303912913447597330', 'selected'))
+        self.assertEqual(store.paper_open_position_amount(A, TOKEN),
+                         '50303912913447597330')
         store.close()
 
     def test_receipt_coverage_does_not_double_count_intent_updates(self):

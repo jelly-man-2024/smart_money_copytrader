@@ -1,6 +1,6 @@
 # 多数据源与实盘准备 Goal 验收矩阵
 
-更新时间：2026-09-12。本文按当前工作树和服务器实测记录逐项核验，不是主网上线授权。
+更新时间：2026-09-13。本文按当前工作树和服务器实测记录逐项核验，不是无人值守主网上线授权。
 
 状态含义：`已验证` 表示存在代码与对应测试/运行证据；`部分验证` 表示实现存在但缺目标环境
 证据；`待外部确认` 表示必须由操作员或用户提供授权，不能由项目自行完成。
@@ -8,9 +8,9 @@
 | 要求 | 状态 | 权威证据 | 未覆盖边界 |
 |---|---|---|---|
 | 配置 MySQL 可由使用者服务器托管 | 已验证 | `mysql_config.py`；localhost Docker；远程六项显式配置/TLS/脱敏测试 | 尚未连接使用者另一台远程服务器 |
-| `copy_relationships` 单表保存 follower×smart 唯一策略/额度 | 已验证 | schema 唯一键；严格 loader；真实两 follower 隔离脚本 | 当前 `run_mode` 仅 paper |
+| `copy_relationships` 单表保存 follower×smart 唯一策略/额度 | 已验证 | schema 唯一键；严格 loader；真实两 follower 隔离脚本 | mainnet_live 当前每进程仅一条 |
 | CSV 批量导入聪明钱 | 已验证 | 67 条历史来源、导入 CLI、默认 disabled、零地址写入口拒绝 | 新真实 follower 批量导入需操作员执行 |
-| 独立 key MySQL 简单签名数据源 | 已验证 | 独立 schema/容器/列级 SELECT；`OfflineDatabaseSigner`；`key-status` | key 表保持 0 行，未使用真实密钥 |
+| 独立 key MySQL 简单签名数据源 | 已验证 | 独立 schema/容器/列级 SELECT；`OfflineDatabaseSigner`；`key-status`；测试 follower 元数据存在/enabled | 私钥由使用者自行插入；项目未选择或输出私钥列，尚未真实签名 |
 | 最小权限与连接加密 | 已验证 | 实际 `SHOW GRANTS`；远程 CA/完整显式配置门禁 | TLS 证书轮换由部署方负责 |
 | 日志脱敏、私钥/raw 不进账本 | 已验证 | 固定异常、secret/raw 字段拒绝、slots 签名结果、SQLite 审计 | 调用方仍必须避免显式打印 raw 属性 |
 | 配置快照与签名前新鲜关系复核 | 已验证 | relationship snapshot；`MySqlRelationshipGate`；真实 disable 演练 | 签名检查与未来广播之间仍有时间窗口 |
@@ -20,9 +20,9 @@
 | 公开执行生命周期与重组处理 | 部分验证 | pending/confirmed/reverted/replaced/orphaned 模拟；attempt audit；`execution-track` 磁盘重启/错误链 CLI 回归 | 服务器无现成本地 EVM 节点，缺真实广播、重组和 replacement 演练 |
 | 运行账本迁移到业务 MySQL | 已验证 | 20 张 InnoDB 表、最小 DML、幂等迁移、真实 BUY+SELL/PnL/reorg/execution 演练；60 秒 MySQL monitor 持久化 5 个保守信号/候选和 570 个规范块 | 旧文件均为具名测试 SQLite，无唯一生产源，保留归档；新业务 MySQL 从本次主网只读游标开始 |
 | 广播前最终复核 | 部分验证 | 内存 raw hash/sender/字段、关系、额度、报价、RPC 全量重查 | reviewer 与真实发送尚未形成原子边界 |
-| `copy_eligible=false` 且禁止主网签名/广播 | 已验证 | 所有 replay；RPC allowlist；mainnet gate 无条件拒绝 | 无 |
+| `copy_eligible=false` 与独立实盘授权 | 部分验证 | 所有 replay；只读 RPC allowlist；逐 relationship/snapshot live gate；独立 broadcaster | 尚无真实小额回执和余额差分结算证据 |
 | 操作员验收 | 待外部确认 | `OPERATOR_RUNBOOK.md` 已提供步骤 | 需确认钱包、额度、Gas、滑点、停止/恢复流程 |
-| 用户最终主网授权 | 待外部确认 | 当前没有授权，门禁保持关闭 | 必须在审阅证据后再次明确授权 |
+| 用户小额主网测试授权 | 部分验证 | 用户已明确要求准备真实主网测试；门禁默认关闭 | 仍需具体钱包、relationship snapshot 和测试窗口验收 |
 
 ## 当前结论
 

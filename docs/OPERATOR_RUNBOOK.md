@@ -1,7 +1,8 @@
-# 跟单执行操作手册（当前为离线准备）
+# 跟单执行操作手册
 
-本文描述当前受支持的运维流程。它不是主网上线授权。项目当前没有广播入口，RPC allowlist
-不包含 `eth_sendRawTransaction`，`copy_eligible` 固定为 `false`。
+本文描述当前受支持的运维流程。普通模式仍不广播，`ReadOnlyRpc` allowlist 继续不包含
+`eth_sendRawTransaction`。单独的 `MainnetBroadcaster` 只在 `mainnet_live` 的全部门禁通过后发送；
+`copy_eligible` 仍固定为 `false`，不能把观察字段当成实盘授权。
 
 ## 数据源边界
 
@@ -9,8 +10,8 @@
   额度、触发点、允许协议/资产/路由和配置快照。
 - 私钥库是另一个 MySQL，由使用者在自己的服务器上自行维护。项目运行账号只能按公开地址读取
   `wallet_address, private_key_hex, enabled`；配置库和 SQLite 账本都没有私钥字段。
-- 当前里程碑不得向私钥库导入真实或测试私钥。离线回归只使用进程内随机无资金密钥和模拟查询。
-  将来只有完成风险验收并得到用户再次明确授权后，才可单独启用主网密钥读取、签名和广播。
+- 自动化回归不得向私钥库导入真实或测试私钥，只使用进程内随机无资金密钥和模拟查询。
+  `mainnet_live` 测试的私钥只能由使用者自行维护，并受本文的逐关系验收和多重门禁限制。
 
 可用 `sm-copy key-status --wallet 0x公开地址` 做元数据连通性检查。它只选择 `wallet_address` 和
 `enabled`，不选择 `private_key_hex`，输出固定带 `private_key_read=false`；仍必须显式打开三个
@@ -71,7 +72,7 @@ replacement 提价、replacement parent 状态以及最终 block number/hash；�
    和离线签名前都会复查。
 
 出现异常时先停用关系并创建 stop file，再运行 `execution-audit` 和只读 RPC 核对。不要清库、
-重置 nonce 或重发交易。当前没有项目内广播，因此外部广播产生的 hash 只能交给只读 tracker 跟踪。
+重置 nonce 或盲目重发交易。mainnet_live 广播 hash 和外部广播 hash 都交给只读 tracker 跟踪。
 CLI 为 `sm-copy execution-track --db ... --proposal-id ...`；原始签名 hash 可省略 `--tx-hash`，
 replacement 必须同时给出新 hash 和 `--replaces-tx-hash`。输出固定
 `read_only=true,broadcast_performed=false,copy_eligible=false`。
@@ -98,14 +99,66 @@ immutable transaction，并要求 hash 与账本一致。只允许唯一 attempt
 任何 UNKNOWN、needs_review、失败执行、非规范链或归属不明信号都不得构建交易。被动收币不算买入，
 bundle 中他人的 Swap 不归给目标钱包，claim + swap 仍分别保留。
 
-## 主网上线前仍需人工验收
+## 小额 mainnet_live 测试入口
+
+当前只允许一条 enabled relationship，且必须满足：
+
+- 配置来自 `--paper-mysql`，运行账本使用 `--ledger-mysql`；
+- `run_mode='mainnet_live'`、`trigger_mode='evidenced'`；
+- 来源必须最终得到严格验证的本地 V2/V3/V4 exact-input 路径；Relay 订单只用于归因，绝不降级
+  复用聪明钱或聚合器的源 calldata。Relay 被动交付 receipt 没有 Swap 时，只允许查询配置 V3
+  Factory 的 `100/500/3000/10000` 四个标准直接池，在同一固定区块验证 code、token0/token1/fee，
+  并按该 relationship 本次实际计划输入量择优；这不是任意多跳或多协议寻路；
+- token 输入必须对实际执行 router 有足额 allowance。`mainnet-approve-usdg` 固定按该关系 USDG
+  周期总预算的200倍预授权；SELL 若 allowance 不足，monitor 会在每次签名/广播前重新验证关系，
+  并仅按该 relationship 账本中的同 Token 当前归因持仓总量自动授权。授权确认位于规范块且链上
+  allowance 足额后才重新报价并卖出；不会授权钱包中无归因的同币余额。该 allowance 不放大软件
+  预算，测试结束仍应单独撤销为0。monitor 以本次 proposal 输入量判断现有 allowance 是否足够；
+  已足够时不补授权，只有不足时才写入上述有界授权目标；
+- 先用 `relationship-status --relationship-id ID` 得到精确 `config_snapshot_hash`；
+- 将 `config/mainnet_risk_acceptance.example.json` 复制到仓库外的运维目录，替换 follower、
+  relationship 和 snapshot 后设为 `chmod 600`；该文件不含私钥，但不得提交；
+- 私钥仍只由使用者写入独立 key MySQL，不得写到业务 MySQL、仓库 `.env`、命令参数或聊天。
+
+启动前在当前 shell 或部署平台 secret 中设置：
+
+```bash
+export SMART_MONEY_EMERGENCY_STOP=0
+export SMART_MONEY_EXECUTION_MODE=mainnet_live
+export SMART_MONEY_SIGNING_MODE=mainnet_live
+export SMART_MONEY_BROADCAST_MODE=mainnet_live
+export SMART_MONEY_MAINNET_CHAIN_ID=4663
+export SMART_MONEY_MAINNET_RISK_ACK_FILE=/absolute/path/to/accepted-risk.json
+```
+
+然后显式选择额度周期并启动：
+
+```bash
+.venv/bin/sm-copy monitor --seconds 0 --paper-mysql --ledger-mysql \
+  --paper-cycle-action reset --paper-cycle-id mainnet-test-YYYYMMDD-HHMM \
+  --paper-cycle-reason operator_small_value_test --enable-mainnet-live \
+  --relay-auto-associate
+```
+
+任一开关、验收文件字段、配置 snapshot、关系 enabled 状态、余额、allowance、Gas、nonce、报价或
+签名发送者不匹配都会在广播前拒绝。RPC 返回 hash 必须等于本地签名 hash；日志只保存公开 hash，
+不保存 raw signed transaction。收到 `live_recovery_requires_operator_review` 时先运行
+`execution-audit --ledger-mysql`，不要直接重发。
+
+当前已知限制：confirmed 会按规范 receipt 的 follower ERC-20 净差额写入 position lot/PnL；但只
+覆盖当前 ERC-20 exact-input MVP，native/复杂手续费币仍需扩展。首笔 SELL 在没有 allowance 时会
+多等待一笔 approve 的规范回执，之后只要剩余 allowance 覆盖归因持仓便不会重复授权；OKX 仅完成
+严格客户端，尚未接 monitor；Relay 公共 requests/v2 还需在退役前迁移 v3。
+因此此入口只适合人工看守、可承受全部损失的极小额验证，不是正式无人值守上线。
+
+## 正式主网上线前仍需人工验收
 
 - 在独立测试链完成真实广播的失败、超时、nonce 冲突、replacement、revert、重启和重组演练。
 - 确认广播瞬间的最终报价、余额、Gas、额度和 nonce 原子边界。
 - 操作员书面确认钱包、逐关系/逐币种额度、周期规则、Gas/滑点上限、停止和恢复流程。
-- 用户审阅证据后再次明确授权主网读取私钥、签名与广播。
+- 用户审阅证据后明确授权具体主网 follower、relationship、snapshot 和测试窗口。
 
-这些条件未全部满足前，不增加主网开关，不改变 `copy_eligible=false`。
+这些条件未全部满足前，不得把小额测试入口升级为无人值守实盘；`copy_eligible=false` 不改变。
 
 ## 操作员验收记录模板（默认未通过）
 

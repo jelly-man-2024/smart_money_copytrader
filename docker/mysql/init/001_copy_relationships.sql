@@ -29,9 +29,10 @@ CREATE TABLE IF NOT EXISTS copy_relationships (
     PRIMARY KEY (id),
     UNIQUE KEY uq_copy_relationship (follower_wallet, smart_wallet),
     KEY ix_copy_relationship_enabled_smart (enabled, smart_wallet),
-    CONSTRAINT chk_copy_relationship_mode CHECK (run_mode = 'paper'),
+    CONSTRAINT chk_copy_relationship_mode CHECK (run_mode IN ('paper','mainnet_live')),
     CONSTRAINT chk_copy_relationship_trigger CHECK
-      (trigger_mode IN ('feed_intent', 'receipt_success', 'swap_evidenced')),
+      (trigger_mode IN ('feed_intent', 'receipt_success', 'swap_evidenced',
+                        'relay_sell_evidenced', 'relay_buy_evidenced', 'evidenced')),
     CONSTRAINT chk_copy_relationship_usdg_mode CHECK
       (usdg_rule_mode IN ('fixed', 'proportional')),
     CONSTRAINT chk_copy_relationship_eth_mode CHECK

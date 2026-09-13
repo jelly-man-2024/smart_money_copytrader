@@ -7,7 +7,7 @@ import sqlite3
 import time
 
 from . import registry as R
-from .models import Signal, Transaction
+from .models import Signal, Transaction, address
 
 STAGE_RANK = {"intent": 0, "execution_observed": 1, "needs_review": 1,
               "swap_evidenced": 2, "relay_sell_evidenced": 2,
@@ -919,6 +919,12 @@ class Store:
             if budget is None or int(budget[0]) < int(row[6]):
                 raise ValueError("reservation ledger mismatch")
             attribution = json.loads(row[7])
+            position_attribution = dict(attribution)
+            source_output = position_attribution.get("source_amount_out_raw")
+            if (isinstance(source_output, str) and source_output.isdecimal()
+                    and int(source_output) > 0):
+                position_attribution["source_position_initial_raw"] = source_output
+                position_attribution["source_position_remaining_raw"] = source_output
             source_event_id = attribution.get("source_event_id", row[0])
             order_payload = json.dumps({
                 "paper_only": True, "source_event_id": source_event_id,
@@ -943,7 +949,7 @@ class Store:
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'open')""", (
                     fill["lot_id"], row[2], row[4], row[9], row[5], row[3], row[6], row[6],
                     fill["amount_out_raw"], fill["amount_out_raw"], source_event_id,
-                    fill["fill_id"], row[7],
+                    fill["fill_id"], json.dumps(position_attribution, sort_keys=True),
                 ))
             self.connection.execute("""UPDATE paper_budgets
                 SET reserved_raw=?,invested_raw=? WHERE cycle_id=? AND wallet=? AND bucket=?""",
@@ -1179,6 +1185,121 @@ class Store:
             return None, "attributed_principal_asset_ambiguous"
         return matches[0], "selected"
 
+    def paper_proportional_sell_amount(
+            self, wallet: str, token: str, source_sell_raw: str,
+            ratio_ppm: int) -> tuple[str | None, str]:
+        """Map a smart-wallet sell fraction onto this relationship's attributed lots."""
+        if (not isinstance(source_sell_raw, str) or not source_sell_raw.isdecimal()
+                or int(source_sell_raw) <= 0 or not isinstance(ratio_ppm, int)
+                or not 1 <= ratio_ppm <= 1_000_000):
+            raise ValueError("invalid proportional sell inputs")
+        target_source = int(source_sell_raw) * ratio_ppm // 1_000_000
+        if target_source <= 0:
+            return None, "planned_amount_rounds_to_zero"
+        rows = self.connection.execute("""SELECT token_initial_raw,token_remaining_raw,
+                attribution_payload FROM paper_positions
+            WHERE wallet=? AND token=? AND status='open'
+            ORDER BY created_at,lot_id""", (wallet.lower(), token.lower())).fetchall()
+        local_total = 0
+        source_left = target_source
+        for token_initial, token_remaining, raw_attribution in rows:
+            attribution = json.loads(raw_attribution)
+            source_remaining = attribution.get("source_position_remaining_raw")
+            if source_remaining is None:
+                source_initial = attribution.get("source_amount_out_raw")
+                if source_initial is None and int(token_initial) == int(token_remaining):
+                    source = self.signal(attribution.get("source_event_id", ""))
+                    if source is not None:
+                        source_initial = source.evidence.get(
+                            "actual_output_credit_raw", source.amount_out_raw)
+                if (not isinstance(source_initial, str) or not source_initial.isdecimal()
+                        or int(token_initial) != int(token_remaining)):
+                    return None, "source_position_basis_missing"
+                source_remaining = source_initial
+            if (not isinstance(source_remaining, str)
+                    or not source_remaining.isdecimal() or int(source_remaining) <= 0):
+                return None, "source_position_basis_invalid"
+            take_source = min(int(source_remaining), source_left)
+            take_local = (int(token_remaining) if take_source == int(source_remaining)
+                          else int(token_remaining) * take_source // int(source_remaining))
+            local_total += take_local
+            source_left -= take_source
+            if source_left == 0:
+                break
+        if local_total <= 0:
+            return None, "attributed_position_insufficient"
+        return str(local_total), "selected"
+
+    def paper_open_position_amount(self, wallet: str, token: str) -> str:
+        """Return this ledger scope's attributed open balance for one token."""
+        rows = self.connection.execute("""SELECT token_remaining_raw
+            FROM paper_positions WHERE wallet=? AND token=? AND status='open'""",
+            (wallet.lower(), token.lower())).fetchall()
+        return str(sum(int(row[0]) for row in rows))
+
+    def paper_sell_execution_route(
+            self, wallet: str, token: str, principal_asset: str,
+            amount_raw: str) -> tuple[dict | None, str]:
+        """Recover one execution route from the BUY signals backing selected lots."""
+        if (not isinstance(amount_raw, str) or not amount_raw.isdecimal()
+                or int(amount_raw) <= 0):
+            raise ValueError("invalid sell route amount")
+        rows = self.connection.execute("""SELECT p.lot_id,p.token_remaining_raw,
+                p.source_event_id,p.principal_asset
+            FROM paper_positions p WHERE p.wallet=? AND p.token=?
+                AND p.principal_asset=? AND p.status='open'
+            ORDER BY p.created_at,p.lot_id""", (
+                wallet.lower(), token.lower(), principal_asset.lower())).fetchall()
+        remaining = int(amount_raw)
+        selected = []
+        for lot_id, token_remaining, source_event_id, _ in rows:
+            reserved = sum(int(row[0]) for row in self.connection.execute(
+                """SELECT token_amount_raw FROM paper_position_reservations
+                   WHERE lot_id=? AND status='active'""", (lot_id,)))
+            available = max(int(token_remaining) - reserved, 0)
+            take = min(available, remaining)
+            if not take:
+                continue
+            source = self.signal(source_event_id)
+            route = (source.evidence.get("local_execution_route")
+                     if source is not None else None)
+            if not isinstance(route, dict):
+                return None, "attributed_buy_execution_route_missing"
+            try:
+                protocol = route.get("protocol")
+                assets = tuple(address(item) for item in route.get("assets", []))
+                if (protocol not in {"v2", "v3", "v4"} or len(assets) < 2
+                        or {assets[0], assets[-1]}
+                        != {token.lower(), principal_asset.lower()}):
+                    return None, "attributed_buy_execution_route_invalid"
+                if protocol == "v2":
+                    parameters = ()
+                elif protocol == "v3":
+                    fees = route.get("fees")
+                    if (not isinstance(fees, list) or len(fees) != len(assets) - 1
+                            or any(not isinstance(fee, int)
+                                   or not 0 <= fee < 2 ** 24 for fee in fees)):
+                        return None, "attributed_buy_execution_route_invalid"
+                    parameters = tuple(fees)
+                else:
+                    fields = tuple(tuple(route.get(name, [])) for name in (
+                        "fees", "tick_spacings", "hooks", "hook_data"))
+                    if any(len(field) != len(assets) - 1 for field in fields):
+                        return None, "attributed_buy_execution_route_invalid"
+                    parameters = fields
+                selected.append(((protocol, assets, parameters), route))
+            except (TypeError, ValueError):
+                return None, "attributed_buy_execution_route_invalid"
+            remaining -= take
+            if remaining == 0:
+                break
+        if remaining:
+            return None, "attributed_position_insufficient"
+        unique = {item[0] for item in selected}
+        if len(unique) != 1:
+            return None, "attributed_buy_execution_route_ambiguous"
+        return dict(selected[0][1]), "selected"
+
     def fill_paper_sell(self, proposal_id: str, fill: dict) -> bool:
         """Fill a paper sell and restore each source lot's original-principal budget."""
         required = {
@@ -1237,7 +1358,8 @@ class Store:
             gas_left = int(fill["gas_cost_wei"])
             for index, (lot_id, token_amount) in enumerate(reservations):
                 lot = self.connection.execute("""SELECT token_remaining_raw,
-                        principal_remaining_raw,budget_cycle_id,budget_bucket,status,principal_asset
+                        principal_remaining_raw,budget_cycle_id,budget_bucket,status,principal_asset,
+                        attribution_payload,token_initial_raw
                     FROM paper_positions WHERE lot_id=?""", (lot_id,)).fetchone()
                 sold, token_remaining, principal_remaining = (
                     int(token_amount), int(lot[0]), int(lot[1]))
@@ -1261,10 +1383,30 @@ class Store:
                     raise ValueError("invested budget ledger mismatch")
                 new_tokens = token_remaining - sold
                 new_principal = principal_remaining - principal
+                position_attribution = json.loads(lot[6])
+                source_remaining = position_attribution.get(
+                    "source_position_remaining_raw")
+                if source_remaining is None:
+                    source_remaining = position_attribution.get("source_amount_out_raw")
+                if (source_remaining is None
+                        and int(lot[7]) == token_remaining):
+                    source = self.signal(position_attribution.get("source_event_id", ""))
+                    if source is not None:
+                        source_remaining = source.evidence.get(
+                            "actual_output_credit_raw", source.amount_out_raw)
+                if (isinstance(source_remaining, str) and source_remaining.isdecimal()
+                        and int(source_remaining) > 0):
+                    source_value = int(source_remaining)
+                    source_sold = (source_value if sold == token_remaining else
+                                   source_value * sold // token_remaining)
+                    position_attribution["source_position_remaining_raw"] = str(
+                        source_value - source_sold)
                 self.connection.execute("""UPDATE paper_positions SET token_remaining_raw=?,
-                    principal_remaining_raw=?,status=?,updated_at=CURRENT_TIMESTAMP
+                    principal_remaining_raw=?,attribution_payload=?,status=?,
+                    updated_at=CURRENT_TIMESTAMP
                     WHERE lot_id=?""", (
                         str(new_tokens), str(new_principal),
+                        json.dumps(position_attribution, sort_keys=True),
                         "closed" if new_tokens == 0 else "open", lot_id,
                     ))
                 self.connection.execute("""UPDATE paper_budgets SET invested_raw=?

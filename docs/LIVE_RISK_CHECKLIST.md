@@ -1,7 +1,8 @@
 # 实盘风险控制清单
 
-本文是实盘功能的硬门槛，不是上线授权。所有项目未完成并留下可复核证据前，必须保持
-`copy_eligible=false`，不得读取主网私钥、签名或广播。
+本文是实盘功能的硬门槛，不是无人值守上线授权。所有项目未完成并留下可复核证据前，必须保持
+`copy_eligible=false`；只有人工看守的单 relationship 小额测试可在逐项门禁匹配后读取对应密钥、
+签名和广播。
 
 ## 数据源与权限
 
@@ -39,22 +40,25 @@
 
 - [x] 只为已验证精确路由构建 exact-input：V2/V3 及 V4 单跳 native-input 已完成 ABI/反解回归；
   V4 token-input/多跳在 Permit2 和实际组合验收前显式拒绝，不属于当前受支持路径。
-- [x] 当前执行器不生成 approval 交易；token 路径只接受链上已有且足额的 Router allowance，
-  不自动扩大授权或签署无限授权。V4 token-input 因 Permit2 语义未验收而拒绝。
+- [x] monitor 不自动生成 approval；独立命令把 USDG allowance 限定为当前 relationship 周期总预算
+  的200倍，拒绝无限授权、部分追加授权和存在 pending nonce。软件净累计投入上限不变，测试结束
+  必须撤销 allowance。V4 token-input 因 Permit2 语义未验收而拒绝。
 - [x] 签名前逐字段核对 chain ID、to、calldata、value、gas、type、EIP-1559 fee 与持久 unsigned
   plan；from 由预期 follower 的数据库密钥派生并在签名后 recovery 复核。deadline/minOut 已固定
   在构建后 ABI 回归核验的 calldata 中，关系配置 snapshot hash 也在签名前匹配当前配置。
 - [x] 使用 pending nonce 并持久化 nonce reservation；同一 proposal 幂等，并发事务和重启恢复
   已覆盖。只读生命周期协调已能发现外部广播的原交易和同 nonce replacement，replacement
-  必须保持 from/to/calldata/value/gas/chain/type 并逐次提高 EIP-1559 费用；项目仍不广播。
+  必须保持 from/to/calldata/value/gas/chain/type 并逐次提高 EIP-1559 费用。
 - [ ] 广播前再次检查余额、Gas、报价年龄、滑点、价格偏离、流动性和额度。当前已完成未签名
   plan 的余额、Router allowance、Gas、报价年龄和目标 allowlist 只读预检；离线签名前已重新
   报价并复查上述状态、pending nonce、BUY budget reservation 或 SELL position reservation。
   最终公开复核证据随 signed 状态原子保存。另有无广播能力的 pre-broadcast reviewer：对调用方
   内存中的 raw bytes 核对 hash/sender/完整交易后再次执行关系、额度、报价和 RPC preflight，且
-  要求 pending nonce 与签名 nonce 完全相等。由于没有实际广播原子边界，本项仍保持未完成。
+  要求 pending nonce 与签名 nonce 完全相等。受控 broadcaster 已接在 reviewer 后；confirmed
+  ERC-20 路径会核对规范 receipt 和 follower 净差额并结算 lot/PnL。尚无真实主网小额回执证据，
+  因此本项仍保持未完成。
 - [x] proposal、execution plan 和 nonce reservation 均有持久幂等键；同一 source
-  signal/relationship 最多形成一个 prepared plan。真实 signed/broadcast order 仍未启用。
+  signal/relationship 最多形成一个 prepared plan。受控 live 路径已复用这些幂等键。
 - [x] execution plan 的身份字段、follower/relationship/config snapshot、transaction、unsigned
   plan 和初始 preflight 使用持久 SHA-256 完整性哈希；重启读取或签名前不匹配即拒绝。旧 SQLite
   行在首次迁移时按已有内容补建基线哈希，不把该哈希误称为抵御数据库管理员的签名证明。
@@ -69,8 +73,8 @@
 ## 验证与上线门禁
 
 - [x] 使用运行时临时生成且无资金的测试密钥完成 type-2 离线签名/发送者恢复测试；密钥不写盘。
-  真实 key MySQL 临时写入测试未执行：安全审查依据 AGENTS.md 当前里程碑“测试不得存储私钥”
-  拒绝该操作；随后只读查询确认 `wallet_keys` 仍为 0 行。保留内存密钥+模拟查询验证。
+  使用者已自行向独立 key MySQL 插入 follower 记录；项目只执行不选择私钥列的元数据检查，确认
+  found/enabled，没有读取或输出真实私钥。真实签名仍待风险清单完成后单独执行。
 - [x] 离线签名前重新报价/预检；报价恶化或 pending nonce 超过预留值均拒绝。账本只记录公开
   tx hash、signed 状态和最终公开复核证据，不记录 raw signed transaction；复核证据若包含
   private key/raw transaction 字段会拒绝。
@@ -78,12 +82,13 @@
   RPC 未发现、pending、成功 receipt、revert、replacement 字段/费用拒绝及规范块 hash 不符
   的 orphan；`execution-track` 已提供外部 hash 的只读 CLI 接入。服务器没有现成本地 EVM 节点
   二进制或镜像，仍缺独立测试链的真实广播演练。
-- [ ] 主网广播 RPC 方法不在默认允许列表，并有单独、默认关闭的双重开关。
-  默认只接受 execution mode + signing mode 同为 `offline_test`，且 emergency stop 显式解除；
-  stop file 每次签名前复查。主网 gate 当前无条件拒绝，广播方法仍不在 RPC allowlist。真正的
-  主网双开关需用户最终授权后另行实现，因此本项保持未完成。
+- [x] 主网广播 RPC 方法不在默认只读允许列表，并有单独、默认关闭的多重开关。
+  `MainnetBroadcaster` 与 `ReadOnlyRpc` 分离，要求 execution/signing/broadcast mode、emergency
+  stop、stop file、chain ID、CLI 开关，以及绑定 follower/relationship/config snapshot 的权限
+  安全验收文件；发送前独立恢复 sender 并验证 chain/hash。缺任一项在 key SELECT 前或广播前拒绝。
 - [ ] 操作员明确确认钱包、单笔/周期额度、Gas 上限、紧急停止和回滚流程。
   数据库 `enabled=0` 的即时签名前停机门禁、默认停止的进程环境门禁及运行期 stop file 已实现；
   启动、重启、三层停止及公开 execution 状态处置已写入 `OPERATOR_RUNBOOK.md`；仍缺操作员验收
   记录和真实广播后的测试链演练，故本项保持未完成。
-- [ ] 用户在所有证据审阅后再次明确授权主网读取私钥、签名和广播。
+- [x] 用户已明确授权开发人工看守的小额主网测试入口。
+- [ ] 用户在真实小额证据、余额差分结算、approve/重启处置完成后授权无人值守实盘。

@@ -9,6 +9,7 @@ from . import registry as R
 
 
 ZERO = "0x" + "00" * 20
+V3_SWAP = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
 
 
 def _selector(signature: str) -> bytes:
@@ -23,6 +24,71 @@ def _address_result(value: str) -> str:
     if not isinstance(value, str) or not value.startswith("0x"):
         raise ValueError("invalid eth_call result")
     return address(decode(["address"], bytes.fromhex(value[2:]))[0])
+
+
+async def discover_v3_execution_route(rpc, receipt: dict, token_in: str,
+                                      token_out: str,
+                                      minimum_output_raw: str | None = None) -> dict:
+    """Find one direction-matching V3 pool in an already successful receipt.
+
+    This is execution-route evidence only. Caller separately proves that a Relay
+    delivery or wallet debit belongs to the observed smart wallet.
+    """
+    token_in, token_out = address(token_in), address(token_out)
+    if token_in == token_out or number(receipt.get("status", 0)) != 1:
+        raise ValueError("successful receipt and distinct route assets required")
+    minimum = 0
+    if minimum_output_raw is not None:
+        if not isinstance(minimum_output_raw, str) or not minimum_output_raw.isdecimal():
+            raise ValueError("invalid minimum route output")
+        minimum = int(minimum_output_raw)
+    block = hex(number(receipt.get("blockNumber", 0)))
+
+    async def call(to: str, data: str):
+        return await rpc.call("eth_call", [{"to": to, "data": data}, block])
+
+    candidates = []
+    for log in receipt.get("logs", []):
+        topics = log.get("topics", []) if isinstance(log, dict) else []
+        if (log.get("removed") or not topics or topics[0].lower() != V3_SWAP
+                or len(topics) != 3):
+            continue
+        pool = address(log.get("address"))
+        try:
+            token0 = _address_result(await call(pool, _call_data("token0()")))
+            token1 = _address_result(await call(pool, _call_data("token1()")))
+            if {token0, token1} != {token_in, token_out}:
+                continue
+            fee_raw = await call(pool, _call_data("fee()"))
+            fee = int(decode(["uint24"], bytes.fromhex(fee_raw[2:]))[0])
+            expected_pool = _address_result(await call(
+                R.V3_FACTORY, _call_data(
+                    "getPool(address,address,uint24)",
+                    ["address", "address", "uint24"], [token0, token1, fee])))
+            if expected_pool != pool or (await rpc.call(
+                    "eth_getCode", [pool, block])) in ("0x", "0x0"):
+                continue
+            values = decode(
+                ["int256", "int256", "uint160", "uint128", "int24"],
+                bytes.fromhex(log.get("data", "0x")[2:]))
+            amount0, amount1 = int(values[0]), int(values[1])
+            input_delta = amount0 if token_in == token0 else amount1
+            output_delta = amount0 if token_out == token0 else amount1
+            if input_delta <= 0 or output_delta >= 0 or -output_delta < minimum:
+                continue
+            candidates.append({
+                "protocol": "v3", "assets": [token_in, token_out], "fees": [fee],
+                "verified_pool": pool, "verified_block_number": str(number(
+                    receipt.get("blockNumber", 0))),
+                "pool_input_raw": str(input_delta),
+                "pool_output_raw": str(-output_delta),
+            })
+        except (TypeError, ValueError):
+            continue
+    unique = {item["verified_pool"]: item for item in candidates}
+    if len(unique) != 1:
+        raise ValueError("destination receipt does not select one verified V3 route")
+    return next(iter(unique.values()))
 
 
 async def verify_signal_pools(rpc, signals: list[Signal], receipt: dict) -> dict[str, dict]:

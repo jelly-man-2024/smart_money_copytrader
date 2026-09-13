@@ -16,7 +16,7 @@ from .rpc import RpcError
 RATIO_SCALE = 1_000_000
 TRIGGER_MODES = frozenset({
     "feed_intent", "receipt_success", "swap_evidenced",
-    "relay_sell_evidenced", "relay_buy_evidenced",
+    "relay_sell_evidenced", "relay_buy_evidenced", "evidenced",
 })
 BUDGET_BUCKETS = frozenset({"USDG", "ETH_WETH"})
 
@@ -95,7 +95,11 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
     if source.protocol not in {"v2", "v3", "v4", "0x", "kyber", "relay_solver"}:
         raise ValueError("source protocol has no paper execution route")
     matches = []
-    for definition in routes or ():
+    definitions = list(routes or ())
+    dynamic = source.evidence.get("local_execution_route")
+    if isinstance(dynamic, dict):
+        definitions.append(dynamic)
+    for definition in definitions:
         assets = definition.get("assets") if isinstance(definition, dict) else None
         if (not isinstance(assets, list) or len(assets) < 2
                 or {assets[0], assets[-1]} != {source.token_in, output_asset}):
@@ -103,10 +107,11 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
         forward = assets[0] == source.token_in
         ordered_assets = list(assets if forward else reversed(assets))
         protocol = definition.get("protocol")
-        evidence = {
+        evidence = deepcopy(source.evidence)
+        evidence.update({
             "paper_execution_source_protocol": source.protocol,
             "paper_execution_route": deepcopy(definition),
-        }
+        })
         if protocol == "v2":
             evidence["route"] = ordered_assets
             contract = R.V2_ROUTER
@@ -218,6 +223,11 @@ def trigger_allowed(signal: Signal, mode: str) -> tuple[bool, str | None]:
     if mode in {"relay_sell_evidenced", "relay_buy_evidenced"}:
         return (signal.stage == mode,
                 None if signal.stage == mode else f"{mode}_required")
+    if mode == "evidenced":
+        allowed = signal.stage in {
+            "swap_evidenced", "relay_sell_evidenced", "relay_buy_evidenced",
+        }
+        return allowed, None if allowed else "confirmed_exchange_evidence_required"
     if mode == "receipt_success":
         allowed = signal.execution_status == "success" and signal.stage != "needs_review"
         return allowed, None if allowed else "successful_unambiguous_receipt_required"
@@ -228,8 +238,18 @@ def trigger_allowed(signal: Signal, mode: str) -> tuple[bool, str | None]:
 def scope_reason(signal: Signal, allowed_protocols: frozenset[str] | None,
                  allowed_assets: frozenset[str] | None,
                  allowed_routes: frozenset[str] | None = None) -> str | None:
+    """Validate trusted funding/intermediate assets and evidenced dynamic targets."""
     if allowed_protocols is not None and signal.protocol not in allowed_protocols:
         return "protocol_not_allowed"
+    evidenced_stages = {
+        "swap_evidenced", "relay_buy_evidenced", "relay_sell_evidenced",
+    }
+    dynamic_target = None
+    if signal.execution_status == "success" and signal.stage in evidenced_stages:
+        if signal.behavior == "BUY":
+            dynamic_target = signal.token_out
+        elif signal.behavior == "SELL":
+            dynamic_target = signal.token_in
     if allowed_assets is not None:
         route_assets = {signal.token_in, signal.token_out}
         if signal.protocol == "v2" and isinstance(signal.evidence.get("route"), list):
@@ -242,11 +262,13 @@ def scope_reason(signal: Signal, allowed_protocols: frozenset[str] | None,
             for hop in signal.evidence["v4_hops"]:
                 if isinstance(hop, dict):
                     route_assets.update((hop.get("token_in"), hop.get("token_out")))
+        if dynamic_target is not None:
+            route_assets.discard(dynamic_target)
         if None in route_assets or not route_assets <= allowed_assets:
             return "asset_not_allowed"
     if allowed_routes is not None and signal.protocol not in {"0x", "kyber", "relay_solver"}:
         key = signal_route_key(signal)
-        if key is None or key not in allowed_routes:
+        if key is None or (key not in allowed_routes and dynamic_target is None):
             return "route_not_allowed"
     return None
 
@@ -301,7 +323,11 @@ class PaperEngine:
 
     def _attribution(self, signal: Signal) -> dict:
         context = self.wallet_contexts.get(signal.wallet, {})
-        return {
+        source_input = signal.evidence.get(
+            "actual_input_debit_raw", signal.amount_in_raw)
+        source_output = signal.evidence.get(
+            "actual_output_credit_raw", signal.amount_out_raw)
+        result = {
             "follower_wallet": context.get("follower_wallet"),
             "relationship_id": context.get("relationship_id"),
             "config_snapshot_hash": self.config_snapshot_hash,
@@ -309,8 +335,14 @@ class PaperEngine:
             "smart_wallet_label": self.wallet_labels.get(signal.wallet, signal.wallet),
             "source_tx_hash": signal.tx_hash, "source_mode": signal.mode,
             "source_behavior": signal.behavior, "source_stage": signal.stage,
+            "source_amount_in_raw": source_input,
+            "source_amount_out_raw": source_output,
             "trigger_mode": self.trigger_mode, "strategy_version": self.strategy_version,
         }
+        route = signal.evidence.get("local_execution_route")
+        if isinstance(route, dict):
+            result["local_execution_route"] = deepcopy(route)
+        return result
 
     def _ledger_wallet(self, signal: Signal) -> str:
         context = self.wallet_contexts.get(signal.wallet, {})
@@ -357,7 +389,15 @@ class PaperEngine:
             return self._decision(
                 signal, False, bucket_or_reason, {"source_signal": signal.to_dict()})
         try:
-            quote_signal = execution_quote_signal(signal, self.execution_routes)
+            try:
+                quote_signal = execution_quote_signal(signal, self.execution_routes)
+            except ValueError:
+                discover = getattr(self.quoter, "discover_v3_route", None)
+                if signal.protocol != "relay_solver" or not callable(discover):
+                    raise
+                signal.evidence["local_execution_route"] = await discover(signal, amount)
+                self.store.put(signal)
+                quote_signal = execution_quote_signal(signal, self.execution_routes)
             quote, reference, gas_price = await self.quoter.quote_with_reference(
                 quote_signal, amount)
         except (RpcError, ValueError) as exc:
@@ -410,10 +450,26 @@ class PaperEngine:
         allowed, reason = trigger_allowed(signal, self.trigger_mode)
         if not allowed:
             return self._decision(signal, False, reason, {"source_signal": signal.to_dict()})
-        amount, bucket_or_reason = planned_input_amount(signal, amount_rule)
-        if amount is None:
-            return self._decision(
-                signal, False, bucket_or_reason, {"source_signal": signal.to_dict()})
+        if amount_rule.mode == "proportional":
+            actual = signal.evidence.get("actual_input_debit_raw")
+            bucket_or_reason = budget_bucket(signal.token_out)
+            if (not isinstance(actual, str) or not actual.isdecimal()
+                    or int(actual) <= 0 or bucket_or_reason is None):
+                return self._decision(
+                    signal, False, "verified_actual_input_missing", {
+                        "source_signal": signal.to_dict()})
+            amount, amount_reason = self.store.paper_proportional_sell_amount(
+                self._ledger_wallet(signal), signal.token_in, actual,
+                amount_rule.ratio_ppm)
+            if amount is None:
+                return self._decision(signal, False, amount_reason, {
+                    "source_signal": signal.to_dict()})
+        else:
+            amount, bucket_or_reason = planned_input_amount(signal, amount_rule)
+            if amount is None:
+                return self._decision(
+                    signal, False, bucket_or_reason, {
+                        "source_signal": signal.to_dict()})
         principal_asset, principal_reason = self.store.paper_sell_principal_asset(
             self._ledger_wallet(signal), signal.token_in, amount)
         if principal_asset is None:
@@ -421,8 +477,20 @@ class PaperEngine:
                 "source_signal": signal.to_dict(),
             })
         try:
-            quote_signal = execution_quote_signal(
-                signal, self.execution_routes, principal_asset)
+            try:
+                quote_signal = execution_quote_signal(
+                    signal, self.execution_routes, principal_asset)
+            except ValueError:
+                route, route_reason = self.store.paper_sell_execution_route(
+                    self._ledger_wallet(signal), signal.token_in,
+                    principal_asset, amount)
+                if route is None:
+                    return self._decision(signal, False, route_reason, {
+                        "source_signal": signal.to_dict(),
+                    })
+                signal.evidence["local_execution_route"] = route
+                quote_signal = execution_quote_signal(
+                    signal, self.execution_routes, principal_asset)
             quote, reference, gas_price = await self.quoter.quote_with_reference(
                 quote_signal, amount)
         except (RpcError, ValueError) as exc:

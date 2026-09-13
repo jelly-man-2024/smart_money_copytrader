@@ -439,3 +439,95 @@ fill 和反向 mark 探针成功，证明此前是执行环境网络边界而非
 RPC 错误均经持久重试恢复，队列/重试/失败最终为 0。该窗口仅形成 1 条外部入账 needs_review，
 没有命中临时策略的 Relay BUY/SELL，paper decision/fill 为 0；因此它证明监听与恢复健康，但不
 替代真实 Relay 信号到 paper fill 的端到端样本。单元回归与固定区块探针共同覆盖该逻辑闭环。
+
+## 2026-09-13 动态目标资产语义修正
+
+`copy_relationships.allowed_assets` 现在解释为可信本金、结算币和中间路由币集合，不再是
+可以买入的 token 白名单。只有已成功执行且达到 `swap_evidenced`、`relay_buy_evidenced` 或
+`relay_sell_evidenced` 的信号，BUY 输出 token / SELL 输入 token 才作为动态目标从静态检查中
+排除；未知中间币仍拒绝，feed intent、UNKNOWN、needs_review 和失败交易不会获得动态放行。
+SELL 后续仍必须命中同 relationship 的已有归因 lot，不能借此卖出钱包中其他来源的 token。
+
+`allowed_routes` 允许配置为空。直连或仅经过可信中间币的已证实 V2/V3/V4 源路径，可以跟随
+新出现的 meme token，而不要求事先枚举其合约；聚合器/Relay 源在 OKX 动态构建接入完成前仍需
+可执行的本地路径，否则报价阶段安全拒绝。字段名为保持 MySQL 向后兼容暂不改动，README 与流程
+文档已明确新语义。
+
+同日增加受控 `mainnet_live` 小额测试入口：独立 `MainnetBroadcaster` 没有修改 `ReadOnlyRpc`
+allowlist，且在读取 key 前和广播瞬间都要求 execution/signing/broadcast 三个 mode、急停关闭、显式
+chain ID，以及权限安全并绑定 follower/relationship/config snapshot 的风险验收 JSON。广播器再次
+恢复 raw transaction sender、校验 chain ID 和本地 hash，RPC 返回 hash 不一致即拒绝。
+
+monitor 只在 `--paper-mysql --ledger-mysql --enable-mainnet-live` 下接受恰好一条
+`run_mode=mainnet_live` 关系，触发点固定为 `swap_evidenced`，当前只执行直接 V2/V3/V4。签名前重新
+加载 enabled relationship，随后进行多轮报价、余额/allowance/Gas/nonce 检查、签名、复核、广播
+和 180 秒公开回执跟踪。已预留/已签名状态在重启时仅报警，避免自动重发。
+
+本入口仍缺 confirmed 回执的真实余额差分→position/PnL 结算、自动 approve 和 OKX monitor 集成，
+因此只能用于人工看守的极小额主网测试，不能称为正式无人值守版本。现有本机 MySQL 已应用
+`004_mainnet_live_relationships.sql`；67 条旧关系保持 `paper/disabled`，没有擅自启用任何钱包。
+
+## 2026-09-13 Fomo/Relay 主网最小闭环准备
+
+针对 relationship 78 的实际 Fomo BUY，monitor 可选 `--relay-auto-associate`：只对目标链被动入账
+候选查询 Relay 官方公共订单，严格绑定源 payer/inTx、目标 recipient/outTx/payment 和本地 receipt。
+当前真实样本源为 Solana USDC；只对登记的 `(chain_id, currency)` 映射到本地 USDG，其他跨链资产
+不推断。若同一目标 receipt 有方向匹配的 V3 Swap，则在该历史区块核对 factory、token0/token1、
+fee/code 后保存本地路径；若严格 Relay 被动交付 receipt 没有 Swap，则只在配置 V3 Factory 的四个
+标准 fee tier 中，以 relationship 实际计划输入量做同区块直接池报价，并逐池核对 code、pair 和 fee
+后择优。两者都不复用聪明钱 calldata，也不是任意多跳/多协议寻路。
+
+统一 `evidenced` trigger 接受严格的 direct swap、Relay BUY 或 Relay SELL 三种证据，feed_intent 与
+receipt_success 仍只能作为 shadow。confirmed live receipt 已补规范块重查、follower ERC-20 净差额
+核验以及归因 lot/PnL/额度结算。新增 `mainnet-approve-usdg`；操作员选择将 allowance 固定为该
+relationship USDG 周期总预算的200倍，软件额度仍为原上限。它拒绝无限授权、已有部分授权、
+pending nonce、配置变化或任一 live gate 缺失，测试结束需要撤销。
+
+实际 MySQL 关系仍 `enabled=0`，当前 snapshot 为
+`aa11cd2486b97f3064cd5f7c744f519f3dc6c079d4dbc4e909e25fe488c2f647`。follower 公共余额已只读核对，
+key 元数据已确认存在/enabled，但没有选择或输出私钥列。历史 Fomo 回补闭合 1 笔 Relay BUY 并保留
+1 笔普通被动入账负例；2 USDG 实时报价/预算探针到 allowance 门禁正确停止。最终 169/169 tests、
+13 笔/27 信号 replay、pip check、compileall、diff check 通过。依据项目规则，真实授权/广播仍需
+完成操作员风险清单，不能因代码入口存在而自动启用。
+
+## 2026-09-13 主网跟卖自动授权与比例语义
+
+第一笔真实 BUY 已成功结算后，SELL 改为按来源持仓比例映射，而不是复制聪明钱的 Token raw 数量。
+例如本次 smart wallet 买到 `69405773920665976786` raw，而 follower 买到
+`50303912913447597330` raw；smart wallet 全卖时 follower 卖自己的全部归因 lot，smart wallet
+卖50%时 follower 卖自己的50%。旧 lot 若尚无新增的 source position 字段，会从原始已保存 BUY
+signal 的 `actual_output_credit_raw` 恢复基数；无法恢复时保持拒绝，不猜测。
+
+V2/V3 SELL 的输入 Token allowance 现在由 monitor 自动管理，不再要求逐笔人工确认。它先重新验证
+enabled relationship、follower/smart/snapshot，再以该 relationship ledger scope 的当前 open lot
+总量作为授权上限；approve 模拟成功、规范 receipt 成功且最终 allowance 足额后，才重新报价并发送
+SELL。钱包中没有对应归因 lot 的同币余额不进入授权上限。171 项单测、pip check 与 diff check
+通过；实际恢复 live 前仍需核对 MySQL lot、链上两侧余额和急停状态。
+
+同日主网 SELL 已形成完整闭环。smart wallet 的 0x + Relay 卖出不能直接提供 follower 可复用的
+执行 calldata；系统从原跟买 lot 恢复此前验证过的 V3 fee=3000 路径并反向执行。follower 精确
+授权并卖出全部 `50303912913447597330` raw Token，收到 `1993796` raw USDG；proposal/attempt/fill、
+lot、额度和归因均已结算，链上 Token 余额与对应 V3 allowance 均为0。详细 hash、区块、PnL 和日志
+见 `docs/SERVER_VALIDATION_2026-09-13.md` 的“第一笔真实 SELL 闭环”。本轮结束后 relationship 78
+已禁用、`var/EXECUTION_STOP` 已恢复，未保留自动实盘运行进程。
+
+配置语义需特别注意：`allowed_protocols` 是来源识别与本地执行协议的准入集合，不是聚合报价器的
+“遍历协议列表”。0x/Relay/Kyber 只提供来源归因；本地执行仍需唯一、可验证的 V2/V3/V4 route。
+当前从 Relay 目标 receipt 自动发现的仅是 V3；SELL 可复用并反转原 BUY lot 保存的 V2/V3/V4 路径。
+跨多个协议主动枚举池、比较报价并选路仍是后续独立的 routing 模块工作，不能把“协议允许”误作
+“已实现该协议的自动寻路”。
+
+第二轮主网测试前又修正 allowance 阈值：`minimum_required_raw` 是本次 proposal 的输入量，
+`amount_raw` 是不足时才写入链上的有界授权目标。USDG 现有 allowance 足够本次买入时不会为了恢复
+到预算×200而逐笔重复 approve；meme Token 现有 allowance 足够本次部分卖出时，也不会仅因它小于
+全部归因持仓而补授权。不足时仍分别补到预算×200或本 relationship 的全部归因 open position。
+172/172 回归通过，relationship 78 与急停仍保持关闭。
+
+第二轮 Fomo/Relay 主网买卖也已形成闭环。BUY 被动入账 receipt 无 Swap，系统先以 Relay 唯一订单
+证明归因，再按跟单实际2 USDG发现并验证 fee=500 直接 V3 池；follower 实际买到
+`9161024053399471` raw Token。smart wallet 全卖后，SELL receipt 自身验证到 fee=3000 V3 路径，
+follower 按归因比例卖出全部上述 Token并收回 `1998190` raw USDG。该轮 lot 已 closed，预算
+invested/reserved 均归零，realized PnL 为 `-1810` raw USDG（不含 Gas），Token 余额/allowance 为0；
+执行审计4笔历史 swap attempt 全部 confirmed 且无 issue。修复后174/174单测、pip check、diff check
+通过。结束状态仍为 relationship 78 disabled、stop file active、无 monitor；公开 hash、区块、Gas、
+最终余额及日志见 `docs/SERVER_VALIDATION_2026-09-13.md`。

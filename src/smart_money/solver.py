@@ -7,6 +7,12 @@ from .models import Signal
 from . import registry as R
 
 
+def _opaque(value, name: str, limit: int = 256) -> str:
+    if not isinstance(value, str) or not value or len(value) > limit:
+        raise ValueError(f"relay {name} is invalid")
+    return value.lower() if value.startswith("0x") else value
+
+
 def _request(document: dict) -> dict:
     requests = document.get("requests")
     if not isinstance(requests, list) or len(requests) != 1:
@@ -118,8 +124,8 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
 
     request = _request(document)
     order_id, request_id = _request_identity(request)
-    request_user = str(request.get("user", "")).lower()
-    if (request.get("status") != "success" or len(request_user) != 42
+    request_user = _opaque(request.get("user"), "request user", 128)
+    if (request.get("status") != "success"
             or str(request.get("recipient", "")).lower() != candidate.wallet):
         raise ValueError("relay request is not owned by the candidate wallet")
     protocol = request.get("protocol", {})
@@ -129,13 +135,13 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
         origin_chain = int(origin.get("chainId"))
     except (TypeError, ValueError):
         raise ValueError("relay origin amount or chain is invalid") from None
-    token_in = str(origin.get("currency", "")).lower()
-    source_tx = str(origin.get("transactionId", "")).lower()
-    if (amount_in <= 0 or len(token_in) != 42 or len(source_tx) != 66
-            or str(origin.get("depositor", "")).lower() != request_user):
+    source_currency = _opaque(origin.get("currency"), "origin currency", 128)
+    source_tx = _opaque(origin.get("transactionId"), "origin transaction")
+    source_payer = _opaque(origin.get("depositor"), "origin depositor", 128)
+    if amount_in <= 0 or source_payer != request_user:
         raise ValueError("relay origin is not attributable to the request user")
     in_txs = request.get("data", {}).get("inTxs", [])
-    if sum(str(item.get("hash", "")).lower() == source_tx
+    if sum(_opaque(item.get("hash"), "input transaction") == source_tx
            and item.get("chainId") == origin_chain and item.get("status") == "success"
            for item in in_txs) != 1:
         raise ValueError("relay origin transaction is not uniquely successful")
@@ -164,7 +170,8 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
             credits.append((str(token.get("tokenAddress", "")).lower(), amount))
     if credits != [(token_out, amount_out)]:
         raise ValueError("relay delivery credit does not match the local receipt")
-    order_output = protocol.get("orderData", {}).get("output", {})
+    order_data = request.get("orderData") or protocol.get("orderData") or {}
+    order_output = order_data.get("output", {})
     payments = order_output.get("payments", [])
     matching_payments = []
     for payment in payments:
@@ -179,10 +186,12 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
     if len(matching_payments) != 1:
         raise ValueError("relay order output does not uniquely authorize the wallet credit")
 
+    local_input = (R.USDG if (origin_chain, source_currency)
+                   in R.RELAY_USDG_EQUIVALENTS else source_currency)
     result = deepcopy(candidate)
     result.behavior = "BUY"
     result.stage = "relay_buy_evidenced"
-    result.token_in = token_in
+    result.token_in = local_input
     result.token_out = token_out
     result.amount_in_raw = str(amount_in)
     result.amount_out_raw = str(amount_out)
@@ -192,7 +201,11 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
     result.evidence.update({
         "source_orchestrator": "relay", "relay_order_id": order_id,
         "relay_request_id": request_id, "source_chain_id": str(origin_chain),
-        "source_tx_hash": source_tx, "source_payer": request_user,
+        "source_currency": source_currency, "source_tx_hash": source_tx,
+        "source_payer": request_user, "local_funding_asset": local_input,
+        "funding_normalization": (
+            "solana_usdc_6_to_robinhood_usdg_6_operator_approved"
+            if local_input == R.USDG and source_currency != R.USDG else "identity"),
         "destination_tx_hash": candidate.tx_hash,
         "actual_input_debit_raw": str(amount_in),
         "actual_output_credit_raw": str(amount_out),

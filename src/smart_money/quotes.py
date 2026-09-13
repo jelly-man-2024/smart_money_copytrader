@@ -1,14 +1,17 @@
 """Block-pinned, read-only Uniswap quotes for paper trading."""
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, replace
 import time
 
 from eth_abi import decode, encode
+from eth_abi.exceptions import DecodingError
 from eth_utils import keccak
 
 from . import registry as R
 from .models import Signal, address, number
+from .rpc import RpcError
 
 POOL_KEY = "(address,address,uint24,int24,address)"
 V4_PATH_KEY = "(address,uint24,int24,address,bytes)"
@@ -189,6 +192,92 @@ class LiveQuoter:
         reference = await self._quote_at(signal, str(reference_amount), header)
         gas_price = await self.rpc.call("eth_gasPrice")
         return quote, reference, str(number(gas_price))
+
+    async def discover_v3_route(
+            self, signal: Signal, amount_in_raw: str,
+            fee_tiers: tuple[int, ...] = (100, 500, 3000, 10000)) -> dict:
+        """Find one bounded direct V3 route at one pinned canonical block.
+
+        This is intentionally not a general-purpose path search. It checks only
+        the four standard fee tiers on the configured V3 factory, verifies each
+        returned pool's code and immutable pair/fee, and chooses the pool with
+        the greatest quote for the caller's actual planned input amount.
+        """
+        if (signal.stage in {"needs_review", "failed"}
+                or signal.canonical_status == "orphaned"
+                or signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}
+                or not signal.token_in or not signal.token_out):
+            raise ValueError("signal is not eligible for V3 route discovery")
+        if not amount_in_raw.isdecimal() or int(amount_in_raw) <= 0:
+            raise ValueError("invalid route discovery input amount")
+        if fee_tiers != (100, 500, 3000, 10000):
+            raise ValueError("only the bounded standard V3 fee tiers are supported")
+
+        token_in, token_out = _erc20(signal.token_in), _erc20(signal.token_out)
+        if token_in == token_out:
+            raise ValueError("V3 route assets must differ")
+        header = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
+        if (not isinstance(header, dict) or not isinstance(header.get("hash"), str)
+                or "number" not in header):
+            raise ValueError("route discovery block header missing")
+        block_number = number(header["number"])
+        block_tag = hex(block_number)
+        candidates: list[tuple[int, int, str]] = []
+        for fee in fee_tiers:
+            try:
+                raw_pool = await self._call(
+                    R.V3_FACTORY,
+                    _selector("getPool(address,address,uint24)") + encode(
+                        ["address", "address", "uint24"],
+                        [token_in, token_out, fee]),
+                    block_tag)
+                pool = address(decode(["address"], raw_pool)[0])
+                if pool == R.NATIVE:
+                    continue
+                code = await self.rpc.call("eth_getCode", [pool, block_tag])
+                if not isinstance(code, str) or code.lower() in {"0x", "0x0", "0x00"}:
+                    continue
+                pool_token0 = address(decode(
+                    ["address"], await self._call(
+                        pool, _selector("token0()"), block_tag))[0])
+                pool_token1 = address(decode(
+                    ["address"], await self._call(
+                        pool, _selector("token1()"), block_tag))[0])
+                pool_fee = int(decode(
+                    ["uint24"], await self._call(
+                        pool, _selector("fee()"), block_tag))[0])
+                if {pool_token0, pool_token1} != {token_in, token_out} or pool_fee != fee:
+                    continue
+                evidence = deepcopy(signal.evidence)
+                evidence["hops"] = [{
+                    "token_in": signal.token_in,
+                    "token_out": signal.token_out,
+                    "fee": fee,
+                }]
+                quote_signal = replace(
+                    signal, protocol="v3", contract=R.V3_QUOTER,
+                    exact_in=True, amount_out_raw=None, amount_limit_raw=None,
+                    evidence=evidence)
+                quote = await self._quote_at(quote_signal, amount_in_raw, header)
+                candidates.append((int(quote.amount_out_raw), fee, pool))
+            except (RpcError, DecodingError, ValueError, TypeError, IndexError):
+                continue
+        if not candidates:
+            raise ValueError("no verified quotable direct V3 pool")
+        amount_out, fee, pool = sorted(
+            candidates, key=lambda item: (-item[0], item[1], item[2]))[0]
+        return {
+            "protocol": "v3",
+            "assets": [signal.token_in, signal.token_out],
+            "fees": [fee],
+            "verified_pool": pool,
+            "verified_block_number": str(block_number),
+            "verified_block_hash": header["hash"].lower(),
+            "route_discovery": "v3_factory_bounded_best_quote",
+            "route_discovery_amount_in_raw": amount_in_raw,
+            "route_discovery_amount_out_raw": str(amount_out),
+            "evaluated_fee_tiers": list(fee_tiers),
+        }
 
     async def _quote_at(self, signal: Signal, amount_in_raw: str, header: dict) -> Quote:
         if (signal.stage in {"needs_review", "failed"}

@@ -12,24 +12,44 @@ import time
 import websockets
 
 from .account_state import prestate_implementations
+from .approval import (
+    approve_relationship_token, approve_relationship_usdg,
+    confirm_relationship_token_approval,
+)
 from .backfill import BlockScanner, ReorgDetected, relevant
+from .broadcast import MainnetBroadcaster
 from .config import load_endpoint_env
 from .decode import Decoder
 from .feed import DecodeError, FeedHealth, decode_raw, envelopes
 from .execution_receipts import ReadOnlyExecutionTracker
+from .execution_controls import require_mainnet_broadcast_enabled
+from .execution_pipeline import (
+    ExecutionPreparer, LiveExecutionSigner, LivePreBroadcastReviewer,
+)
 from .key_source import key_record_status
+from .live_settlement import settle_confirmed_execution
 from .ledger_migration import migrate_sqlite_ledger
 from .models import Transaction, number
-from .mysql_config import import_watchlist_relationships, load_mysql_paper_config
+from .mysql_config import (
+    MySqlRelationshipGate, import_watchlist_relationships,
+    load_enabled_relationship_policy, load_mysql_paper_config,
+)
 from .mysql_store import MySqlStore
 from .native_flows import verify_native_flows
-from .paper import PaperEngine, PaperExecutor, PaperValuator, budget_bucket, scope_reason
+from .paper import (
+    PaperEngine, PaperExecutor, PaperValuator, budget_bucket,
+    execution_quote_signal, scope_reason,
+)
 from .paper_config import load_paper_config
-from .pools import verify_signal_pools
+from .pools import discover_v3_execution_route, verify_signal_pools
 from .quotes import LiveQuoter
 from .receipts import enrich
-from .registry import CHAIN_ID, ENTRYPOINT, delegation, load_watchlist, snapshot_delegations
+from .registry import (
+    CHAIN_ID, ENTRYPOINT, NATIVE, USDG, V2_ROUTER, V3_ROUTER, delegation,
+    load_watchlist, snapshot_delegations,
+)
 from .rpc import ReadOnlyRpc, RpcError
+from .relay_api import RelayApiError, RelayNotReady, RelayPublicClient
 from .solver import relay_passive_buy
 from .store import Store
 
@@ -172,11 +192,53 @@ def paper_cycle(args):
         store.close()
 
 
+def relationship_status(args):
+    """Print one enabled relationship and its snapshot without key material."""
+    policy = load_enabled_relationship_policy(args.relationship_id)
+    print(json.dumps({
+        "relationship_id": policy.relationship_id,
+        "run_mode": policy.run_mode,
+        "follower_wallet": policy.follower_wallet,
+        "smart_wallet": policy.wallet,
+        "smart_wallet_label": policy.label,
+        "strategy_version": policy.strategy_version,
+        "trigger_mode": policy.trigger_mode,
+        "allowed_protocols": sorted(policy.allowed_protocols),
+        "trusted_assets": sorted(policy.allowed_assets),
+        "route_definitions": policy.route_definitions,
+        "budget_limits": policy.budget_limits,
+        "config_snapshot_hash": policy.snapshot_hash,
+        "private_key_read": False,
+    }, ensure_ascii=False, sort_keys=True))
+
+
+async def mainnet_approve_usdg(args):
+    """Explicitly broadcast one exact-budget USDG approval after all live gates."""
+    load_endpoint_env()
+    policy = load_enabled_relationship_policy(args.relationship_id)
+    rpc = ReadOnlyRpc(os.environ.get(
+        "ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"))
+    if number(await rpc.call("eth_chainId")) != CHAIN_ID:
+        raise ValueError("RPC is connected to the wrong chain")
+    result = await approve_relationship_usdg(
+        policy, rpc, MySqlRelationshipGate(), MainnetBroadcaster())
+    print(json.dumps({
+        "relationship_id": policy.relationship_id,
+        "follower_wallet": policy.follower_wallet,
+        "asset": "USDG", "spender": "v3_router",
+        "amount_raw": result.amount_raw,
+        "previous_allowance_raw": result.previous_allowance_raw,
+        "tx_hash": result.tx_hash, "submitted": result.submitted,
+        "live_trading": True,
+    }, ensure_ascii=False, sort_keys=True))
+
+
 async def monitor(args):
     load_endpoint_env()
     watchlist = load_watchlist(args.watchlist)
     watched_bytes = [bytes.fromhex(a[2:]) for a in watchlist]
     rpc = ReadOnlyRpc(os.environ.get("ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"))
+    relay_client = RelayPublicClient() if args.relay_auto_associate else None
     feed_url = os.environ.get("ROBINHOOD_FEED_URL", "wss://feed.mainnet.chain.robinhood.com")
     if not feed_url.startswith("wss://"):
         raise ValueError("feed must use WSS")
@@ -190,6 +252,8 @@ async def monitor(args):
     paper_config = runtime_paper_config(args)
     paper_engines = {}
     paper_executor = None
+    live_pipelines = {}
+    live_tracking_tasks = set()
     if paper_config:
         if not set(paper_config.wallets) <= set(watchlist):
             raise ValueError("paper config wallets must be present in the observer watchlist")
@@ -208,11 +272,42 @@ async def monitor(args):
                         raise ValueError("active paper budget does not match config")
         else:
             raise ValueError("paper mode requires explicit --paper-cycle-action")
+        live_policies = [policy for policy in paper_config.relationships
+                         if policy.run_mode == "mainnet_live"]
+        if live_policies:
+            if (not args.enable_mainnet_live or not args.paper_mysql
+                    or not args.ledger_mysql):
+                raise ValueError(
+                    "mainnet_live requires --enable-mainnet-live, --paper-mysql and --ledger-mysql")
+            if len(live_policies) != 1:
+                raise ValueError("exactly one mainnet_live relationship is supported per process")
+            policy = live_policies[0]
+            require_mainnet_broadcast_enabled(
+                policy.follower_wallet, policy.relationship_id, policy.snapshot_hash)
+        elif args.enable_mainnet_live:
+            raise ValueError("--enable-mainnet-live requires one mainnet_live relationship")
         quoter = LiveQuoter(rpc)
         paper_executor = {}
+        relationship_gate = MySqlRelationshipGate() if live_policies else None
+        broadcaster = MainnetBroadcaster() if live_policies else None
         for policy in paper_config.relationships:
-            paper_executor[policy.ledger_scope] = PaperExecutor(
-                store, quoter, policy.quote_policy, policy.route_definitions)
+            if policy.run_mode == "paper":
+                paper_executor[policy.ledger_scope] = PaperExecutor(
+                    store, quoter, policy.quote_policy, policy.route_definitions)
+            else:
+                preparer = ExecutionPreparer(
+                    store, quoter, rpc, policy.quote_policy,
+                    policy.allowed_protocols, policy.allowed_assets,
+                    policy.allowed_routes, policy.snapshot_hash)
+                signer = LiveExecutionSigner(
+                    store, quoter, rpc, policy.quote_policy, policy.snapshot_hash,
+                    relationship_gate=relationship_gate)
+                reviewer = LivePreBroadcastReviewer(
+                    store, quoter, rpc, policy.quote_policy, relationship_gate)
+                live_pipelines[policy.ledger_scope] = (
+                    preparer, signer, reviewer, broadcaster,
+                    ReadOnlyExecutionTracker(store, rpc),
+                )
             for mode in (policy.trigger_mode, *policy.shadow_trigger_modes):
                 paper_engines[(mode, policy.ledger_scope)] = PaperEngine(
                     store, quoter, policy.quote_policy,
@@ -242,6 +337,11 @@ async def monitor(args):
         "paper_decisions", "paper_accepted", "paper_rejected", "paper_shadow_accepted",
         "paper_filled", "paper_fill_cancelled",
         "paper_reserved_recovered", "paper_errors",
+        "live_prepared", "live_signed", "live_broadcast", "live_pending",
+        "live_confirmed", "live_reverted", "live_orphaned", "live_errors",
+        "live_settled", "live_approval_broadcast", "live_approval_confirmed",
+        "relay_lookup_pending", "relay_lookup_errors", "relay_buy_associated",
+        "local_v3_routes_verified",
     ):
         stats[name] = 0
     stats["recovered_inflight"] = store.recover_inflight()
@@ -273,6 +373,12 @@ async def monitor(args):
                 store.cancel_paper_proposal(proposal_id, "source_signal_unavailable_on_recovery")
                 stats["paper_fill_cancelled"] += 1
                 continue
+            if matching[0].run_mode == "mainnet_live":
+                stats["live_errors"] += 1
+                report("live_recovery_requires_operator_review", proposal_id=proposal_id,
+                       relationship_id=matching[0].relationship_id,
+                       live_trading=True)
+                continue
             execution = await paper_executor[matching[0].ledger_scope].execute(
                 signal, proposal_id)
             stats["paper_reserved_recovered"] += 1
@@ -281,6 +387,103 @@ async def monitor(args):
             report("paper_execution_recovered", proposal_id=proposal_id,
                    status=execution.status, reason=execution.reason,
                    fill_id=execution.fill_id, paper_only=True, live_trading=False)
+
+    async def track_live(policy, proposal_id):
+        tracker = live_pipelines[policy.ledger_scope][4]
+        previous = None
+        for _ in range(180):
+            try:
+                observation = await tracker.observe(proposal_id)
+                if observation.status != previous:
+                    report("live_execution_observed", proposal_id=proposal_id,
+                           tx_hash=observation.tx_hash, status=observation.status,
+                           block_number=observation.block_number,
+                           block_hash=observation.block_hash, live_trading=True)
+                    previous = observation.status
+                if observation.status in {"confirmed", "reverted", "orphaned"}:
+                    stats[f"live_{observation.status}"] += 1
+                    if observation.status == "confirmed":
+                        try:
+                            settlement = await settle_confirmed_execution(
+                                store, rpc, proposal_id, observation.tx_hash)
+                            stats["live_settled"] += 1
+                            report("live_execution_settled", **settlement,
+                                   live_trading=True)
+                        except Exception as exc:
+                            stats["live_errors"] += 1
+                            report("live_settlement_error", proposal_id=proposal_id,
+                                   tx_hash=observation.tx_hash,
+                                   error_type=type(exc).__name__, live_trading=True)
+                    return
+                stats["live_pending"] += observation.status == "observed_pending"
+            except Exception as exc:
+                stats["live_errors"] += 1
+                report("live_tracking_error", proposal_id=proposal_id,
+                       error_type=type(exc).__name__, live_trading=True)
+            await asyncio.sleep(1)
+        report("live_tracking_timeout", proposal_id=proposal_id, live_trading=True)
+
+    async def execute_live(policy, signal, proposal_id):
+        proposal = store.paper_proposal(proposal_id)
+        quote_signal = execution_quote_signal(
+            signal, policy.route_definitions, proposal["output_asset"])
+        if quote_signal.protocol not in {"v2", "v3", "v4"}:
+            raise ValueError("live execution route is not a verified V2/V3/V4 path")
+        preparer, signer, reviewer, broadcaster, _ = live_pipelines[policy.ledger_scope]
+        if quote_signal.token_in != NATIVE:
+            spender = {"v2": V2_ROUTER, "v3": V3_ROUTER}.get(
+                quote_signal.protocol)
+            if spender is None:
+                raise ValueError("live token input route has no verified approval spender")
+            if proposal["attribution"].get("source_behavior") == "SELL":
+                approval_amount = store.paper_open_position_amount(
+                    policy.ledger_scope, quote_signal.token_in)
+                if int(approval_amount) < int(proposal["amount_in_raw"]):
+                    raise ValueError("attributed approval bound is below proposal input")
+                approval = await approve_relationship_token(
+                    policy, rpc, relationship_gate, broadcaster,
+                    quote_signal.token_in, approval_amount, spender,
+                    minimum_required_raw=proposal["amount_in_raw"])
+            elif quote_signal.token_in == USDG and spender == V3_ROUTER:
+                approval = await approve_relationship_usdg(
+                    policy, rpc, relationship_gate, broadcaster,
+                    minimum_required_raw=proposal["amount_in_raw"])
+            else:
+                approval = await approve_relationship_token(
+                    policy, rpc, relationship_gate, broadcaster,
+                    quote_signal.token_in, proposal["amount_in_raw"], spender)
+            if approval.submitted:
+                stats["live_approval_broadcast"] += 1
+                report("live_approval_broadcast", proposal_id=proposal_id,
+                       tx_hash=approval.tx_hash, asset=approval.asset,
+                       spender=approval.spender, amount_raw=approval.amount_raw,
+                       previous_allowance_raw=approval.previous_allowance_raw,
+                       relationship_id=policy.relationship_id, live_trading=True)
+                confirmation = await confirm_relationship_token_approval(
+                    rpc, approval, policy.follower_wallet)
+                stats["live_approval_confirmed"] += 1
+                report("live_approval_confirmed", proposal_id=proposal_id,
+                       relationship_id=policy.relationship_id,
+                       live_trading=True, **confirmation)
+        prepared = await preparer.prepare(quote_signal, proposal_id)
+        stats["live_prepared"] += 1
+        signed = await signer.sign(quote_signal, proposal_id)
+        stats["live_signed"] += 1
+        reviewed = await reviewer.review(
+            quote_signal, proposal_id, signed.raw_transaction)
+        result = await broadcaster.broadcast(
+            reviewed, signed.raw_transaction,
+            follower_wallet=policy.follower_wallet,
+            relationship_id=policy.relationship_id,
+            config_snapshot_hash=policy.snapshot_hash)
+        stats["live_broadcast"] += 1
+        report("live_execution_broadcast", proposal_id=proposal_id,
+               plan_id=prepared.plan_id, tx_hash=result.tx_hash,
+               relationship_id=policy.relationship_id,
+               follower_wallet=policy.follower_wallet, live_trading=True)
+        task = asyncio.create_task(track_live(policy, proposal_id))
+        live_tracking_tasks.add(task)
+        task.add_done_callback(live_tracking_tasks.discard)
 
     async def paper_observe(signal):
         if not paper_config or signal.wallet not in paper_config.wallets:
@@ -303,7 +506,10 @@ async def monitor(args):
                          or (mode == "swap_evidenced" and signal.stage in {
                              "swap_evidenced", "needs_review", "failed"})
                          or (mode in {"relay_sell_evidenced", "relay_buy_evidenced"}
-                             and signal.stage in {mode, "needs_review", "failed"}))
+                             and signal.stage in {mode, "needs_review", "failed"})
+                         or (mode == "evidenced" and signal.stage in {
+                             "swap_evidenced", "relay_sell_evidenced",
+                             "relay_buy_evidenced", "needs_review", "failed"}))
                 if not ready:
                     continue
                 decision_started = time.monotonic()
@@ -321,26 +527,35 @@ async def monitor(args):
                        follower_wallet=policy.follower_wallet,
                        shadow_only=engine.shadow_only, accepted=decision.accepted,
                        reason=decision.reason, proposal_id=decision.proposal_id,
-                       live_trading=False)
+                       live_trading=policy.run_mode == "mainnet_live")
                 if decision.accepted and decision.proposal_id and not engine.shadow_only:
                     execution_started = time.monotonic()
-                    execution = await paper_executor[policy.ledger_scope].execute(
-                        signal, decision.proposal_id)
-                    timings.observe("paper_execution_requote_ms",
-                                    time.monotonic() - execution_started)
-                    stats["paper_filled" if execution.status == "filled"
-                          else "paper_fill_cancelled"] += 1
-                    report("paper_execution", proposal_id=execution.proposal_id,
-                           status=execution.status, reason=execution.reason,
-                           fill_id=execution.fill_id, paper_only=True, live_trading=False)
+                    if policy.run_mode == "paper":
+                        execution = await paper_executor[policy.ledger_scope].execute(
+                            signal, decision.proposal_id)
+                        timings.observe("paper_execution_requote_ms",
+                                        time.monotonic() - execution_started)
+                        stats["paper_filled" if execution.status == "filled"
+                              else "paper_fill_cancelled"] += 1
+                        report("paper_execution", proposal_id=execution.proposal_id,
+                               status=execution.status, reason=execution.reason,
+                               fill_id=execution.fill_id, paper_only=True,
+                               live_trading=False)
+                    else:
+                        await execute_live(policy, signal, decision.proposal_id)
+                        timings.observe("live_execution_ms",
+                                        time.monotonic() - execution_started)
 
     async def safe_paper_observe(signal):
         try:
             await paper_observe(signal)
         except Exception as exc:
-            stats["paper_errors"] += 1
-            report("paper_error", source_event_id=signal.event_id,
-                   error_type=type(exc).__name__, live_trading=False)
+            live = any(policy.run_mode == "mainnet_live"
+                       for policy in paper_config.policies_for(signal.wallet)) \
+                if paper_config else False
+            stats["live_errors" if live else "paper_errors"] += 1
+            report("copy_execution_error", source_event_id=signal.event_id,
+                   error_type=type(exc).__name__, live_trading=live)
 
     async def account_impl(wallet, block="latest", strict=False):
         try:
@@ -406,12 +621,81 @@ async def monitor(args):
                     if native_checks:
                         timings.observe("native_trace_rpc_ms", time.monotonic() - native_started)
                     final_signals = enrich(tx, signals, receipt, watchlist, pool_checks, native_checks)
+                    defer_completion = False
                     for signal in final_signals:
                         signal.fresh = bool(tx.timestamp and health.healthy() and time.time() - tx.timestamp <= health.max_age_seconds)
                         signal.evidence["account_state_source"] = "transaction_prestate_trace"
                         signal.evidence["observation_source"] = tx.observation_source
+                        if signal.stage == "relay_sell_evidenced":
+                            try:
+                                signal.evidence["local_execution_route"] = \
+                                    await discover_v3_execution_route(
+                                        rpc, receipt, signal.token_in, signal.token_out,
+                                        signal.evidence.get("actual_output_credit_raw"))
+                                stats["local_v3_routes_verified"] += 1
+                            except (RpcError, ValueError) as exc:
+                                report("local_execution_route_rejected",
+                                       source_event_id=signal.event_id,
+                                       error_type=type(exc).__name__, live_trading=False)
                         emit(store, signal)
-                        await safe_paper_observe(signal)
+                        observed = signal
+                        if (relay_client is not None
+                                and signal.behavior in {
+                                    "EXTERNAL_DELIVERY_CANDIDATE", "INCOMING_TRANSFER"}
+                                and signal.stage == "needs_review"):
+                            try:
+                                document = await relay_client.lookup_by_destination_hash(
+                                    signal.tx_hash)
+                                associated = relay_passive_buy(document, signal)
+                                try:
+                                    associated.evidence["local_execution_route"] = \
+                                        await discover_v3_execution_route(
+                                            rpc, receipt, associated.token_in,
+                                            associated.token_out,
+                                            associated.evidence.get(
+                                                "actual_output_credit_raw"))
+                                    stats["local_v3_routes_verified"] += 1
+                                except (RpcError, ValueError) as exc:
+                                    report("local_execution_route_not_in_receipt",
+                                           source_event_id=associated.event_id,
+                                           error_type=type(exc).__name__,
+                                           active_discovery_deferred=True,
+                                           live_trading=False)
+                                emit(store, associated)
+                                observed = associated
+                                stats["relay_buy_associated"] += 1
+                                stats["receipt_relay_buy_evidenced"] += 1
+                                report("relay_buy_auto_associated",
+                                       source_event_id=associated.event_id,
+                                       relay_order_id=associated.evidence.get("relay_order_id"),
+                                       live_trading=False)
+                            except RelayNotReady:
+                                stats["relay_lookup_pending"] += 1
+                                defer_completion = True
+                                continue
+                            except (RelayApiError, RpcError, ValueError) as exc:
+                                stats["relay_lookup_errors"] += 1
+                                report("relay_buy_auto_association_rejected",
+                                       source_event_id=signal.event_id,
+                                       error_type=type(exc).__name__, live_trading=False)
+                        route_before = observed.evidence.get("local_execution_route")
+                        await safe_paper_observe(observed)
+                        route_after = observed.evidence.get("local_execution_route")
+                        if (not isinstance(route_before, dict)
+                                and isinstance(route_after, dict)
+                                and route_after.get("route_discovery")
+                                == "v3_factory_bounded_best_quote"):
+                            stats["local_v3_routes_verified"] += 1
+                            report(
+                                "local_v3_route_discovered",
+                                source_event_id=observed.event_id,
+                                verified_pool=route_after.get("verified_pool"),
+                                fee=(route_after.get("fees") or [None])[0],
+                                block_number=route_after.get(
+                                    "verified_block_number"),
+                                amount_in_raw=route_after.get(
+                                    "route_discovery_amount_in_raw"),
+                                live_trading=False)
                         stats["receipt_signals"] += 1
                         if signal.behavior == "UNKNOWN":
                             stats["receipt_unknown"] += 1
@@ -424,8 +708,16 @@ async def monitor(args):
                         if signal.stage == "relay_buy_evidenced":
                             stats["receipt_relay_buy_evidenced"] += 1
                     stats["receipts"] += 1
-                    store.complete_candidate(tx.hash, number(receipt.get("blockNumber", 0)),
-                                             receipt.get("blockHash"))
+                    if defer_completion:
+                        attempts, delay = store.retry_candidate(
+                            tx.hash, "relay_request_not_ready")
+                        if delay is None:
+                            stats["candidate_retry_exhausted"] += 1
+                        else:
+                            stats["candidate_retries"] += 1
+                    else:
+                        store.complete_candidate(tx.hash, number(receipt.get("blockNumber", 0)),
+                                                 receipt.get("blockHash"))
             except RpcError:
                 stats["worker_errors"] += 1
                 attempts, delay = store.retry_candidate(tx.hash, "rpc_error")
@@ -544,7 +836,8 @@ async def monitor(args):
     beat = asyncio.create_task(heartbeat())
     receiver = asyncio.create_task(receive())
     try:
-        report("monitor_started", wallets=len(watchlist), seconds=args.seconds, live_trading=False)
+        report("monitor_started", wallets=len(watchlist), seconds=args.seconds,
+               live_trading=bool(live_pipelines))
         if args.seconds > 0:
             try:
                 await asyncio.wait_for(receiver, timeout=args.seconds)
@@ -559,14 +852,18 @@ async def monitor(args):
     finally:
         for task in [receiver, dispatch_task, backfill_task, beat, *workers]:
             task.cancel()
+        for task in live_tracking_tasks:
+            task.cancel()
         await asyncio.gather(receiver, dispatch_task, backfill_task, beat, *workers,
                              return_exceptions=True)
+        if live_tracking_tasks:
+            await asyncio.gather(*live_tracking_tasks, return_exceptions=True)
         candidate_states = store.candidate_counts()
         chain_cursor = store.chain_cursor()
         store.close()
         report("monitor_finished", counters=dict(stats), candidate_states=candidate_states,
                chain_cursor=chain_cursor, latency_ms=timings.summary(),
-               coverage=coverage_summary(stats), live_trading=False)
+               coverage=coverage_summary(stats), live_trading=bool(live_pipelines))
 
 
 async def reconcile_reorg(args):
@@ -665,7 +962,8 @@ async def execution_track(args):
 
 
 def parser():
-    root = argparse.ArgumentParser(description="Read-only smart-money observer; no signing or broadcasting")
+    root = argparse.ArgumentParser(
+        description="Smart-money observer with separately gated mainnet execution tools")
     commands = root.add_subparsers(dest="command", required=True)
     replay_parser = commands.add_parser("replay", help="Replay captured transactions without network access")
     replay_parser.add_argument("--fixtures", default="data/transaction_examples.json")
@@ -682,6 +980,12 @@ def parser():
     monitor_parser.add_argument("--confirmations", type=int, default=2)
     monitor_parser.add_argument("--backfill-batch", type=int, default=20)
     monitor_parser.add_argument("--backfill-interval", type=float, default=1.0)
+    monitor_parser.add_argument(
+        "--enable-mainnet-live", action="store_true",
+        help="Explicitly allow one fully gated mainnet_live MySQL relationship")
+    monitor_parser.add_argument(
+        "--relay-auto-associate", action="store_true",
+        help="Read Relay public order evidence for passive delivery candidates")
     monitor_source = monitor_parser.add_mutually_exclusive_group()
     monitor_source.add_argument("--paper-config")
     monitor_source.add_argument("--paper-mysql", action="store_true",
@@ -718,6 +1022,14 @@ def parser():
     relationship_parser.add_argument("--follower-label", required=True)
     relationship_parser.add_argument("--watchlist", default="data/fomo_watchlist.csv")
     relationship_parser.add_argument("--template", default="config/paper.example.json")
+    relationship_status_parser = commands.add_parser(
+        "relationship-status",
+        help="Show one enabled relationship and its live-binding snapshot without secrets")
+    relationship_status_parser.add_argument("--relationship-id", required=True)
+    approval_parser = commands.add_parser(
+        "mainnet-approve-usdg",
+        help="Broadcast one bounded 200x-budget USDG approval for an enabled live relationship")
+    approval_parser.add_argument("--relationship-id", required=True)
     paper_export_parser = commands.add_parser(
         "paper-export", help="Export attributed paper fills as JSONL")
     paper_export_parser.add_argument("--db", default="var/observer.sqlite3")
@@ -825,6 +1137,10 @@ def main():
                 args.follower_wallet, args.follower_label, args.watchlist, args.template)
             report("relationships_imported", inserted=inserted, skipped_existing=skipped,
                    enabled=False, live_trading=False)
+        elif args.command == "relationship-status":
+            relationship_status(args)
+        elif args.command == "mainnet-approve-usdg":
+            asyncio.run(mainnet_approve_usdg(args))
         else:
             require_existing_sqlite(args)
             store = runtime_store(args)

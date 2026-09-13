@@ -31,6 +31,7 @@ class WalletPaperPolicy:
     label: str
     follower_wallet: str | None
     relationship_id: str | None
+    run_mode: str
     budget_limits: dict[str, str]
     buy_rules: dict[str, AmountRule]
     sell_rule: AmountRule
@@ -179,8 +180,8 @@ def load_paper_config(path: str | Path) -> PaperConfig:
     if len(normalized_assets) != len(set(normalized_assets)):
         raise ValueError("duplicate allowed asset")
     route_rows = document["allowed_routes"]
-    if not isinstance(route_rows, list) or not route_rows:
-        raise ValueError("allowed routes are required")
+    if not isinstance(route_rows, list):
+        raise ValueError("allowed routes must be a list")
     route_keys = [_route_key(row, set(protocols), set(normalized_assets))
                   for row in route_rows]
     if len(route_keys) != len(set(route_keys)):
@@ -192,7 +193,7 @@ def load_paper_config(path: str | Path) -> PaperConfig:
     relationships = []
     relationship_keys = set()
     for row in wallet_rows:
-        _fields(row, {"wallet", "label", "follower_wallet", "relationship_id",
+        _fields(row, {"wallet", "label", "follower_wallet", "relationship_id", "run_mode",
                       "budget_limits", "buy_rules", "sell_rule"},
                 {"wallet", "budget_limits", "buy_rules", "sell_rule"}, "wallet policy")
         wallet = address(row["wallet"])
@@ -223,8 +224,16 @@ def load_paper_config(path: str | Path) -> PaperConfig:
             raise ValueError("invalid relationship id")
         if (follower is None) != (relationship_id is None):
             raise ValueError("follower wallet and relationship id must be configured together")
+        run_mode = row.get("run_mode", "paper")
+        if run_mode not in {"paper", "mainnet_live"}:
+            raise ValueError("invalid relationship run mode")
+        if run_mode == "mainnet_live" and (
+                follower is None or relationship_id is None
+                or trigger not in {"swap_evidenced", "evidenced"}):
+            raise ValueError(
+                "mainnet_live requires a relationship identity and evidenced trigger")
         policy = WalletPaperPolicy(
-            wallet, label.strip(), follower, relationship_id, normalized_limits,
+            wallet, label.strip(), follower, relationship_id, run_mode, normalized_limits,
             {bucket: _amount_rule(rule) for bucket, rule in buy_rules.items()},
             _amount_rule(row["sell_rule"]), strategy, trigger, tuple(shadows),
             quote_policy, frozenset(protocols), frozenset(normalized_assets),
@@ -242,7 +251,7 @@ def load_paper_config(path: str | Path) -> PaperConfig:
         document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     relationships = [WalletPaperPolicy(
         policy.wallet, policy.label, policy.follower_wallet, policy.relationship_id,
-        policy.budget_limits, policy.buy_rules, policy.sell_rule,
+        policy.run_mode, policy.budget_limits, policy.buy_rules, policy.sell_rule,
         policy.strategy_version, policy.trigger_mode, policy.shadow_trigger_modes,
         policy.quote_policy, policy.allowed_protocols, policy.allowed_assets,
         policy.allowed_routes, policy.route_definitions, snapshot_hash,

@@ -83,8 +83,8 @@ def rows_to_document(rows: list[dict]) -> dict:
     wallets = []
     seen_relationships = set()
     for row in rows:
-        if row.get("run_mode") != "paper":
-            raise ValueError("only paper relationships are supported")
+        if row.get("run_mode") not in {"paper", "mainnet_live"}:
+            raise ValueError("unsupported relationship run mode")
         follower = address(row["follower_wallet"])
         smart = address(row["smart_wallet"])
         relationship = (follower, smart)
@@ -112,6 +112,7 @@ def rows_to_document(rows: list[dict]) -> dict:
             "label": row["smart_wallet_label"],
             "follower_wallet": follower,
             "relationship_id": str(row["id"]),
+            "run_mode": row["run_mode"],
             "budget_limits": {
                 "USDG": str(row["usdg_budget_limit_raw"]),
                 "ETH_WETH": str(row["eth_budget_limit_raw"]),

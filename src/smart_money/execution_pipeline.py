@@ -13,8 +13,10 @@ from hexbytes import HexBytes
 from .execution_prep import (
     ReadOnlyExecutionPreflight, UnsignedExecutionPlan, build_execution_plan,
 )
-from .key_source import OfflineDatabaseSigner
-from .execution_controls import require_offline_signing_enabled
+from .key_source import LiveDatabaseSigner, OfflineDatabaseSigner
+from .execution_controls import (
+    require_mainnet_signing_enabled, require_offline_signing_enabled,
+)
 from .quotes import assess_quote
 from .registry import UNIVERSAL_ROUTER, V2_ROUTER, V3_ROUTER
 
@@ -134,9 +136,9 @@ class ExecutionPreparer:
         if (not follower or not relationship or snapshot != self.config_snapshot_hash
                 or proposal["source_event_id"] != signal.event_id):
             raise ValueError("proposal attribution or config snapshot mismatch")
-        now = time.time() if now is None else now
         quote, reference, gas_price_raw = await self.quoter.quote_with_reference(
             signal, proposal["amount_in_raw"])
+        now = time.time() if now is None else now
         accepted, reason, risk = assess_quote(
             signal, quote, reference, self.quote_policy, gas_price_raw, now)
         if not accepted:
@@ -203,7 +205,6 @@ class OfflineExecutionSigner:
 
     async def _sign(self, signal, proposal_id: str, now: float | None,
                     recovering: bool) -> OfflineSignedExecution:
-        require_offline_signing_enabled()
         row = self.store.execution_plan(proposal_id)
         expected_status = "signed" if recovering else "prepared"
         if (row is None or row["status"] != expected_status
@@ -211,6 +212,7 @@ class OfflineExecutionSigner:
                 or row.get("unsigned_plan") is None):
             raise ValueError(
                 f"{expected_status} execution plan is unavailable or stale")
+        self._authorize(row)
         proposal = self.store.paper_proposal(proposal_id)
         if (proposal is None or proposal["status"] != "reserved"
                 or proposal["source_event_id"] != signal.event_id
@@ -235,9 +237,9 @@ class OfflineExecutionSigner:
             if (len(attempts) != 1 or attempts[0]["tx_hash"] != row["signed_tx_hash"]
                     or attempts[0]["status"] != "signed"):
                 raise ValueError("signed transaction is already observed or not recoverable")
-        now = time.time() if now is None else now
         quote, reference, gas_price = await self.quoter.quote_with_reference(
             signal, proposal["amount_in_raw"])
+        now = time.time() if now is None else now
         accepted, reason, risk = assess_quote(
             signal, quote, reference, self.quote_policy, gas_price, now)
         original = UnsignedExecutionPlan(**row["unsigned_plan"])
@@ -252,7 +254,7 @@ class OfflineExecutionSigner:
             self.quote_policy.max_gas_cost_wei).check(refreshed, now)
         if preflight["pending_nonce"] > reservation["nonce"]:
             raise ValueError("reserved nonce is behind current pending nonce")
-        signer = self.signer_factory(row["follower_wallet"])
+        signer = self._signer(row)
         raw = signer.sign_transaction(row["transaction"])
         if Account.recover_transaction(raw).lower() != row["follower_wallet"]:
             raise ValueError("offline signature sender mismatch")
@@ -277,6 +279,31 @@ class OfflineExecutionSigner:
             row["plan_id"], proposal_id, tx_hash, raw,
             {**preflight, "requote": quote.to_dict(), "risk": risk})
 
+    def _authorize(self, row: dict) -> None:
+        require_offline_signing_enabled()
+
+    def _signer(self, row: dict):
+        return self.signer_factory(row["follower_wallet"])
+
+
+class LiveExecutionSigner(OfflineExecutionSigner):
+    """Sign one approved mainnet plan; raw bytes remain memory-only."""
+
+    def __init__(self, store, quoter, rpc, quote_policy, config_snapshot_hash: str,
+                 signer_factory=LiveDatabaseSigner, relationship_gate=None):
+        super().__init__(store, quoter, rpc, quote_policy, config_snapshot_hash,
+                         signer_factory, relationship_gate)
+
+    def _authorize(self, row: dict) -> None:
+        require_mainnet_signing_enabled(
+            row["follower_wallet"], row["relationship_id"],
+            row["config_snapshot_hash"])
+
+    def _signer(self, row: dict):
+        return self.signer_factory(
+            row["follower_wallet"], row["relationship_id"],
+            row["config_snapshot_hash"])
+
 
 class ReadOnlyPreBroadcastReviewer:
     """Last read-only review of signed bytes; deliberately cannot broadcast."""
@@ -290,7 +317,6 @@ class ReadOnlyPreBroadcastReviewer:
 
     async def review(self, signal, proposal_id: str, raw_transaction: bytes,
                      now: float | None = None) -> ReadOnlyBroadcastReview:
-        require_offline_signing_enabled()
         if (not isinstance(raw_transaction, bytes) or not raw_transaction
                 or len(raw_transaction) > 1024 * 1024):
             raise ValueError("invalid signed transaction bytes")
@@ -301,6 +327,7 @@ class ReadOnlyPreBroadcastReviewer:
                 or proposal["source_event_id"] != signal.event_id
                 or signal.canonical_status == "orphaned"):
             raise ValueError("signed execution is unavailable or stale")
+        self._authorize(row)
         tx_hash = "0x" + keccak(raw_transaction).hex()
         if tx_hash != row["signed_tx_hash"]:
             raise ValueError("signed transaction hash does not match execution plan")
@@ -327,9 +354,9 @@ class ReadOnlyPreBroadcastReviewer:
         if (budget.get("follower_wallet") != row["follower_wallet"]
                 or budget.get("relationship_id") != row["relationship_id"]):
             raise ValueError("execution budget attribution does not match plan")
-        now = time.time() if now is None else now
         quote, reference, gas_price = await self.quoter.quote_with_reference(
             signal, proposal["amount_in_raw"])
+        now = time.time() if now is None else now
         accepted, reason, risk = assess_quote(
             signal, quote, reference, self.quote_policy, gas_price, now)
         if not accepted or int(quote.amount_out_raw) < int(original.minimum_amount_out_raw):
@@ -350,3 +377,15 @@ class ReadOnlyPreBroadcastReviewer:
             "risk": risk, "preflight": preflight,
         }
         return ReadOnlyBroadcastReview(proposal_id, tx_hash, now, evidence)
+
+    def _authorize(self, row: dict) -> None:
+        require_offline_signing_enabled()
+
+
+class LivePreBroadcastReviewer(ReadOnlyPreBroadcastReviewer):
+    """Run the same final review under the exact mainnet relationship gate."""
+
+    def _authorize(self, row: dict) -> None:
+        require_mainnet_signing_enabled(
+            row["follower_wallet"], row["relationship_id"],
+            row["config_snapshot_hash"])

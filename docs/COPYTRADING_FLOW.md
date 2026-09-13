@@ -1,11 +1,13 @@
 # 当前跟单流程与行为矩阵
 
-更新时间：2026-09-12。
+更新时间：2026-09-13。
 
 本文说明当前代码如何从聪明钱链上活动产生信号，以及业务 MySQL 中一条
-`copy_relationships` 配置会让跟单钱包采取什么动作。当前 `run_mode` 只允许 `paper`：所谓
-“跟买、跟卖、成交”均为使用实时 RPC 报价写入业务账本的纸面操作，不读取主网私钥、不签名、
-不广播交易，所有信号继续保持 `copy_eligible=false`。
+`copy_relationships` 配置会让跟单钱包采取什么动作。`run_mode=paper` 的“跟买、跟卖、成交”均为
+使用实时 RPC 报价写入业务账本的纸面操作。`run_mode=mainnet_live` 已增加一条显式测试入口，只允许
+单 relationship、MySQL 配置/账本和 `evidenced` 的严格本地 V2/V3/V4 路径；全部门禁同时打开时才读取
+该 follower 的独立 key MySQL 记录、签名并广播。所有来源信号仍保持 `copy_eligible=false`；live
+资格由独立策略与运行门禁决定，不能根据该字段推断可广播。
 
 ## 1. 一条跟单关系代表什么
 
@@ -33,13 +35,19 @@ proposal、持仓 lot 和收益归因。某行 `enabled=false` 时只保留配�
 | `sell_rule_*` | 聪明钱卖出时，跟单使用固定 token 数量或聪明钱实际卖出数量比例 |
 | `*_budget_limit_raw` | 本手动周期内、按聪明钱关系隔离的 USDG 与 ETH/WETH 累计投入上限 |
 | `allowed_protocols` | 当前策略允许报价的 V2/V3/V4 协议集合 |
-| `allowed_assets` | 跟单决策允许涉及的资产合约集合 |
-| `allowed_routes` | 允许的完整资产路径及 V3 fee、V4 fee/tickSpacing/hook/hookData |
+| `allowed_assets` | 可信本金/结算币和中间路由币；不是目标 meme token 白名单 |
+| `allowed_routes` | 可选的预配置本地路径及 V3 fee、V4 fee/tickSpacing/hook/hookData |
 | `quote_policy` | 报价年龄、价格偏离、价格影响、滑点、Gas 和最小输出限制 |
 | `strategy_version` | 写入历史归因的策略版本；修改配置不会倒推改写旧成交 |
 
 金额始终按链上原始整数处理并以十进制字符串保存。`ratio_ppm=100000` 表示 10%，
 `ratio_ppm=500000` 表示 50%，`ratio_ppm=1000000` 表示 100%。
+
+对于 `swap_evidenced` / Relay 严格兑换证据，BUY 的输出 token 是动态目标，不要求预先写进
+`allowed_assets`；SELL 的输入 token 同样动态，但后续必须能匹配该 relationship 的已有归因 lot。
+本金/结算端和每一个中间 token 仍必须在 `allowed_assets`。例如 `USDG→MEME` 可放行，
+`USDG→未知中间币→MEME` 会拒绝，除非该中间币明确配置为可信；只有 feed intent、收币 Transfer、
+UNKNOWN 或 needs_review 都不会因此获得目标 token 放行。
 
 ### 本机数据库当前实际状态
 
@@ -267,9 +275,9 @@ usdg_fixed_amount_raw = 1000000
 - 不因为钱包转出 token 就跟卖。
 - 不把 bundle 中其他人的 Swap 归给聪明钱。
 - 不复制聪明钱的原始 calldata、nonce、recipient、deadline 或授权。
-- 不自动 approve，更不会自动无限授权。
+- monitor 不自动 approve；独立人工命令最多精确授权该关系的 USDG 周期总额度，绝不无限授权。
 - 不处理未知路径后强行下单。
-- 不读取主网私钥、不签名、不广播主网交易。
+- 默认只读模式不读取主网私钥、不签名、不广播；受控 mainnet_live 仍必须通过单独风险验收。
 - 不承诺成交、收益、最终性或所有协议覆盖。
 
 ## 9. 当前配置下的一条完整示例
@@ -277,7 +285,7 @@ usdg_fixed_amount_raw = 1000000
 假设一条 enabled relationship 配置如下：
 
 ```text
-主触发：swap_evidenced
+主触发：evidenced
 影子触发：feed_intent、receipt_success
 ETH/WETH 买入：聪明钱实际输入的 10%
 USDG 买入：固定 5 USDG
@@ -303,7 +311,7 @@ USDG 周期额度：100 USDG
 
 ## 10. 从当前纸面流程到主网还缺什么
 
-纸面 fill 目前不是链上成交。进入主网 M3 前，还要完成并单独验收：受支持 Router/路径的主网
-交易构建、独立密钥安全、精确授权、广播瞬间最终复核、交易发送、pending/replacement、真实
-回执与余额变化核对、账实不符全局停止，以及操作员确认的极小额额度。完成这些之前，业务表的
-`run_mode` 仍只能是 `paper`。
+纸面 fill 不是链上成交。受控 mainnet_live 已具备 V2/V3/V4 构建、独立密钥门禁、精确 USDG
+授权、广播前复核、pending/receipt 跟踪与 ERC-20 余额差分结算，但仍需人工完成风险清单和真实
+小额证据。业务表的 `run_mode=mainnet_live` 仅用于人工看守测试；OKX 动态构建、复杂 native/手续费
+结算、自动重发以及生产级 Relay v3 迁移未完成，不得作为无人值守正式版本。

@@ -43,7 +43,9 @@ def build_execution_plan(signal, follower_wallet: str, relationship_id: str,
                          allowed_routes: frozenset[str]) -> "UnsignedExecutionPlan":
     """Build evidenced exact-input calldata for tightly bounded V2/V3/V4 paths."""
     follower = address(follower_wallet)
-    if (signal.stage != "swap_evidenced" or signal.execution_status != "success"
+    if (signal.stage not in {"swap_evidenced", "relay_buy_evidenced",
+                             "relay_sell_evidenced"}
+            or signal.execution_status != "success"
             or signal.canonical_status == "orphaned"
             or signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}
             or signal.exact_in is not True or signal.protocol not in {"v2", "v3", "v4"}):

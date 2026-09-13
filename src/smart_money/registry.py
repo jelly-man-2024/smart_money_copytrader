@@ -31,6 +31,8 @@ RELAY_ROUTER = "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
 ZERO_X_ALLOWANCE_HOLDER = "0x0000000000001ff3684f28c67538d4d072c22734"
 KYBER_META_AGGREGATION_ROUTER_V2 = "0x6131b5fae19ea4f9d964eac0408e4408b66337b5"
 PERMIT2 = "0x000000000022d473030f116ddee9f6b43ac78ba3"
+OKX_ROUTER = "0x6e2a35a7ad683cf634d91492d73bb7ff774c6919"
+OKX_APPROVAL = "0x42170295f1173c9e5874ea9d00c6d137e1a4f53d"
 DEPOSITORY = "0x4cd00e387622c35bddb9b4c962c136462338bc31"
 RIPE_CLAIM = "0x2d3cb2b39289f402187d7dc9b609ead6646f2506"
 POSITION_MANAGERS = {
@@ -38,6 +40,11 @@ POSITION_MANAGERS = {
     "0x58daec3116aae6d93017baaea7749052e8a04fa7",
 }
 QUOTE_ASSETS = {NATIVE, WETH, USDG}
+RELAY_USDG_EQUIVALENTS = {
+    # Relay's Solana mainnet chain id and canonical USDC mint. Both this asset
+    # and Robinhood USDG use six decimals; the source identity remains evidence.
+    (792703809, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+}
 
 
 def load_watchlist(path: str | Path) -> dict[str, dict]:
