@@ -194,6 +194,8 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
         "relay_request_id": request_id, "source_chain_id": str(origin_chain),
         "source_tx_hash": source_tx, "source_payer": request_user,
         "destination_tx_hash": candidate.tx_hash,
+        "actual_input_debit_raw": str(amount_in),
+        "actual_output_credit_raw": str(amount_out),
         "order_attribution": "relay_api_and_local_receipt_exact_match",
     })
     result.copy_eligible = False

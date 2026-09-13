@@ -212,7 +212,7 @@ async def monitor(args):
         paper_executor = {}
         for policy in paper_config.relationships:
             paper_executor[policy.ledger_scope] = PaperExecutor(
-                store, quoter, policy.quote_policy)
+                store, quoter, policy.quote_policy, policy.route_definitions)
             for mode in (policy.trigger_mode, *policy.shadow_trigger_modes):
                 paper_engines[(mode, policy.ledger_scope)] = PaperEngine(
                     store, quoter, policy.quote_policy,
@@ -223,6 +223,7 @@ async def monitor(args):
                                      "relationship_id": policy.relationship_id,
                                      "ledger_scope": policy.ledger_scope}},
                     policy.snapshot_hash,
+                    execution_routes=policy.route_definitions,
                     shadow_only=mode != policy.trigger_mode,
                 )
     timings = LatencySamples()
@@ -300,7 +301,9 @@ async def monitor(args):
                 ready = ((mode == "feed_intent" and signal.stage == "intent")
                          or (mode == "receipt_success" and signal.execution_status == "success")
                          or (mode == "swap_evidenced" and signal.stage in {
-                             "swap_evidenced", "needs_review", "failed"}))
+                             "swap_evidenced", "needs_review", "failed"})
+                         or (mode in {"relay_sell_evidenced", "relay_buy_evidenced"}
+                             and signal.stage in {mode, "needs_review", "failed"}))
                 if not ready:
                     continue
                 decision_started = time.monotonic()
@@ -617,7 +620,8 @@ async def paper_mark(args):
                 continue
             try:
                 mark = await PaperValuator(
-                    store, quoter, matching[0].quote_policy).mark(lot_id, source)
+                    store, quoter, matching[0].quote_policy,
+                    matching[0].route_definitions).mark(lot_id, source)
                 marked += 1
                 report("paper_marked", lot_id=lot_id, mark_id=mark.mark_id,
                        block_number=mark.block_number,

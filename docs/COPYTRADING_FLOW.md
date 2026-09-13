@@ -103,13 +103,13 @@ Feed 和 RPC 不是二选一。Feed 用于更早观察意向；RPC 用于补洞�
 | N10 MySQL 关系加载 | [`mysql_config.py:125 load_mysql_paper_config()`](../src/smart_money/mysql_config.py#L125)、[`paper_config.py:125 load_paper_config()`](../src/smart_money/paper_config.py#L125) | 只加载 enabled 行，逐 relationship 严格校验并生成配置快照 |
 | N10 业务 MySQL 后端 | [`mysql_store.py:99 MySqlStore`](../src/smart_money/mysql_store.py#L99)、[`cli.py:52 runtime_store()`](../src/smart_money/cli.py#L52) | 让既有 Store 合约运行于业务 MySQL；`--ledger-mysql` 时启用 |
 | N11 信号分派到关系 | [`cli.py:263 paper_observe()`](../src/smart_money/cli.py#L263) | 找出该聪明钱的全部 relationship，选择 BUY/SELL 规则并分别执行主/影子触发 |
-| N12 触发档判断 | [`paper.py:135 trigger_allowed()`](../src/smart_money/paper.py#L135) | 检查 feed_intent、receipt_success、swap_evidenced 的对应条件及孤块/失败状态 |
+| N12 触发档判断 | [`paper.py:135 trigger_allowed()`](../src/smart_money/paper.py#L135) | 检查 feed_intent、receipt_success、swap_evidenced、relay_buy_evidenced、relay_sell_evidenced 的精确条件及孤块/失败状态 |
 | N12 路径范围判断 | [`paper.py:30 signal_route_key()`](../src/smart_money/paper.py#L30)、[`paper.py:154 scope_reason()`](../src/smart_money/paper.py#L154) | 将协议、完整资产路径、fee/hook 参数与 relationship allowlist 精确匹配 |
 | N13 跟单金额 | [`paper.py:83 budget_bucket()`](../src/smart_money/paper.py#L83)、[`paper.py:115 planned_input_amount()`](../src/smart_money/paper.py#L115) | 选择 USDG 或 ETH/WETH 桶，按固定金额或聪明钱已验证实际输入比例计算 |
-| N14 实时报价 | [`quotes.py:159 LiveQuoter`](../src/smart_money/quotes.py#L159)、[`quotes.py:177 quote_with_reference()`](../src/smart_money/quotes.py#L177) | 在固定区块取得 V2/V3/V4 报价和小额参考报价，不复用聪明钱成交价 |
+| N14 实时报价 | [`paper.py:89 execution_quote_signal()`](../src/smart_money/paper.py#L89)、[`quotes.py:159 LiveQuoter`](../src/smart_money/quotes.py#L159) | 在固定区块取得 V2/V3/V4 报价；聚合器源信号唯一映射到本地允许路径，不复用聪明钱 calldata 或成交价 |
 | N15 风控评估 | [`quotes.py:72 validate_quote()`](../src/smart_money/quotes.py#L72)、[`quotes.py:108 assess_quote()`](../src/smart_money/quotes.py#L108) | 检查年龄、资产、源价格偏离、价格影响、滑点、Gas 与最小输出 |
 | N16 BUY 决策/预留 | [`paper.py:266 PaperEngine.propose_buy()`](../src/smart_money/paper.py#L266)、[`store.py:680 reserve_paper_proposal()`](../src/smart_money/store.py#L680) | 保存 decision，并在同一事务创建 proposal、检查和预留对应额度 |
-| N16 SELL 决策/预留 | [`paper.py:321 PaperEngine.propose_sell()`](../src/smart_money/paper.py#L321)、[`store.py:1080 reserve_paper_sell()`](../src/smart_money/store.py#L1080) | 只预留同 relationship、同 token、同本金桶的可用 position lot |
+| N16 SELL 决策/预留 | [`paper.py:401 PaperEngine.propose_sell()`](../src/smart_money/paper.py#L401)、[`store.py:1082 reserve_paper_sell()`](../src/smart_money/store.py#L1082)、[`store.py:1155 paper_sell_principal_asset()`](../src/smart_money/store.py#L1155) | 只预留同 relationship、同 token 的可用 lot；唯一选择原本金资产并以该资产作为退出和收益单位 |
 | N17 二次报价/纸面成交 | [`paper.py:385 PaperExecutor`](../src/smart_money/paper.py#L385)、[`paper.py:397 execute()`](../src/smart_money/paper.py#L397) | 对 reserved proposal 再报价；恶化或异常则取消，满足条件才写纸面 fill |
 | N18 BUY 订单与持仓 | [`store.py:882 fill_paper_buy()`](../src/smart_money/store.py#L882) | 原子写 BUY order/fill/position lot，额度由 reserved 转为 invested |
 | N19 SELL 与本金恢复 | [`store.py:1153 fill_paper_sell()`](../src/smart_money/store.py#L1153) | 消耗 lot reservation、按卖出比例减少持仓、恢复原本金并写 realized PnL |

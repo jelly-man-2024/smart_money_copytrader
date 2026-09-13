@@ -70,13 +70,21 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 .venv/bin/python scripts/validate_paper_readonly.py
 ```
 
-默认主触发为 `swap_evidenced`，Feed 和 receipt 只作影子比较且不占额度。主触发通过后会再次
+默认主触发为 `swap_evidenced`；也可为 Goal 1 的严格订单证据选择
+`relay_buy_evidenced` 或 `relay_sell_evidenced`。Feed 和 receipt 只作影子比较且不占额度。主触发通过后会再次
 取得固定区块的实时报价；只有第二次报价仍通过原始 `minOut`、时效、偏离、价格冲击和 Gas
 门控，才写入本地 paper fill。全过程没有签名、广播或真实订单。
 `allowed_routes` 必须逐条列出 V2 资产路径、V3 路径与 fee，或 V4 路径与
 fee/tickSpacing/hook/hookData；
-路径中的所有中间资产也必须出现在 `allowed_assets`。路由方向对称，但换 fee、hook 或中间池
+路径中的所有中间资产也必须出现在 `allowed_assets`。对 0x、Kyber 或 Relay Solver 源信号，
+同一配置还必须恰好包含一条首尾资产匹配的本地 V2/V3/V4 报价路径；程序保留源协议归因，
+但不会复用聪明钱的聚合器 calldata。路由方向对称，但换 fee、hook 或中间池
 都会得到不同 key 并被拒绝。
+
+跟卖只处置该 relationship 归因形成的 position lot。退出资产取该 lot 的原始本金资产：例如
+ETH 买入后，即使聪明钱经 Relay 卖成 USDG，纸面跟单仍以允许列表中的 Token→ETH 路径重新报价，
+按 ETH 原始整数计算收益并恢复 ETH_WETH 额度。多个本金资产均可满足同一卖出而无法唯一选择时，
+以 `attributed_principal_asset_ambiguous` 拒绝，不做跨币种原始整数相减。
 
 程序会恢复真实发送者、解析已知智能账户/EntryPoint 包装，再按支持的 ABI 识别行为。
 目标只是收款人的大规模等额分发汇总为一条 BULK_DISTRIBUTION，不生成多个买入信号。

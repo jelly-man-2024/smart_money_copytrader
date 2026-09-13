@@ -156,6 +156,8 @@ def load_mysql_paper_config() -> PaperConfig:
         frozenset().union(*(policy.allowed_protocols for policy in relationships)),
         frozenset().union(*(policy.allowed_assets for policy in relationships)),
         frozenset().union(*(policy.allowed_routes for policy in relationships)),
+        tuple(definition for policy in relationships
+              for definition in policy.route_definitions),
         wallets, tuple(relationships), aggregate_hash,
     )
 

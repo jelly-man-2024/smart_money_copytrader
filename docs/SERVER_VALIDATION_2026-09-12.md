@@ -514,3 +514,42 @@ Base 付款人不是 Robinhood 收币钱包，因此规则分别要求 `request.
 至此完成；没有自动进入 Goal 2、paper 或实盘。非阻塞后续风险：紧凑 Kyber 样本不是完整原始
 tx/receipt 归档；Relay requests/v2 官方将在 2026-11-24 退役，而 v3 需要 API key。当前程序不
 自动调用 v2，只消费操作者保存的证据 JSON；Goal 2 前应单独设计 v3 凭据和响应兼容方案。
+
+## 精简版 Goal 2：Relay 信号到本地纸面路径（进行中）
+
+本轮新增 `relay_buy_evidenced`、`relay_sell_evidenced` 精确触发档，0x、Kyber、Relay Solver
+源协议范围，以及聚合器源信号到 relationship 本地 V2/V3/V4 报价路径的唯一映射。源归因字段
+保持 Relay/0x/Kyber；proposal 的 `execution_signal` 单独保存实际报价协议、完整路径与参数。
+首次决策和成交前二次报价均重建该路径，配置变化或歧义会取消/拒绝。
+
+SELL 现在先查询同 relationship 的未预留归因 lot，并选择唯一能覆盖计划卖出量的原始本金资产。
+纸面退出资产为该本金资产，而不盲从聪明钱的最终回款币种。回归已覆盖 ETH 买入、Relay 信号
+卖成 USDG、跟单侧 Token→ETH 退出：卖出一半 token 后释放一半 ETH 本金，realized PnL 仍以
+wei 记录；不会把 USDG raw 与 wei 相减。多个本金资产均可覆盖时安全拒绝。
+
+实测结果：
+
+- `.venv/bin/python -m pip check`：`No broken requirements found`；
+- compileall：通过；
+- `.venv/bin/python -m unittest discover -s tests -v`：158/158 通过；
+- 13 笔 replay：通过，最终 `transactions=13`，保留 UNKNOWN、外部入账候选和 Relay deposit
+  的保守分类，全部 `copy_eligible=false`；临时账本为
+  `/tmp/smart-money-goal2-replay-2026-09-12.sqlite3`；
+- 沙箱内 `scripts/validate_paper_readonly.py` 两次等待超过 90 秒无输出；获准只读联网后 10.9 秒
+  成功完成。source quote 区块 61236836，fill 输入 `1000000000000000` wei、输出 `2531788`
+  USDG raw；mark 区块 61236837，反向毛估值 `999000034819959` wei，未实现 PnL
+  `-999965180041` wei，Gas `29786400000000` wei；输出明确 `copy_eligible=false`；
+- `--paper-mysql --ledger-mysql` 因业务表当前没有 enabled relationship 而安全拒绝，未修改配置；
+- 现有 `validate_mysql_ledger.py` 在普通沙箱连接失败；获准访问本机 MySQL 后检测到业务库已有
+  canonical cursor，按脚本保护规则拒绝测试写入。未删除或重置生产游标，也未通过关闭保护完成
+  验收；新增账本方法继续由 SQLite 全闭环与 MySQL SQL 兼容回归覆盖；
+- 改用观察名单地址和临时无私钥 JSON 策略完成 60 秒主网 Feed/RPC/SQLite 监听，账本为
+  `/tmp/smart-money-goal2-live-2026-09-12.sqlite3`。最终 connections=1、frames=2746、
+  decoded=10951、candidates=11、receipts=11、complete=11，pending/queued/retry/failed=0；
+  backfill blocks=567，queue drops/reconnections/frame/account-code/backfill errors=0。3 次临时
+  `RpcError` 均进入持久重试并最终 complete。回执信号 1 条，为外部入账 needs_review，未误判
+  BUY；该窗口没有 Relay BUY/SELL，paper decisions/fills=0。
+
+因此主网只读接入、队列、候选、回执、持久重试和健康收尾通过；固定区块 paper BUY/fill/mark
+探针也通过。但实时窗口没有满足临时策略的 Relay 买卖，不能单凭 paper fill=0 宣称实时完整闭环。
+本轮没有读取私钥、签名、广播、发送交易或改变 `copy_eligible=false`。

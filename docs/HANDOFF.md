@@ -417,3 +417,25 @@ payment/outTx/fill/local receipt；真实正例升级为 `relay_buy_evidenced`�
 重复关联幂等、重组撤销和跨 UserOperation 禁止拼接均已有回归。Relay 响应提示 requests/v2 将
 退役，后续需兼容 v3。最终 `pip check`、153/153 unittest、13 笔 replay 和 diff check 通过；
 Goal 1 已停止在只读信号层，等待用户讨论并另建 Goal 2。
+
+## Goal 2 当前进度（2026-09-12，进行中）
+
+Goal 2 已接入 `relay_buy_evidenced`、`relay_sell_evidenced` 两个精确触发档，并允许 0x、Kyber、
+Relay Solver 作为源协议。源交易归因与跟单报价路径已经分离：聚合器信号只决定来源、方向、
+资产和已验证金额；纸面执行必须从 relationship 的 `allowed_routes` 唯一选出本地 V2/V3/V4
+路径，首次决策和成交前二次报价均重新选择并核对相同路径。缺路径或多条路径同时匹配均拒绝。
+
+SELL 新增原始本金资产选择。系统先按 relationship ledger scope、token 和未被其他 proposal
+预留的 lot 选择唯一可覆盖卖出量的 `principal_asset`，再用 Token→principal_asset 路径报价。
+因此 ETH 出资 BUY、聪明钱卖成 USDG 时，不会把 USDG raw 与 wei 直接相减，而是纸面退出为
+ETH、恢复 ETH_WETH 原始本金并以 wei 记录 realized PnL。若 USDG 与 ETH 两类 lot 都能独立覆盖
+同一卖出量，则以 `attributed_principal_asset_ambiguous` 安全拒绝。`paper-mark` 同样会先恢复
+聚合器 BUY 使用的本地执行路径再反转估值。全量回归当前为 157/157。
+
+本轮 `pip check`、compileall、158 项 unittest 与 13 笔历史 replay 已通过，replay 继续保持
+`copy_eligible=false`。沙箱内主网调用无响应；获准只读联网后，固定区块 paper BUY、二次报价
+fill 和反向 mark 探针成功，证明此前是执行环境网络边界而非 RPC 客户端超时缺陷。随后使用临时
+无私钥策略完成 60 秒 Feed/RPC/SQLite 纸面监听：11 个候选、11 个回执最终 complete，3 次临时
+RPC 错误均经持久重试恢复，队列/重试/失败最终为 0。该窗口仅形成 1 条外部入账 needs_review，
+没有命中临时策略的 Relay BUY/SELL，paper decision/fill 为 0；因此它证明监听与恢复健康，但不
+替代真实 Relay 信号到 paper fill 的端到端样本。单元回归与固定区块探针共同覆盖该逻辑闭环。

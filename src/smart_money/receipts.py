@@ -307,6 +307,7 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
         signal.evidence.update({
             "actual_input_debit_raw": str(actual_input),
             "actual_output_deposit_raw": deposits[0].amount_in_raw,
+            "actual_output_credit_raw": deposits[0].amount_in_raw,
             "source_deposit_event_id": deposits[0].event_id,
         })
         signal.reasons.append("relay_source_deposit_is_not_destination_finality_or_trade_approval")

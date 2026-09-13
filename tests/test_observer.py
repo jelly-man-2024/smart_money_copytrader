@@ -946,6 +946,105 @@ class FixtureTests(unittest.TestCase):
 
 
 class QuoteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_relay_sell_exits_to_lot_principal_and_restores_that_cap(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-relay', 'operator_started')
+        store.configure_paper_budget(A, 'ETH_WETH', '1000')
+        store.reserve_paper_proposal({
+            'proposal_id': 'relay-buy-p', 'source_event_id': 'relay-buy-event',
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'relay_buy_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.NATIVE, 'output_asset': TOKEN,
+            'budget_bucket': 'ETH_WETH', 'amount_in_raw': '400',
+            'attribution': {'smart_wallet': A},
+        })
+        store.fill_paper_buy('relay-buy-p', {
+            'order_id': 'relay-buy-o', 'fill_id': 'relay-buy-f', 'lot_id': 'relay-lot',
+            'amount_out_raw': '2000', 'fee_asset': R.NATIVE, 'fee_amount_raw': '0',
+            'gas_cost_wei': '20000000',
+            'quote_observed_at': '2026-09-12T00:00:00Z',
+            'filled_at': '2026-09-12T00:00:01Z',
+        })
+        sell = Signal(
+            '0x' + '77' * 32, A, 'third_party', 'SELL', 'call', R.RELAY_ROUTER,
+            '0x', stage='relay_sell_evidenced', execution_status='success',
+            token_in=TOKEN, token_out=R.USDG, protocol='relay_solver',
+            evidence={'actual_input_debit_raw': '1000',
+                      'actual_output_credit_raw': '250'})
+        routes = ({'protocol': 'v3', 'assets': [R.NATIVE, TOKEN], 'fees': [500]},)
+
+        class Quoter:
+            async def quote_with_reference(self, source, amount):
+                self.source = source
+                return (Quote('v3', R.V3_QUOTER, 1, '0x' + 'aa' * 32, 100.0,
+                              TOKEN, R.NATIVE, amount, '240'),
+                        Quote('v3', R.V3_QUOTER, 1, '0x' + 'aa' * 32, 100.0,
+                              TOKEN, R.NATIVE, '100', '24'), '100')
+
+        quoter = Quoter()
+        policy = QuotePolicy(max_price_impact_bps=200, max_gas_cost_wei='40000000')
+        engine = PaperEngine(store, quoter, policy, 'paper-v1',
+                             'relay_sell_evidenced', execution_routes=routes)
+        decision = await engine.propose_sell(
+            sell, AmountRule('proportional', ratio_ppm=1_000_000), now=101)
+        self.assertTrue(decision.accepted)
+        proposal = store.paper_proposal(decision.proposal_id)
+        self.assertEqual((proposal['output_asset'], proposal['budget_bucket']),
+                         (R.NATIVE, 'ETH_WETH'))
+        self.assertEqual((quoter.source.token_out, quoter.source.protocol),
+                         (R.NATIVE, 'v3'))
+        execution = await PaperExecutor(
+            store, quoter, policy, routes).execute(sell, decision.proposal_id, now=102)
+        self.assertEqual(execution.status, 'filled')
+        self.assertEqual(store.paper_budget(A, 'ETH_WETH')['invested_raw'], '200')
+        pnl = store.paper_realized_pnl(execution.fill_id)[0]
+        self.assertEqual((pnl['principal_asset'], pnl['principal_released_raw'],
+                          pnl['proceeds_raw'], pnl['realized_pnl_raw']),
+                         (R.NATIVE, '200', '240', '40'))
+        store.close()
+
+    async def test_relay_buy_uses_configured_local_v3_route_for_paper_quote(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('manual-relay', 'operator_started')
+        store.configure_paper_budget(A, 'ETH_WETH', '1000')
+        signal = Signal(
+            TXHASH, A, 'third_party', 'BUY', 'incoming', R.RELAY_ROUTER,
+            '0xcd6e13f7', stage='relay_buy_evidenced', execution_status='success',
+            token_in=R.NATIVE, token_out=TOKEN, protocol='relay_solver',
+            evidence={'actual_input_debit_raw': '1000',
+                      'actual_output_credit_raw': '2000'})
+        routes = ({'protocol': 'v3', 'assets': [R.NATIVE, TOKEN], 'fees': [500]},)
+
+        class Quoter:
+            async def quote_with_reference(self, source, amount):
+                self.source = source
+                quote = Quote('v3', R.V3_QUOTER, 1, '0x' + 'aa' * 32, 100.0,
+                              R.NATIVE, TOKEN, amount, '198')
+                reference = Quote('v3', R.V3_QUOTER, 1, '0x' + 'aa' * 32, 100.0,
+                                  R.NATIVE, TOKEN, '10', '20')
+                return quote, reference, '100'
+
+        quoter = Quoter()
+        engine = PaperEngine(
+            store, quoter, QuotePolicy(max_adverse_deviation_bps=200,
+                                       max_price_impact_bps=200,
+                                       max_gas_cost_wei='40000000'),
+            'paper-relay-v1', 'relay_buy_evidenced',
+            frozenset({'relay_solver'}), frozenset({R.NATIVE, TOKEN}),
+            frozenset({signal_route_key(signal)}), execution_routes=routes)
+        decision = await engine.propose_buy(
+            signal, AmountRule('proportional', ratio_ppm=100_000), now=101)
+        self.assertTrue(decision.accepted)
+        self.assertEqual((quoter.source.protocol, quoter.source.evidence['hops']),
+                         ('v3', [{'token_in': R.NATIVE,
+                                  'token_out': TOKEN, 'fee': 500}]))
+        proposal = store.paper_proposal(decision.proposal_id)
+        self.assertEqual(proposal['quote']['execution_signal']['protocol'], 'v3')
+        self.assertEqual(proposal['attribution']['source_stage'],
+                         'relay_buy_evidenced')
+        self.assertFalse(signal.copy_eligible)
+        store.close()
+
     async def test_live_quoter_pins_v2_v3_v4_calls_to_observed_block(self):
         calls = []
 
@@ -1251,6 +1350,50 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
             'block_hash': '0x' + 'ab' * 32, 'quote_source': R.V2_ROUTER,
             'quote_observed_at': '2026-09-12T00:00:00+00:00', 'risk': {},
         }))
+        store.close()
+
+    async def test_relay_position_mark_reverses_its_local_execution_route(self):
+        store = Store(':memory:')
+        store.start_paper_budget_cycle('relay-mark', 'operator_started')
+        store.configure_paper_budget(A, 'ETH_WETH', '1000')
+        source = Signal(
+            TXHASH, A, 'third_party', 'BUY', 'incoming', R.RELAY_ROUTER, '0x',
+            stage='relay_buy_evidenced', execution_status='success',
+            token_in=R.NATIVE, token_out=TOKEN, protocol='relay_solver',
+            evidence={'actual_input_debit_raw': '400',
+                      'actual_output_credit_raw': '2000'})
+        store.reserve_paper_proposal({
+            'proposal_id': 'relay-mark-p', 'source_event_id': source.event_id,
+            'source_tx_hash': TXHASH, 'wallet': A,
+            'trigger_mode': 'relay_buy_evidenced', 'strategy_version': 'paper-v1',
+            'input_asset': R.NATIVE, 'output_asset': TOKEN,
+            'budget_bucket': 'ETH_WETH', 'amount_in_raw': '400',
+            'attribution': {'smart_wallet': A},
+        })
+        store.fill_paper_buy('relay-mark-p', {
+            'order_id': 'relay-mark-o', 'fill_id': 'relay-mark-f',
+            'lot_id': 'relay-mark-lot', 'amount_out_raw': '2000',
+            'fee_asset': R.NATIVE, 'fee_amount_raw': '0', 'gas_cost_wei': '20000000',
+            'quote_observed_at': '2026-09-12T00:00:00Z',
+            'filled_at': '2026-09-12T00:00:01Z',
+        })
+
+        class Quoter:
+            async def quote_with_reference(self, signal, amount):
+                self.signal = signal
+                return (Quote('v3', R.V3_QUOTER, 10, '0x' + 'ab' * 32, 100.0,
+                              TOKEN, R.NATIVE, amount, '440'),
+                        Quote('v3', R.V3_QUOTER, 10, '0x' + 'ab' * 32, 100.0,
+                              TOKEN, R.NATIVE, '100', '22'), '100')
+
+        quoter = Quoter()
+        routes = ({'protocol': 'v3', 'assets': [R.NATIVE, TOKEN], 'fees': [500]},)
+        mark = await PaperValuator(
+            store, quoter, QuotePolicy(max_gas_cost_wei='30000000'), routes,
+        ).mark('relay-mark-lot', source, now=101)
+        self.assertEqual((quoter.signal.protocol, quoter.signal.token_in,
+                          quoter.signal.token_out, mark.unrealized_pnl_raw),
+                         ('v3', TOKEN, R.NATIVE, '40'))
         store.close()
 
     async def test_paper_engine_persists_quote_rejection_without_reserving(self):
@@ -2644,6 +2787,33 @@ class SafetyTests(unittest.TestCase):
         signal.stage = 'needs_review'
         self.assertEqual(trigger_allowed(signal, 'receipt_success'),
                          (False, 'source_signal_not_eligible'))
+
+    def test_relay_paper_trigger_modes_require_the_exact_evidence_stage(self):
+        sell = Signal(TXHASH, A, 'bundled_account', 'SELL', 'userop/0',
+                      R.ZERO_X_ALLOWANCE_HOLDER, '0x2213bc0b',
+                      stage='relay_sell_evidenced', execution_status='success',
+                      protocol='0x', token_in=TOKEN, token_out=R.USDG)
+        self.assertEqual(trigger_allowed(sell, 'relay_sell_evidenced'), (True, None))
+        self.assertEqual(trigger_allowed(sell, 'relay_buy_evidenced'),
+                         (False, 'relay_buy_evidenced_required'))
+        buy = replace(sell, behavior='BUY', stage='relay_buy_evidenced',
+                      protocol='relay_solver', token_in=R.NATIVE, token_out=TOKEN)
+        self.assertEqual(trigger_allowed(buy, 'relay_buy_evidenced'), (True, None))
+        self.assertEqual(trigger_allowed(buy, 'swap_evidenced'),
+                         (False, 'swap_evidence_required'))
+        buy.stage = 'needs_review'
+        self.assertEqual(trigger_allowed(buy, 'relay_buy_evidenced'),
+                         (False, 'source_signal_not_eligible'))
+
+    def test_relay_source_routes_are_pair_scoped_and_direction_symmetric(self):
+        signal = Signal(TXHASH, A, 'third_party', 'BUY', 'incoming', R.RELAY_ROUTER,
+                        '0xcd6e13f7', protocol='relay_solver',
+                        token_in=R.NATIVE, token_out=TOKEN)
+        reverse = replace(signal, behavior='SELL', token_in=TOKEN, token_out=R.NATIVE)
+        self.assertEqual(signal_route_key(signal), signal_route_key(reverse))
+        self.assertIsNone(scope_reason(
+            signal, frozenset({'relay_solver'}), frozenset({R.NATIVE, TOKEN}),
+            frozenset({signal_route_key(signal)})))
 
     def test_paper_asset_allowlist_covers_every_route_intermediate(self):
         middle = '0x' + '44' * 20

@@ -14,7 +14,10 @@ from .quotes import QuotePolicy, assess_market_quote, assess_quote
 from .rpc import RpcError
 
 RATIO_SCALE = 1_000_000
-TRIGGER_MODES = frozenset({"feed_intent", "receipt_success", "swap_evidenced"})
+TRIGGER_MODES = frozenset({
+    "feed_intent", "receipt_success", "swap_evidenced",
+    "relay_sell_evidenced", "relay_buy_evidenced",
+})
 BUDGET_BUCKETS = frozenset({"USDG", "ETH_WETH"})
 
 
@@ -71,6 +74,9 @@ def signal_route_key(signal: Signal) -> str | None:
                 bytes.fromhex(hook_data[2:])
                 parameters = [(int(key[2]), int(key[3]), address(key[4]),
                                hook_data.lower())]
+        elif signal.protocol in {"0x", "kyber", "relay_solver"}:
+            assets = [signal.token_in, signal.token_out]
+            parameters = [tuple()]
         else:
             return None
         if assets[0] != signal.token_in or assets[-1] != signal.token_out:
@@ -78,6 +84,71 @@ def signal_route_key(signal: Signal) -> str | None:
         return normalized_route_key(signal.protocol, assets, parameters)
     except (KeyError, TypeError, ValueError, IndexError):
         return None
+
+
+def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
+                           output_asset: str | None = None) -> Signal:
+    """Select one validated local quote route without changing source attribution."""
+    output_asset = address(output_asset) if output_asset is not None else source.token_out
+    if source.protocol in {"v2", "v3", "v4"} and output_asset == source.token_out:
+        return source
+    if source.protocol not in {"v2", "v3", "v4", "0x", "kyber", "relay_solver"}:
+        raise ValueError("source protocol has no paper execution route")
+    matches = []
+    for definition in routes or ():
+        assets = definition.get("assets") if isinstance(definition, dict) else None
+        if (not isinstance(assets, list) or len(assets) < 2
+                or {assets[0], assets[-1]} != {source.token_in, output_asset}):
+            continue
+        forward = assets[0] == source.token_in
+        ordered_assets = list(assets if forward else reversed(assets))
+        protocol = definition.get("protocol")
+        evidence = {
+            "paper_execution_source_protocol": source.protocol,
+            "paper_execution_route": deepcopy(definition),
+        }
+        if protocol == "v2":
+            evidence["route"] = ordered_assets
+            contract = R.V2_ROUTER
+        elif protocol == "v3":
+            fees = definition.get("fees")
+            if not isinstance(fees, list) or len(fees) != len(assets) - 1:
+                continue
+            ordered_fees = list(fees if forward else reversed(fees))
+            evidence["hops"] = [
+                {"token_in": ordered_assets[i], "token_out": ordered_assets[i + 1],
+                 "fee": ordered_fees[i]}
+                for i in range(len(ordered_fees))
+            ]
+            contract = R.V3_QUOTER
+        elif protocol == "v4":
+            fields = [definition.get(name) for name in (
+                "fees", "tick_spacings", "hooks", "hook_data")]
+            if any(not isinstance(value, list) or len(value) != len(assets) - 1
+                   for value in fields):
+                continue
+            fees, ticks, hooks, hook_data = [
+                list(value if forward else reversed(value)) for value in fields]
+            evidence["v4_hops"] = []
+            for i, (fee, tick, hook, data) in enumerate(
+                    zip(fees, ticks, hooks, hook_data)):
+                token_in, token_out = ordered_assets[i:i + 2]
+                currency0, currency1 = sorted((token_in, token_out))
+                evidence["v4_hops"].append({
+                    "token_in": token_in, "token_out": token_out,
+                    "pool_key": [currency0, currency1, fee, tick, hook],
+                    "hook_data": data,
+                })
+            contract = R.V4_QUOTER
+        else:
+            continue
+        matches.append(replace(
+            source, protocol=protocol, contract=contract, token_out=output_asset,
+            evidence=evidence,
+            amount_out_raw=None, amount_limit_raw=None, exact_in=True))
+    if len(matches) != 1:
+        raise ValueError("source asset pair does not select one local execution route")
+    return matches[0]
 
 
 def budget_bucket(asset: str) -> str | None:
@@ -144,6 +215,9 @@ def trigger_allowed(signal: Signal, mode: str) -> tuple[bool, str | None]:
     if mode == "swap_evidenced":
         return (signal.stage == "swap_evidenced",
                 None if signal.stage == "swap_evidenced" else "swap_evidence_required")
+    if mode in {"relay_sell_evidenced", "relay_buy_evidenced"}:
+        return (signal.stage == mode,
+                None if signal.stage == mode else f"{mode}_required")
     if mode == "receipt_success":
         allowed = signal.execution_status == "success" and signal.stage != "needs_review"
         return allowed, None if allowed else "successful_unambiguous_receipt_required"
@@ -170,7 +244,7 @@ def scope_reason(signal: Signal, allowed_protocols: frozenset[str] | None,
                     route_assets.update((hop.get("token_in"), hop.get("token_out")))
         if None in route_assets or not route_assets <= allowed_assets:
             return "asset_not_allowed"
-    if allowed_routes is not None:
+    if allowed_routes is not None and signal.protocol not in {"0x", "kyber", "relay_solver"}:
         key = signal_route_key(signal)
         if key is None or key not in allowed_routes:
             return "route_not_allowed"
@@ -196,6 +270,7 @@ class PaperEngine:
                  wallet_labels: dict[str, str] | None = None,
                  wallet_contexts: dict[str, dict] | None = None,
                  config_snapshot_hash: str | None = None,
+                 execution_routes: tuple[dict, ...] | None = None,
                  shadow_only: bool = False):
         if trigger_mode not in TRIGGER_MODES or not strategy_version:
             raise ValueError("invalid paper engine configuration")
@@ -210,6 +285,7 @@ class PaperEngine:
         self.wallet_labels = wallet_labels or {}
         self.wallet_contexts = wallet_contexts or {}
         self.config_snapshot_hash = config_snapshot_hash
+        self.execution_routes = execution_routes
         self.shadow_only = shadow_only
 
     def _scope_reason(self, signal: Signal) -> str | None:
@@ -281,7 +357,9 @@ class PaperEngine:
             return self._decision(
                 signal, False, bucket_or_reason, {"source_signal": signal.to_dict()})
         try:
-            quote, reference, gas_price = await self.quoter.quote_with_reference(signal, amount)
+            quote_signal = execution_quote_signal(signal, self.execution_routes)
+            quote, reference, gas_price = await self.quoter.quote_with_reference(
+                quote_signal, amount)
         except (RpcError, ValueError) as exc:
             return self._decision(signal, False, "quote_unavailable", {
                 "source_signal": signal.to_dict(), "quote_error_type": type(exc).__name__,
@@ -291,6 +369,7 @@ class PaperEngine:
         quote_payload = {
             "quote": quote.to_dict(), "reference_quote": reference.to_dict(),
             "gas_price_wei": gas_price, "risk": risk,
+            "execution_signal": quote_signal.to_dict(),
         }
         if not accepted:
             return self._decision(signal, False, reason, {
@@ -335,17 +414,32 @@ class PaperEngine:
         if amount is None:
             return self._decision(
                 signal, False, bucket_or_reason, {"source_signal": signal.to_dict()})
+        principal_asset, principal_reason = self.store.paper_sell_principal_asset(
+            self._ledger_wallet(signal), signal.token_in, amount)
+        if principal_asset is None:
+            return self._decision(signal, False, principal_reason, {
+                "source_signal": signal.to_dict(),
+            })
         try:
-            quote, reference, gas_price = await self.quoter.quote_with_reference(signal, amount)
+            quote_signal = execution_quote_signal(
+                signal, self.execution_routes, principal_asset)
+            quote, reference, gas_price = await self.quoter.quote_with_reference(
+                quote_signal, amount)
         except (RpcError, ValueError) as exc:
             return self._decision(signal, False, "quote_unavailable", {
                 "source_signal": signal.to_dict(), "quote_error_type": type(exc).__name__,
             })
-        accepted, reason, risk = assess_quote(
-            signal, quote, reference, self.quote_policy, gas_price, now)
+        if principal_asset == signal.token_out:
+            accepted, reason, risk = assess_quote(
+                signal, quote, reference, self.quote_policy, gas_price, now)
+        else:
+            accepted, reason, risk = assess_market_quote(
+                quote, reference, self.quote_policy, gas_price, now)
+            risk["source_price_comparison"] = "not_comparable_output_asset_changed"
         quote_payload = {
             "quote": quote.to_dict(), "reference_quote": reference.to_dict(),
             "gas_price_wei": gas_price, "risk": risk,
+            "execution_signal": quote_signal.to_dict(),
         }
         if not accepted:
             return self._decision(signal, False, reason, {
@@ -361,8 +455,8 @@ class PaperEngine:
             "proposal_id": proposal_id, "source_event_id": self._ledger_source_event(signal),
             "source_tx_hash": signal.tx_hash, "wallet": self._ledger_wallet(signal),
             "trigger_mode": self.trigger_mode, "strategy_version": self.strategy_version,
-            "input_asset": signal.token_in, "output_asset": signal.token_out,
-            "budget_bucket": bucket_or_reason, "amount_in_raw": amount,
+            "input_asset": signal.token_in, "output_asset": principal_asset,
+            "budget_bucket": budget_bucket(principal_asset), "amount_in_raw": amount,
             "quote": quote_payload, "attribution": attribution,
         })
         if not reserved:
@@ -385,10 +479,12 @@ class PaperExecution:
 class PaperExecutor:
     """Requote and settle a reserved proposal in the local paper ledger only."""
 
-    def __init__(self, store, quoter, quote_policy: QuotePolicy):
+    def __init__(self, store, quoter, quote_policy: QuotePolicy,
+                 execution_routes: tuple[dict, ...] | None = None):
         self.store = store
         self.quoter = quoter
         self.quote_policy = quote_policy
+        self.execution_routes = execution_routes
 
     @staticmethod
     def _id(proposal_id: str, kind: str) -> str:
@@ -400,10 +496,20 @@ class PaperExecutor:
         if proposal is None or proposal["status"] != "reserved":
             return PaperExecution(proposal_id, "not_reserved", "proposal_not_reserved")
         try:
+            quote_signal = execution_quote_signal(
+                signal, self.execution_routes, proposal["output_asset"])
+            stored_execution = (proposal.get("quote") or {}).get("execution_signal")
+            if stored_execution is not None and stored_execution != quote_signal.to_dict():
+                raise ValueError("paper execution route changed after reservation")
             quote, reference, gas_price = await self.quoter.quote_with_reference(
-                signal, proposal["amount_in_raw"])
-            accepted, reason, risk = assess_quote(
-                signal, quote, reference, self.quote_policy, gas_price, now)
+                quote_signal, proposal["amount_in_raw"])
+            if proposal["output_asset"] == signal.token_out:
+                accepted, reason, risk = assess_quote(
+                    signal, quote, reference, self.quote_policy, gas_price, now)
+            else:
+                accepted, reason, risk = assess_market_quote(
+                    quote, reference, self.quote_policy, gas_price, now)
+                risk["source_price_comparison"] = "not_comparable_output_asset_changed"
         except (RpcError, ValueError):
             self.store.cancel_paper_proposal(proposal_id, "fill_requote_unavailable")
             return PaperExecution(proposal_id, "cancelled", "fill_requote_unavailable")
@@ -488,17 +594,21 @@ class PaperMark:
 class PaperValuator:
     """Create immutable, block-pinned marks; it never mutates inventory or budgets."""
 
-    def __init__(self, store, quoter, quote_policy: QuotePolicy):
+    def __init__(self, store, quoter, quote_policy: QuotePolicy,
+                 execution_routes: tuple[dict, ...] | None = None):
         self.store = store
         self.quoter = quoter
         self.quote_policy = quote_policy
+        self.execution_routes = execution_routes
 
     async def mark(self, lot_id: str, source_signal: Signal,
                    now: float | None = None) -> PaperMark:
         position = self.store.paper_position(lot_id)
         if position is None or position["status"] != "open":
             raise ValueError("open paper position required")
-        signal = reverse_quote_signal(source_signal, position["principal_asset"])
+        buy_signal = execution_quote_signal(
+            source_signal, self.execution_routes, position["token"])
+        signal = reverse_quote_signal(buy_signal, position["principal_asset"])
         quote, reference, gas_price = await self.quoter.quote_with_reference(
             signal, position["token_remaining_raw"])
         accepted, reason, risk = assess_market_quote(

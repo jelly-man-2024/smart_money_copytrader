@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -10,7 +11,7 @@ from .models import address
 from .paper import AmountRule, BUDGET_BUCKETS, TRIGGER_MODES, normalized_route_key
 from .quotes import QuotePolicy
 
-SUPPORTED_PROTOCOLS = frozenset({"v2", "v3", "v4"})
+SUPPORTED_PROTOCOLS = frozenset({"v2", "v3", "v4", "0x", "kyber", "relay_solver"})
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 
@@ -40,6 +41,7 @@ class WalletPaperPolicy:
     allowed_protocols: frozenset[str]
     allowed_assets: frozenset[str]
     allowed_routes: frozenset[str]
+    route_definitions: tuple[dict, ...]
     snapshot_hash: str
 
     @property
@@ -60,6 +62,7 @@ class PaperConfig:
     allowed_protocols: frozenset[str]
     allowed_assets: frozenset[str]
     allowed_routes: frozenset[str]
+    route_definitions: tuple[dict, ...]
     wallets: dict[str, WalletPaperPolicy]
     relationships: tuple[WalletPaperPolicy, ...]
     snapshot_hash: str
@@ -93,7 +96,7 @@ def _route_key(value: dict, protocols: set[str], assets: set[str]) -> str:
                 or any(not isinstance(fee, int) or not 0 <= fee < 2 ** 24 for fee in fees)):
             raise ValueError("invalid V3 route fees")
         parameters = [(fee,) for fee in fees]
-    else:
+    elif protocol == "v4":
         _fields(value, {"protocol", "assets", "fees", "tick_spacings", "hooks", "hook_data"},
                 {"protocol", "assets", "fees", "tick_spacings", "hooks", "hook_data"},
                 "V4 route")
@@ -119,6 +122,12 @@ def _route_key(value: dict, protocols: set[str], assets: set[str]) -> str:
                 raise ValueError("invalid V4 route hook data") from exc
         parameters = list(zip(fees, ticks, hooks,
                               (item.lower() for item in hook_data)))
+    else:
+        _fields(value, {"protocol", "assets"}, {"protocol", "assets"},
+                "aggregator/solver route")
+        if hop_count != 1:
+            raise ValueError("aggregator/solver route must contain exactly two assets")
+        parameters = [tuple()]
     return normalized_route_key(protocol, route_assets, parameters)
 
 
@@ -219,7 +228,7 @@ def load_paper_config(path: str | Path) -> PaperConfig:
             {bucket: _amount_rule(rule) for bucket, rule in buy_rules.items()},
             _amount_rule(row["sell_rule"]), strategy, trigger, tuple(shadows),
             quote_policy, frozenset(protocols), frozenset(normalized_assets),
-            frozenset(route_keys), "",
+            frozenset(route_keys), tuple(deepcopy(route_rows)), "",
         )
         relationship_key = (follower, relationship_id, wallet)
         if relationship_key in relationship_keys:
@@ -236,11 +245,12 @@ def load_paper_config(path: str | Path) -> PaperConfig:
         policy.budget_limits, policy.buy_rules, policy.sell_rule,
         policy.strategy_version, policy.trigger_mode, policy.shadow_trigger_modes,
         policy.quote_policy, policy.allowed_protocols, policy.allowed_assets,
-        policy.allowed_routes, snapshot_hash,
+        policy.allowed_routes, policy.route_definitions, snapshot_hash,
     ) for policy in relationships]
     wallets = {}
     for policy in relationships:
         wallets.setdefault(policy.wallet, policy)
     return PaperConfig(strategy, trigger, tuple(shadows), quote_policy,
                        frozenset(protocols), frozenset(normalized_assets),
-                       frozenset(route_keys), wallets, tuple(relationships), snapshot_hash)
+                       frozenset(route_keys), tuple(deepcopy(route_rows)), wallets,
+                       tuple(relationships), snapshot_hash)

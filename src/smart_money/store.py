@@ -1152,6 +1152,33 @@ class Store:
             self.connection.rollback()
             raise
 
+    def paper_sell_principal_asset(self, wallet: str, token: str,
+                                   amount_raw: str) -> tuple[str | None, str]:
+        """Select one attributed principal asset that can cover the requested sale."""
+        if (not isinstance(amount_raw, str) or not amount_raw.isdecimal()
+                or int(amount_raw) <= 0):
+            raise ValueError("invalid sell amount")
+        rows = self.connection.execute("""SELECT p.lot_id,p.token_remaining_raw,
+                p.principal_asset FROM paper_positions p
+            WHERE p.wallet=? AND p.token=? AND p.status='open'
+                AND p.principal_asset!='' ORDER BY p.created_at,p.lot_id""",
+            (wallet.lower(), token.lower())).fetchall()
+        available_by_asset = {}
+        for lot_id, remaining, principal_asset in rows:
+            reserved = sum(int(row[0]) for row in self.connection.execute(
+                """SELECT token_amount_raw FROM paper_position_reservations
+                   WHERE lot_id=? AND status='active'""", (lot_id,)))
+            available_by_asset[principal_asset] = (
+                available_by_asset.get(principal_asset, 0)
+                + max(int(remaining) - reserved, 0))
+        matches = sorted(asset for asset, available in available_by_asset.items()
+                         if available >= int(amount_raw))
+        if not matches:
+            return None, "attributed_position_insufficient"
+        if len(matches) != 1:
+            return None, "attributed_principal_asset_ambiguous"
+        return matches[0], "selected"
+
     def fill_paper_sell(self, proposal_id: str, fill: dict) -> bool:
         """Fill a paper sell and restore each source lot's original-principal budget."""
         required = {
