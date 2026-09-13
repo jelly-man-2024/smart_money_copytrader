@@ -83,9 +83,10 @@
   的 orphan；`execution-track` 已提供外部 hash 的只读 CLI 接入。服务器没有现成本地 EVM 节点
   二进制或镜像，仍缺独立测试链的真实广播演练。
 - [x] 主网广播 RPC 方法不在默认只读允许列表，并有单独、默认关闭的多重开关。
-  `MainnetBroadcaster` 与 `ReadOnlyRpc` 分离，要求 execution/signing/broadcast mode、emergency
-  stop、stop file、chain ID、CLI 开关，以及绑定 follower/relationship/config snapshot 的权限
-  安全验收文件；发送前独立恢复 sender 并验证 chain/hash。缺任一项在 key SELECT 前或广播前拒绝。
+  `MainnetBroadcaster` 与 `ReadOnlyRpc` 分离，要求 stop file 未激活，以及数据库中 enabled、
+  `mainnet_live`、确认时间不早于行更新时间，并绑定 follower/relationship/config snapshot
+  的关系；每次 key SELECT 与广播前重新查询该行，发送前还会独立恢复 sender 并验证 chain/hash。
+  缺任一项都会拒绝，配置变化而未在同一 UPDATE 刷新确认时间也会拒绝。
 - [ ] 操作员明确确认钱包、单笔/周期额度、Gas 上限、紧急停止和回滚流程。
   数据库 `enabled=0` 的即时签名前停机门禁、默认停止的进程环境门禁及运行期 stop file 已实现；
   启动、重启、三层停止及公开 execution 状态处置已写入 `OPERATOR_RUNBOOK.md`；仍缺操作员验收

@@ -86,6 +86,37 @@ def key_record_status(wallet_address: str) -> dict:
     }
 
 
+def live_key_record_status(wallet_address: str, relationship_id: str,
+                           config_snapshot_hash: str) -> dict:
+    """Check live key metadata under the exact relationship without reading it."""
+    wallet = address(wallet_address)
+    connection = _key_connection((wallet, relationship_id, config_snapshot_hash))
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT wallet_address,enabled FROM wallet_keys WHERE wallet_address=%s",
+                (wallet,),
+            )
+            rows = cursor.fetchall()
+    except pymysql.MySQLError as exc:
+        raise ValueError(f"key metadata lookup failed: {type(exc).__name__}") from None
+    finally:
+        connection.close()
+    if len(rows) != 1:
+        return {
+            "wallet_address": wallet, "found": False, "enabled": False,
+            "private_key_read": False, "read_only": True,
+        }
+    returned = address(rows[0].get("wallet_address"))
+    enabled = rows[0].get("enabled")
+    if returned != wallet or enabled not in {0, 1, False, True}:
+        raise ValueError("invalid key metadata record")
+    return {
+        "wallet_address": wallet, "found": True, "enabled": bool(enabled),
+        "private_key_read": False, "read_only": True,
+    }
+
+
 class OfflineDatabaseSigner:
     """Loads exactly one enabled key, validates ownership, and only signs offline."""
 

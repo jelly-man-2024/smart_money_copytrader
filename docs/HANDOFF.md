@@ -36,7 +36,7 @@ Feed 是已排序交易，领先 RPC 不意味着可以抢在已排序目标交�
 - 2026-09-11 新服务器基线和首个 P0 小步见
   `SERVER_VALIDATION_2026-09-11.md`：候选已改为先持久化再进入有界队列，支持重启恢复和
   最多 8 次持久回执退避；关键零值 counters、候选状态与阶段延迟分位数已进入健康日志。
-  当前共 106 项测试。保守分类和 `copy_eligible=false` 均未改变。
+  当前共 176 项测试。保守分类和 `copy_eligible=false` 均未改变。
 - 意向、执行、规范链状态已拆为独立字段，Feed 来源单独标记；第三方入账不归属为目标意向。
   SQLite 已有独立 `canonical_l2` 区块游标。RPC safe-head 扫描器已完成首版：首次锚定而不
   扫全链，之后有界逐块续扫，补抓标为 backfill/fresh=false；父哈希不连续时停止。显式重组
@@ -454,12 +454,13 @@ SELL 后续仍必须命中同 relationship 的已有归因 lot，不能借此卖
 文档已明确新语义。
 
 同日增加受控 `mainnet_live` 小额测试入口：独立 `MainnetBroadcaster` 没有修改 `ReadOnlyRpc`
-allowlist，且在读取 key 前和广播瞬间都要求 execution/signing/broadcast 三个 mode、急停关闭、显式
-chain ID，以及权限安全并绑定 follower/relationship/config snapshot 的风险验收 JSON。广播器再次
+allowlist。最初使用多组进程开关和单独风险 JSON；当前已收敛为数据库驱动的 `sm-copy run`，并在
+读取 key 前和广播瞬间重新加载 enabled `mainnet_live` 行，核对 follower/relationship/config
+snapshot，同时保留全局 stop file。广播器再次
 恢复 raw transaction sender、校验 chain ID 和本地 hash，RPC 返回 hash 不一致即拒绝。
 
-monitor 只在 `--paper-mysql --ledger-mysql --enable-mainnet-live` 下接受恰好一条
-`run_mode=mainnet_live` 关系，触发点固定为 `swap_evidenced`，当前只执行直接 V2/V3/V4。签名前重新
+`sm-copy run` 固定使用 MySQL 配置/账本、Relay 关联和自动额度周期复用，当前接受恰好一条
+`run_mode=mainnet_live` 关系；enabled smart wallet 自动进入监听集合。签名前重新
 加载 enabled relationship，随后进行多轮报价、余额/allowance/Gas/nonce 检查、签名、复核、广播
 和 180 秒公开回执跟踪。已预留/已签名状态在重启时仅报警，避免自动重发。
 
@@ -575,3 +576,22 @@ Token余额/allowance均为0，latest/pending nonce均为13；执行审计8/8 co
 卖出全部归因持仓并收回 `1988018` raw USDG。realized PnL为 -0.011982 USDG（不含Gas），lot closed，
 10 USDG额度全部恢复，链上目标Token余额/allowance均为0。执行审计10/10 confirmed且无issue；
 monitor仍在原screen常驻，relationship 78保持enabled。
+
+## 2026-09-13 数据库驱动启动收敛与本机停机
+
+使用者要求日常配置只维护 `copy_relationships` 与独立库的 `wallet_keys`。实盘逐关系授权现由
+`enabled=TRUE/run_mode='mainnet_live'` 以及行内确认时间共同承担；每次读取密钥和广播前都会重新
+加载该行，核对 follower、relationship ID、完整 snapshot，并要求确认时间不早于行更新时间。任何
+配置变化都会使旧确认失效，需在同一条数据库 UPDATE 刷新。已删除单独风险确认 JSON及 mainnet
+execution/signing/broadcast/chain ID 环境开关要求，仍保留全局 `var/EXECUTION_STOP` 急停、数据库
+enabled 状态、密钥 enabled 状态、配置快照、报价/余额/Gas/allowance/nonce 与链上 hash 门禁。
+
+新增 `docker/mysql/init/006_database_live_acceptance.sql` 和固定入口 `.venv/bin/sm-copy run`：自动使用
+MySQL 配置与账本、Relay 关联、复用活动额度周期，
+第一次才创建周期；新增 relationship 自动初始化独立额度，修改额度保留 invested/reserved，低于已
+占用值时拒绝启动。enabled relationship 中的 smart wallet 自动并入监听集合，不再另改 CSV。
+当前仍限制每进程恰好一条 enabled `mainnet_live` relationship。
+
+本机原 relationship 78 monitor 已按使用者要求停止，`var/EXECUTION_STOP` 已恢复且权限为0600；账本
+审计10/10 attempts confirmed，无 pending/signed/orphaned/reverted。改造后176/176 unittest、13笔回放、
+`pip check`、compileall 和 diff check 通过；未读取真实私钥、未签名或广播新交易。

@@ -43,7 +43,7 @@ python3 -m venv .venv
 离线回放包含 11 笔历史样本、1 笔真实 feed 存款样本和可选的 230 地址批量分发。
 不需要网络、付费 RPC 或私钥。信号输出到 stdout（JSONL），统计输出到 stderr。
 SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信号。
-目前单元测试共 106 项。服务器首次验证顺序为安装、单元测试、离线回放，
+目前单元测试共 176 项。服务器首次验证顺序为安装、单元测试、离线回放，
 再执行下面的 60 秒实时只读监听；完整历史验证记录见 [VALIDATION](docs/VALIDATION.md)。
 
 ## 实时只读监听
@@ -76,7 +76,7 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 取得固定区块的实时报价；只有第二次报价仍通过原始 `minOut`、时效、偏离、价格冲击和 Gas
 门控，才写入本地 paper fill。`run_mode=paper` 全过程没有签名、广播或真实订单。显式的
 `mainnet_live` 测试模式只执行最终能严格验证为本地 V2/V3/V4 的路径，并且还要求 MySQL
-配置/账本、单条 live relationship、CLI 开关、三层进程开关和绑定配置快照的风险验收文件；
+配置/账本、单条 enabled live relationship、全局 stop file 和签名/广播前的 MySQL 配置快照复核；
 普通启动仍然不会签名或广播。Relay 自动关联需显式传 `--relay-auto-associate`，它只使用订单
 做归因，再从同一回执发现并验证本地池，不复用源 calldata。confirmed live 回执会按规范块与
 follower ERC-20 净差额结算收益 lot；当前仍不能用于无人值守运行。具体见
@@ -235,9 +235,24 @@ VALUES ('0x公开地址', '0x私钥', FALSE);
 `SMART_MONEY_SIGNING_MODE=offline_test` 和 `SMART_MONEY_EMERGENCY_STOP=0` 才能访问，并且每次
 签名前检查 `SMART_MONEY_EMERGENCY_STOP_FILE`（默认 `var/EXECUTION_STOP`）不存在。运行期间创建
 该文件即可阻止下一次密钥读取/签名。只允许 chain ID 4663 的 type-2 签名；这些开关不要写进
-项目 `.env`。`mainnet_live` 还需要独立 broadcast mode、chain ID、CLI 开关和绑定具体配置快照的
-风险验收文件，详见 [OPERATOR_RUNBOOK](docs/OPERATOR_RUNBOOK.md) 与
+项目 `.env`。`enabled=TRUE`、`run_mode='mainnet_live'` 且行内 `live_risk_accepted_at` 不早于当前
+更新时间的 MySQL 行，才是逐关系实盘
+授权源；每次私钥读取和广播前都会重新查询并核对 follower、relationship ID、完整配置快照及确认
+是否仍为最新，不再维护单独的风险确认 JSON。详见
+[OPERATOR_RUNBOOK](docs/OPERATOR_RUNBOOK.md) 与
 [LIVE_RISK_CHECKLIST](docs/LIVE_RISK_CHECKLIST.md)。
+
+部署级 RPC/Feed 和两个 MySQL 连接设置一次后，数据库驱动的固定任务直接运行：
+
+```bash
+.venv/bin/sm-copy run
+```
+
+该命令固定使用 enabled `copy_relationships`、MySQL 运行账本、Relay 自动关联和自动额度周期复用。
+聪明钱地址由 enabled relationship 自动加入监听集合。新增或修改 `copy_relationships` 时，在同一条
+SQL 中刷新行内实盘确认；修改 `wallet_keys` 后不需要其他确认。随后重启同一任务即可生效；重启不会
+重置累计投入，降低上限至已占用额度以下会拒绝启动。
+全局 `var/EXECUTION_STOP` 存在时仍会在读取实盘密钥之前拒绝。
 
 只检查某个公开钱包在 key DB 中是否存在/启用，而不读取私钥列：
 

@@ -163,8 +163,8 @@ def load_mysql_paper_config() -> PaperConfig:
     )
 
 
-def load_enabled_relationship_policy(relationship_id: str):
-    """Reload one enabled relationship through the runtime read-only account."""
+def _load_enabled_relationship_row(relationship_id: str) -> dict:
+    """Reload one enabled relationship row through the runtime read-only account."""
     if (not isinstance(relationship_id, str) or not relationship_id.isdecimal()
             or int(relationship_id) <= 0):
         raise ValueError("invalid relationship id")
@@ -182,11 +182,31 @@ def load_enabled_relationship_policy(relationship_id: str):
         connection.close()
     if len(rows) != 1:
         raise ValueError("relationship is disabled or unavailable")
-    document = rows_to_document(rows)
+    return rows[0]
+
+
+def _row_policy(row: dict):
+    document = rows_to_document([row])
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json") as stream:
         json.dump(document, stream)
         stream.flush()
         return load_paper_config(stream.name).relationships[0]
+
+
+def load_enabled_relationship_policy(relationship_id: str):
+    """Reload one enabled relationship through the runtime read-only account."""
+    return _row_policy(_load_enabled_relationship_row(relationship_id))
+
+
+def load_enabled_mainnet_acceptance(relationship_id: str) -> dict:
+    """Load one live policy and its database-owned risk acceptance atomically."""
+    row = _load_enabled_relationship_row(relationship_id)
+    policy = _row_policy(row)
+    return {
+        "policy": policy,
+        "accepted_at": row.get("live_risk_accepted_at"),
+        "updated_at": row.get("updated_at"),
+    }
 
 
 class MySqlRelationshipGate:

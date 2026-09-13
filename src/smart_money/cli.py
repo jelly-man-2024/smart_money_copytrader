@@ -26,13 +26,14 @@ from .execution_controls import require_mainnet_broadcast_enabled
 from .execution_pipeline import (
     ExecutionPreparer, LiveExecutionSigner, LivePreBroadcastReviewer,
 )
-from .key_source import key_record_status
+from .key_source import key_record_status, live_key_record_status
 from .live_settlement import settle_confirmed_execution
 from .ledger_migration import migrate_sqlite_ledger
 from .models import Transaction, number
 from .mysql_config import (
     MySqlRelationshipGate, import_watchlist_relationships,
-    load_enabled_relationship_policy, load_mysql_paper_config,
+    load_enabled_mainnet_acceptance, load_enabled_relationship_policy,
+    load_mysql_paper_config,
 )
 from .mysql_store import MySqlStore
 from .native_flows import verify_native_flows
@@ -73,6 +74,52 @@ def runtime_paper_config(args):
 def runtime_store(args):
     """Choose exactly one ledger backend; never dual-write."""
     return MySqlStore() if getattr(args, "ledger_mysql", False) else Store(args.db)
+
+
+def monitoring_watchlist(path, paper_config=None):
+    """Use the CSV evidence set plus every enabled database relationship wallet."""
+    watchlist = load_watchlist(path)
+    if paper_config is not None:
+        for policy in paper_config.relationships:
+            watchlist.setdefault(policy.wallet, {
+                "real_evm": policy.wallet,
+                "handle": policy.label,
+                "source": "copy_relationships",
+            })
+    return watchlist
+
+
+def prepare_runtime_budget_cycle(store, config, action, cycle_id=None, reason=None):
+    """Reuse budgets on restart, initializing a first cycle and new scopes safely."""
+    active = store.active_paper_budget_cycle()
+    created = False
+    if action == "reset":
+        store.start_paper_budget_cycle(cycle_id, reason)
+        active, created = cycle_id, True
+    elif action == "reuse":
+        if active is None:
+            raise ValueError("no active paper budget cycle to reuse")
+    elif action == "auto":
+        if active is None:
+            active = f"mainnet-auto-{time.time_ns()}"
+            store.start_paper_budget_cycle(active, "automatic_initial_cycle")
+            created = True
+    else:
+        raise ValueError("paper mode requires a budget cycle action")
+    budgets = [(policy.ledger_scope, bucket, limit)
+               for policy in config.relationships
+               for bucket, limit in policy.budget_limits.items()]
+    for scope, bucket, limit in budgets:
+        current = store.paper_budget(scope, bucket)
+        if (current is not None
+                and int(current["reserved_raw"]) + int(current["invested_raw"])
+                > int(limit)):
+            raise ValueError("new limit is below occupied budget")
+    for scope, bucket, limit in budgets:
+        # Existing invested/reserved amounts are preserved. The store rejects
+        # a reduced limit below occupied budget and initializes only new scopes.
+        store.configure_paper_budget(scope, bucket, limit)
+    return active, created
 
 
 def require_existing_sqlite(args):
@@ -194,7 +241,15 @@ def paper_cycle(args):
 
 def relationship_status(args):
     """Print one enabled relationship and its snapshot without key material."""
-    policy = load_enabled_relationship_policy(args.relationship_id)
+    acceptance = load_enabled_mainnet_acceptance(args.relationship_id)
+    policy = acceptance["policy"]
+    accepted_at = acceptance["accepted_at"]
+    updated_at = acceptance["updated_at"]
+    acceptance_current = (
+        accepted_at is not None
+        and updated_at is not None
+        and accepted_at >= updated_at
+    )
     print(json.dumps({
         "relationship_id": policy.relationship_id,
         "run_mode": policy.run_mode,
@@ -208,6 +263,11 @@ def relationship_status(args):
         "route_definitions": policy.route_definitions,
         "budget_limits": policy.budget_limits,
         "config_snapshot_hash": policy.snapshot_hash,
+        "live_risk_accepted_at": (
+            accepted_at.isoformat(timespec="microseconds") if accepted_at else None),
+        "relationship_updated_at": (
+            updated_at.isoformat(timespec="microseconds") if updated_at else None),
+        "live_risk_acceptance_current": acceptance_current,
         "private_key_read": False,
     }, ensure_ascii=False, sort_keys=True))
 
@@ -235,7 +295,8 @@ async def mainnet_approve_usdg(args):
 
 async def monitor(args):
     load_endpoint_env()
-    watchlist = load_watchlist(args.watchlist)
+    paper_config = runtime_paper_config(args)
+    watchlist = monitoring_watchlist(args.watchlist, paper_config)
     watched_bytes = [bytes.fromhex(a[2:]) for a in watchlist]
     rpc = ReadOnlyRpc(os.environ.get("ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"))
     relay_client = RelayPublicClient() if args.relay_auto_associate else None
@@ -249,43 +310,35 @@ async def monitor(args):
     health = FeedHealth()
     stats = Counter()
     store = runtime_store(args)
-    paper_config = runtime_paper_config(args)
     paper_engines = {}
     paper_executor = None
     live_pipelines = {}
     live_tracking_tasks = set()
     if paper_config:
-        if not set(paper_config.wallets) <= set(watchlist):
-            raise ValueError("paper config wallets must be present in the observer watchlist")
-        if args.paper_cycle_action == "reset":
-            store.start_paper_budget_cycle(args.paper_cycle_id, args.paper_cycle_reason)
-            for policy in paper_config.relationships:
-                for bucket, limit in policy.budget_limits.items():
-                    store.configure_paper_budget(policy.ledger_scope, bucket, limit)
-        elif args.paper_cycle_action == "reuse":
-            if store.active_paper_budget_cycle() is None:
-                raise ValueError("no active paper budget cycle to reuse")
-            for policy in paper_config.relationships:
-                for bucket, limit in policy.budget_limits.items():
-                    current = store.paper_budget(policy.ledger_scope, bucket)
-                    if current is None or current["limit_raw"] != limit:
-                        raise ValueError("active paper budget does not match config")
-        else:
-            raise ValueError("paper mode requires explicit --paper-cycle-action")
         live_policies = [policy for policy in paper_config.relationships
                          if policy.run_mode == "mainnet_live"]
         if live_policies:
-            if (not args.enable_mainnet_live or not args.paper_mysql
-                    or not args.ledger_mysql):
+            if not args.paper_mysql or not args.ledger_mysql:
                 raise ValueError(
-                    "mainnet_live requires --enable-mainnet-live, --paper-mysql and --ledger-mysql")
+                    "mainnet_live requires the MySQL configuration and ledger")
             if len(live_policies) != 1:
                 raise ValueError("exactly one mainnet_live relationship is supported per process")
             policy = live_policies[0]
             require_mainnet_broadcast_enabled(
                 policy.follower_wallet, policy.relationship_id, policy.snapshot_hash)
-        elif args.enable_mainnet_live:
-            raise ValueError("--enable-mainnet-live requires one mainnet_live relationship")
+            key_status = live_key_record_status(
+                policy.follower_wallet, policy.relationship_id, policy.snapshot_hash)
+            if not key_status["found"] or not key_status["enabled"]:
+                raise ValueError("enabled follower signing key is unavailable")
+            report("live_key_ready", relationship_id=policy.relationship_id,
+                   follower_wallet=policy.follower_wallet,
+                   private_key_read=False, live_trading=True)
+        cycle_id, cycle_created = prepare_runtime_budget_cycle(
+            store, paper_config, args.paper_cycle_action,
+            args.paper_cycle_id, args.paper_cycle_reason)
+        report("paper_cycle_initialized" if cycle_created else "paper_cycle_reused",
+               cycle_id=cycle_id, wallets=len(paper_config.relationships),
+               automatic=args.paper_cycle_action == "auto", live_trading=False)
         quoter = LiveQuoter(rpc)
         paper_executor = {}
         relationship_gate = MySqlRelationshipGate() if live_policies else None
@@ -981,9 +1034,6 @@ def parser():
     monitor_parser.add_argument("--backfill-batch", type=int, default=20)
     monitor_parser.add_argument("--backfill-interval", type=float, default=1.0)
     monitor_parser.add_argument(
-        "--enable-mainnet-live", action="store_true",
-        help="Explicitly allow one fully gated mainnet_live MySQL relationship")
-    monitor_parser.add_argument(
         "--relay-auto-associate", action="store_true",
         help="Read Relay public order evidence for passive delivery candidates")
     monitor_source = monitor_parser.add_mutually_exclusive_group()
@@ -993,6 +1043,20 @@ def parser():
     monitor_parser.add_argument("--paper-cycle-action", choices=("reuse", "reset"))
     monitor_parser.add_argument("--paper-cycle-id")
     monitor_parser.add_argument("--paper-cycle-reason")
+    run_parser = commands.add_parser(
+        "run",
+        help="Run enabled MySQL copy relationships with persistent MySQL ledger")
+    run_parser.add_argument(
+        "--seconds", type=float, default=0,
+        help="Duration; 0 runs until interrupted")
+    run_parser.set_defaults(
+        watchlist="data/fomo_watchlist.csv", db="var/observer.sqlite3",
+        workers=2, queue_size=256, confirmations=2, backfill_batch=20,
+        backfill_interval=1.0, relay_auto_associate=True,
+        paper_config=None, paper_mysql=True,
+        paper_cycle_action="auto", paper_cycle_id=None,
+        paper_cycle_reason=None, ledger_mysql=True,
+    )
     reconcile_parser = commands.add_parser(
         "reconcile-reorg",
         help="Explicitly search deeper canonical history after automatic reorg recovery halts",
@@ -1072,7 +1136,7 @@ def main():
     try:
         if args.command == "replay":
             replay(args)
-        elif args.command == "monitor":
+        elif args.command in {"monitor", "run"}:
             if (args.seconds < 0 or not 1 <= args.workers <= 8 or not 1 <= args.queue_size <= 10000
                     or args.confirmations < 0 or not 1 <= args.backfill_batch <= 1000
                     or not 0.1 <= args.backfill_interval <= 60):
@@ -1084,6 +1148,9 @@ def main():
                 if args.paper_cycle_action == "reuse" and (
                         args.paper_cycle_id or args.paper_cycle_reason):
                     raise ValueError("paper reuse does not accept cycle id or reason")
+                if args.paper_cycle_action == "auto" and (
+                        args.paper_cycle_id or args.paper_cycle_reason):
+                    raise ValueError("automatic cycle does not accept cycle id or reason")
                 if args.paper_cycle_action is None:
                     raise ValueError("paper mode requires explicit cycle action")
             elif any((args.paper_cycle_action, args.paper_cycle_id, args.paper_cycle_reason)):

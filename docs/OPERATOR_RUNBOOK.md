@@ -19,12 +19,33 @@ offline_test 门禁，且 stop file 存在时拒绝连接。
 
 ## 新增或修改跟单关系
 
+全新 MySQL volume 会自动执行 `docker/mysql/init/006_database_live_acceptance.sql`。已经初始化过的
+数据库不会自动重放 Docker init 文件，部署新代码时需由数据库管理员只执行该迁移一次；不要重复
+执行，也不要删除 volume。迁移只增加 `live_risk_accepted_at`，既有关系默认保持未确认。
+
 1. 用配置库管理账号插入关系，首先保持 `enabled=0`。CSV 批量导入同样默认禁用。
 2. 核对 follower/smart 地址、策略类型、固定金额或比例、币种额度、单聪明钱累计投入上限、
    trigger、quote policy、协议、资产和完整 route。
 3. 使用运行账号加载配置并检查 snapshot hash；运行
    `.venv/bin/python scripts/validate_mysql_relationship_isolation.py` 验证多 follower 隔离。
-4. 当前只允许用于只读监听和纸面跟单。不得因配置 `enabled=1` 推断系统获准实盘。
+4. 实盘关系还必须在同一条 INSERT/UPDATE 中设置
+   `live_risk_accepted_at=CURRENT_TIMESTAMP(6)`。确认时间必须不早于该行 `updated_at`；任何后续字段
+   变化都会使旧确认失效。核对新值后在本次 UPDATE 同时刷新确认时间，再重启固定任务。
+
+已有关系确认并启用的 SQL 形态如下；必须同时限定 ID 和双方钱包，避免更新错行：
+
+```sql
+UPDATE copy_relationships
+SET run_mode = 'mainnet_live',
+    enabled = TRUE,
+    live_risk_accepted_at = CURRENT_TIMESTAMP(6)
+WHERE id = ?
+  AND follower_wallet = '0x跟单钱包'
+  AND smart_wallet = '0x聪明钱钱包';
+```
+
+执行后用 `relationship-status` 确认 `live_risk_acceptance_current=true`，再重启任务。配置字段发生任何
+变化时，把确认时间放在同一条 UPDATE 中刷新；只修改 `wallet_keys` 不会改变关系确认。
 
 CSV 占位关系可能使用零 follower，但必须保持 disabled；启用策略中的零 follower 或零 smart
 wallet 会在配置加载阶段失败关闭。旧占位数据保留用于来源追踪，但新的 `relationships-import`
@@ -56,20 +77,24 @@ transaction，也不读取私钥。`healthy=false` 时不得继续签名准备�
 replacement 提价、replacement parent 状态以及最终 block number/hash；任何一项损坏都会让
 `healthy=false`。
 
-纸面跟单每次启动必须明确选择周期：
+纸面跟单手工命令可以明确选择周期：
 
 - `--paper-cycle-action reuse`：沿用上次累计投入和剩余额度。
 - `--paper-cycle-action reset --paper-cycle-id ... --paper-cycle-reason ...`：人工开启新周期。
 - 跟卖成交会按该 relationship 的归因持仓释放累计投入额度；失败、revert 或 UNKNOWN 不释放。
 
-## 三层停止控制
+数据库驱动的 `sm-copy run` 会自动沿用当前活动周期，绝不因重启重置已投入额度。第一次运行没有
+活动周期时才自动创建一个；新增 relationship 会在同一周期初始化自己的额度。修改额度会保留已有
+invested/reserved 数值，若新上限低于已占用额度则启动失败，不会偷偷清零。
+
+## 停止控制
 
 任一层都应 fail closed：
 
 1. 将目标 `copy_relationships.enabled` 设为 `0`，签名前的新连接复核会拒绝旧配置快照。
-2. 保持 `SMART_MONEY_EMERGENCY_STOP` 非 `0` 或未设置。离线测试只有显式设置为 `0` 才放行。
-3. 创建 `SMART_MONEY_EMERGENCY_STOP_FILE` 指向的文件；默认是 `var/EXECUTION_STOP`。每次密钥访问
-   和离线签名前都会复查。
+2. 创建 `SMART_MONEY_EMERGENCY_STOP_FILE` 指向的文件；默认是 `var/EXECUTION_STOP`。每次实盘
+   密钥访问和广播前都会复查。`SMART_MONEY_EMERGENCY_STOP` 只保留给离线签名测试，不再是实盘
+   部署配置。
 
 出现异常时先停用关系并创建 stop file，再运行 `execution-audit` 和只读 RPC 核对。不要清库、
 重置 nonce 或盲目重发交易。mainnet_live 广播 hash 和外部广播 hash 都交给只读 tracker 跟踪。
@@ -101,7 +126,7 @@ bundle 中他人的 Swap 不归给目标钱包，claim + swap 仍分别保留。
 
 ## 小额 mainnet_live 测试入口
 
-当前只允许一条 enabled relationship，且必须满足：
+当前一个进程只允许一条 enabled `mainnet_live` relationship，且必须满足：
 
 - 配置来自 `--paper-mysql`，运行账本使用 `--ledger-mysql`；
 - `run_mode='mainnet_live'`、`trigger_mode='evidenced'`；
@@ -115,32 +140,29 @@ bundle 中他人的 Swap 不归给目标钱包，claim + swap 仍分别保留。
   allowance 足额后才重新报价并卖出；不会授权钱包中无归因的同币余额。该 allowance 不放大软件
   预算，测试结束仍应单独撤销为0。monitor 以本次 proposal 输入量判断现有 allowance 是否足够；
   已足够时不补授权，只有不足时才写入上述有界授权目标；
-- 先用 `relationship-status --relationship-id ID` 得到精确 `config_snapshot_hash`；
-- 将 `config/mainnet_risk_acceptance.example.json` 复制到仓库外的运维目录，替换 follower、
-  relationship 和 snapshot 后设为 `chmod 600`；该文件不含私钥，但不得提交；
+- 先用 `relationship-status --relationship-id ID` 核对 follower、smart wallet、额度、协议和精确
+  `config_snapshot_hash`。`enabled=TRUE`、`run_mode='mainnet_live'` 且确认时间不早于行更新时间，
+  三者共同构成逐关系实盘授权；不再创建
+  单独的风险确认 JSON；
+- 每次读取私钥及每次广播前，程序都会用运行时只读账号重新加载该行并核对 follower、relationship
+  ID 与完整 snapshot。运行中禁用或修改该行会让旧进程立即拒绝后续签名；确认新配置后重启才会
+  加载新 snapshot；
 - 私钥仍只由使用者写入独立 key MySQL，不得写到业务 MySQL、仓库 `.env`、命令参数或聊天。
 
-启动前在当前 shell 或部署平台 secret 中设置：
+RPC、Feed、业务 MySQL 和私钥 MySQL 连接信息只需在部署平台配置一次。日常启动不再设置
+execution/signing/broadcast/chain ID 环境开关，也不再准备风险 JSON或手工传额度周期参数。
+
+确认全局急停文件不存在后，固定启动命令只有：
 
 ```bash
-export SMART_MONEY_EMERGENCY_STOP=0
-export SMART_MONEY_EXECUTION_MODE=mainnet_live
-export SMART_MONEY_SIGNING_MODE=mainnet_live
-export SMART_MONEY_BROADCAST_MODE=mainnet_live
-export SMART_MONEY_MAINNET_CHAIN_ID=4663
-export SMART_MONEY_MAINNET_RISK_ACK_FILE=/absolute/path/to/accepted-risk.json
+.venv/bin/sm-copy run
 ```
 
-然后显式选择额度周期并启动：
+该命令固定使用 MySQL 配置、MySQL 账本、自动复用额度周期和 Relay 关联；enabled relationship 中的
+smart wallet 会自动加入监听集合，不再维护额外 watchlist。修改 `copy_relationships` 时在同一条
+SQL 刷新 `live_risk_accepted_at`，或修改 `wallet_keys` 后，重启同一命令即可生效。
 
-```bash
-.venv/bin/sm-copy monitor --seconds 0 --paper-mysql --ledger-mysql \
-  --paper-cycle-action reset --paper-cycle-id mainnet-test-YYYYMMDD-HHMM \
-  --paper-cycle-reason operator_small_value_test --enable-mainnet-live \
-  --relay-auto-associate
-```
-
-任一开关、验收文件字段、配置 snapshot、关系 enabled 状态、余额、allowance、Gas、nonce、报价或
+MySQL 配置 snapshot、关系 enabled/run_mode 状态、密钥 enabled 状态、余额、allowance、Gas、nonce、报价或
 签名发送者不匹配都会在广播前拒绝。RPC 返回 hash 必须等于本地签名 hash；日志只保存公开 hash，
 不保存 raw signed transaction。收到 `live_recovery_requires_operator_review` 时先运行
 `execution-audit --ledger-mysql`，不要直接重发。

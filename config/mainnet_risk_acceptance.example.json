@@ -1,8 +1,0 @@
-{
-  "version": 1,
-  "chain_id": 4663,
-  "follower_wallet": "0x0000000000000000000000000000000000000001",
-  "relationship_id": "1",
-  "config_snapshot_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-  "acknowledgement": "I_ACCEPT_MAINNET_FINANCIAL_RISK"
-}

@@ -277,7 +277,9 @@ usdg_fixed_amount_raw = 1000000
 - 不复制聪明钱的原始 calldata、nonce、recipient、deadline 或授权。
 - monitor 不自动 approve；独立人工命令最多精确授权该关系的 USDG 周期总额度，绝不无限授权。
 - 不处理未知路径后强行下单。
-- 默认只读模式不读取主网私钥、不签名、不广播；受控 mainnet_live 仍必须通过单独风险验收。
+- 默认只读模式不读取主网私钥、不签名、不广播；受控 mainnet_live 必须由数据库中 enabled、
+  `mainnet_live` 且行内确认仍为最新的 relationship 明确启用，并在每次签名和广播前重新核对该行及
+  配置快照。
 - 不承诺成交、收益、最终性或所有协议覆盖。
 
 ## 9. 当前配置下的一条完整示例

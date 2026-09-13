@@ -6,6 +6,7 @@ from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
 from dataclasses import replace
+from datetime import datetime, timedelta
 import hashlib
 import hmac
 import io
@@ -32,7 +33,8 @@ from smart_money.backfill import BlockScanner, ReorgDetected
 from smart_money.broadcast import MainnetBroadcaster
 from smart_money.cli import (
     LatencySamples, coverage_summary, dispatch_pending, execution_track,
-    parser as cli_parser, relay_associate,
+    monitoring_watchlist, parser as cli_parser, prepare_runtime_budget_cycle,
+    relay_associate,
 )
 from smart_money.config import load_endpoint_env
 from smart_money.decode import (
@@ -48,16 +50,20 @@ from smart_money.execution_pipeline import (
 )
 from smart_money.execution_receipts import ReadOnlyExecutionTracker
 from smart_money.execution_controls import (
-    MAINNET_ACKNOWLEDGEMENT, require_mainnet_broadcast_enabled,
-    require_mainnet_signing_enabled, require_offline_signing_enabled,
+    require_mainnet_broadcast_enabled, require_mainnet_signing_enabled,
+    require_offline_signing_enabled,
 )
-from smart_money.key_source import LiveDatabaseSigner, OfflineDatabaseSigner, key_record_status
+from smart_money.key_source import (
+    LiveDatabaseSigner, OfflineDatabaseSigner, key_record_status,
+    live_key_record_status,
+)
 from smart_money.ledger_migration import migrate_sqlite_ledger, sqlite_sha256
 from smart_money.live_settlement import settle_confirmed_execution, wallet_erc20_deltas
 from smart_money.models import Signal, Transaction
 from smart_money.mysql_config import (
-    MySqlRelationshipGate, import_watchlist_relationships, load_mysql_paper_config,
-    mysql_connection, rows_to_document,
+    MySqlRelationshipGate, import_watchlist_relationships,
+    load_enabled_mainnet_acceptance, load_mysql_paper_config, mysql_connection,
+    rows_to_document,
 )
 from smart_money.mysql_store import MySqlConnectionCompat
 from smart_money.native_flows import verify_native_flows
@@ -88,7 +94,23 @@ OFFLINE_ENV = {
     'SMART_MONEY_EMERGENCY_STOP': '0',
     'SMART_MONEY_EXECUTION_MODE': 'offline_test',
     'SMART_MONEY_SIGNING_MODE': 'offline_test',
+    'SMART_MONEY_EMERGENCY_STOP_FILE': str(
+        ROOT / 'tests/.execution-stop-not-active'),
 }
+OFFLINE_CONTROL_KEYS = (
+    'SMART_MONEY_EMERGENCY_STOP',
+    'SMART_MONEY_EXECUTION_MODE',
+    'SMART_MONEY_SIGNING_MODE',
+)
+
+
+def accepted_mainnet_relationship(policy, *, stale=False):
+    accepted_at = datetime(2026, 9, 13, 0, 0, 0)
+    return {
+        'policy': policy,
+        'accepted_at': accepted_at,
+        'updated_at': accepted_at + timedelta(microseconds=1) if stale else accepted_at,
+    }
 
 
 def tx(data, to=A, sender=A):
@@ -2663,6 +2685,14 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(status['enabled'])
         self.assertFalse(status['private_key_read'])
 
+        Cursor.rows = [{'wallet_address': B, 'enabled': 1}]
+        with patch('smart_money.key_source._key_connection', return_value=Connection()):
+            status = live_key_record_status(B, '42', 'ab' * 32)
+        self.assertTrue(status['found'])
+        self.assertTrue(status['enabled'])
+        self.assertFalse(status['private_key_read'])
+        self.assertNotIn('private_key', queries[-1][0].lower())
+
     def test_live_database_signer_is_bound_to_relationship_snapshot(self):
         account = Account.create()
         follower = account.address.lower()
@@ -2689,41 +2719,35 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 signer.sign_transaction(transaction)
             connection.assert_not_called()
-        with tempfile.TemporaryDirectory() as folder:
-            acceptance = Path(folder) / 'risk.json'
-            acceptance.write_text(json.dumps({
-                'version': 1, 'chain_id': R.CHAIN_ID,
-                'follower_wallet': follower, 'relationship_id': '42',
-                'config_snapshot_hash': 'ab' * 32,
-                'acknowledgement': MAINNET_ACKNOWLEDGEMENT,
-            }))
-            acceptance.chmod(0o600)
-            live = {
-                'SMART_MONEY_EMERGENCY_STOP': '0',
-                'SMART_MONEY_EXECUTION_MODE': 'mainnet_live',
-                'SMART_MONEY_SIGNING_MODE': 'mainnet_live',
-                'SMART_MONEY_MAINNET_CHAIN_ID': str(R.CHAIN_ID),
-                'SMART_MONEY_MAINNET_RISK_ACK_FILE': str(acceptance),
-            }
-            with patch.dict(os.environ, live, clear=True), patch(
-                    'smart_money.key_source._key_connection',
-                    return_value=Connection()):
-                raw = signer.sign_transaction(transaction)
-            self.assertEqual(Account.recover_transaction(raw).lower(), follower)
-            wrong = LiveDatabaseSigner(follower, '43', 'ab' * 32)
-            with patch.dict(os.environ, live, clear=True), patch(
-                    'smart_money.key_source._key_connection') as connection:
-                with self.assertRaisesRegex(PermissionError, 'does not match'):
-                    wrong.sign_transaction(transaction)
-                connection.assert_not_called()
+        live = {'SMART_MONEY_EMERGENCY_STOP_FILE': OFFLINE_ENV[
+            'SMART_MONEY_EMERGENCY_STOP_FILE']}
+        policy = SimpleNamespace(
+            run_mode='mainnet_live', follower_wallet=follower,
+            relationship_id='42', snapshot_hash='ab' * 32,
+        )
+        with patch.dict(os.environ, live, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                return_value=accepted_mainnet_relationship(policy)), patch(
+                'smart_money.key_source._key_connection',
+                return_value=Connection()):
+            raw = signer.sign_transaction(transaction)
+        self.assertEqual(Account.recover_transaction(raw).lower(), follower)
+        wrong = LiveDatabaseSigner(follower, '43', 'ab' * 32)
+        with patch.dict(os.environ, live, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                return_value=accepted_mainnet_relationship(policy)), patch(
+                'smart_money.key_source._key_connection') as connection:
+            with self.assertRaisesRegex(PermissionError, 'does not match'):
+                wrong.sign_transaction(transaction)
+            connection.assert_not_called()
 
-    def test_execution_process_controls_require_explicit_bound_mainnet_acceptance(self):
+    def test_execution_process_controls_require_enabled_bound_mainnet_relationship(self):
         with patch.dict(os.environ, {}, clear=False):
             for key in OFFLINE_ENV:
                 os.environ.pop(key, None)
             with self.assertRaisesRegex(PermissionError, 'emergency stop'):
                 require_offline_signing_enabled()
-        for missing in OFFLINE_ENV:
+        for missing in OFFLINE_CONTROL_KEYS:
             values = dict(OFFLINE_ENV)
             values.pop(missing)
             with patch.dict(os.environ, values, clear=True):
@@ -2740,35 +2764,32 @@ class SafetyTests(unittest.TestCase):
             }, clear=True):
                 with self.assertRaisesRegex(PermissionError, 'stop file'):
                     require_offline_signing_enabled()
-        with tempfile.TemporaryDirectory() as folder:
-            acceptance = Path(folder) / 'risk.json'
-            acceptance.write_text(json.dumps({
-                'version': 1, 'chain_id': R.CHAIN_ID,
-                'follower_wallet': B, 'relationship_id': '42',
-                'config_snapshot_hash': 'ab' * 32,
-                'acknowledgement': MAINNET_ACKNOWLEDGEMENT,
-            }))
-            acceptance.chmod(0o600)
-            live = {
-                'SMART_MONEY_EMERGENCY_STOP': '0',
-                'SMART_MONEY_EXECUTION_MODE': 'mainnet_live',
-                'SMART_MONEY_SIGNING_MODE': 'mainnet_live',
-                'SMART_MONEY_BROADCAST_MODE': 'mainnet_live',
-                'SMART_MONEY_MAINNET_CHAIN_ID': str(R.CHAIN_ID),
-                'SMART_MONEY_MAINNET_RISK_ACK_FILE': str(acceptance),
-            }
-            for missing in live:
-                values = dict(live)
-                values.pop(missing)
-                with patch.dict(os.environ, values, clear=True):
-                    with self.assertRaises(PermissionError):
-                        require_mainnet_broadcast_enabled(B, '42', 'ab' * 32)
-            with patch.dict(os.environ, live, clear=True):
-                evidence = require_mainnet_signing_enabled(B, '42', 'ab' * 32)
-                self.assertEqual(evidence['follower_wallet'], B)
+        live = {'SMART_MONEY_EMERGENCY_STOP_FILE': OFFLINE_ENV[
+            'SMART_MONEY_EMERGENCY_STOP_FILE']}
+        policy = SimpleNamespace(
+            run_mode='mainnet_live', follower_wallet=B,
+            relationship_id='42', snapshot_hash='ab' * 32,
+        )
+        with patch.dict(os.environ, live, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                return_value=accepted_mainnet_relationship(policy)):
+            evidence = require_mainnet_signing_enabled(B, '42', 'ab' * 32)
+            self.assertEqual(evidence['follower_wallet'], B)
+            self.assertEqual(
+                evidence['acceptance_source'], 'enabled_mainnet_mysql_relationship')
+            require_mainnet_broadcast_enabled(B, '42', 'ab' * 32)
+            with self.assertRaisesRegex(PermissionError, 'does not match'):
+                require_mainnet_broadcast_enabled(A, '42', 'ab' * 32)
+        with patch.dict(os.environ, live, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                side_effect=ValueError('relationship is disabled or unavailable')):
+            with self.assertRaisesRegex(PermissionError, 'unavailable'):
                 require_mainnet_broadcast_enabled(B, '42', 'ab' * 32)
-                with self.assertRaisesRegex(PermissionError, 'does not match'):
-                    require_mainnet_broadcast_enabled(A, '42', 'ab' * 32)
+        with patch.dict(os.environ, live, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                return_value=accepted_mainnet_relationship(policy, stale=True)):
+            with self.assertRaisesRegex(PermissionError, 'stale'):
+                require_mainnet_broadcast_enabled(B, '42', 'ab' * 32)
 
     def test_mainnet_broadcaster_is_separate_hash_checked_and_default_closed(self):
         account = Account.create()
@@ -2785,45 +2806,44 @@ class SafetyTests(unittest.TestCase):
             proposal_id='proposal-live', signed_tx_hash=tx_hash,
             evidence={'broadcast_performed': False})
         broadcaster = MainnetBroadcaster('https://rpc.example')
-        with patch.dict(os.environ, {}, clear=True), self.assertRaises(PermissionError):
+        with patch.dict(os.environ, {
+                'SMART_MONEY_EMERGENCY_STOP_FILE': OFFLINE_ENV[
+                    'SMART_MONEY_EMERGENCY_STOP_FILE'],
+        }, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                side_effect=ValueError('relationship is disabled')), \
+                self.assertRaises(PermissionError):
             asyncio.run(broadcaster.broadcast(
                 review, raw, follower_wallet=follower, relationship_id='42',
                 config_snapshot_hash='ab' * 32))
 
-        with tempfile.TemporaryDirectory() as folder:
-            acceptance = Path(folder) / 'risk.json'
-            acceptance.write_text(json.dumps({
-                'version': 1, 'chain_id': R.CHAIN_ID,
-                'follower_wallet': follower, 'relationship_id': '42',
-                'config_snapshot_hash': 'ab' * 32,
-                'acknowledgement': MAINNET_ACKNOWLEDGEMENT,
-            }))
-            acceptance.chmod(0o600)
-            live = {
-                'SMART_MONEY_EMERGENCY_STOP': '0',
-                'SMART_MONEY_EXECUTION_MODE': 'mainnet_live',
-                'SMART_MONEY_SIGNING_MODE': 'mainnet_live',
-                'SMART_MONEY_BROADCAST_MODE': 'mainnet_live',
-                'SMART_MONEY_MAINNET_CHAIN_ID': str(R.CHAIN_ID),
-                'SMART_MONEY_MAINNET_RISK_ACK_FILE': str(acceptance),
-            }
-            with patch.dict(os.environ, live, clear=True), patch(
-                    'smart_money.broadcast.asyncio.to_thread',
-                    new=AsyncMock(return_value=tx_hash)) as send:
-                result = asyncio.run(broadcaster.broadcast(
-                    review, raw, follower_wallet=follower, relationship_id='42',
-                    config_snapshot_hash='ab' * 32))
-            self.assertTrue(result.submitted)
-            self.assertEqual(result.tx_hash, tx_hash)
-            send.assert_awaited_once_with(broadcaster._request, '0x' + raw.hex())
+        live = {'SMART_MONEY_EMERGENCY_STOP_FILE': OFFLINE_ENV[
+            'SMART_MONEY_EMERGENCY_STOP_FILE']}
+        policy = SimpleNamespace(
+            run_mode='mainnet_live', follower_wallet=follower,
+            relationship_id='42', snapshot_hash='ab' * 32,
+        )
+        with patch.dict(os.environ, live, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                return_value=accepted_mainnet_relationship(policy)), patch(
+                'smart_money.broadcast.asyncio.to_thread',
+                new=AsyncMock(return_value=tx_hash)) as send:
+            result = asyncio.run(broadcaster.broadcast(
+                review, raw, follower_wallet=follower, relationship_id='42',
+                config_snapshot_hash='ab' * 32))
+        self.assertTrue(result.submitted)
+        self.assertEqual(result.tx_hash, tx_hash)
+        send.assert_awaited_once_with(broadcaster._request, '0x' + raw.hex())
 
-            with patch.dict(os.environ, live, clear=True), patch(
-                    'smart_money.broadcast.asyncio.to_thread',
-                    new=AsyncMock(return_value='0x' + 'ff' * 32)), \
-                    self.assertRaisesRegex(RuntimeError, 'different transaction hash'):
-                asyncio.run(broadcaster.broadcast(
-                    review, raw, follower_wallet=follower, relationship_id='42',
-                    config_snapshot_hash='ab' * 32))
+        with patch.dict(os.environ, live, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                return_value=accepted_mainnet_relationship(policy)), patch(
+                'smart_money.broadcast.asyncio.to_thread',
+                new=AsyncMock(return_value='0x' + 'ff' * 32)), \
+                self.assertRaisesRegex(RuntimeError, 'different transaction hash'):
+            asyncio.run(broadcaster.broadcast(
+                review, raw, follower_wallet=follower, relationship_id='42',
+                config_snapshot_hash='ab' * 32))
 
     def test_final_execution_review_rejects_secret_or_raw_transaction_fields(self):
         store = Store(':memory:')
@@ -3028,6 +3048,11 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn('wallet_keys', sql)
         self.assertNotIn('private_key', sql)
         self.assertIn('amount_in_raw VARCHAR(80)', sql)
+        acceptance_sql = (
+            ROOT / 'docker/mysql/init/006_database_live_acceptance.sql').read_text()
+        self.assertIn('live_risk_accepted_at', acceptance_sql)
+        self.assertIn('TIMESTAMP(6) NULL', acceptance_sql)
+        self.assertNotIn('private_key', acceptance_sql)
         self.assertIn('realized_pnl_raw VARCHAR(81)', sql)
         self.assertIn('UNIQUE KEY uq_one_active_paper_budget_cycle', sql)
 
@@ -3259,6 +3284,14 @@ class SafetyTests(unittest.TestCase):
             path.write_text(json.dumps(live_document))
             live = load_paper_config(path)
         self.assertEqual(live.relationships[0].run_mode, 'mainnet_live')
+        accepted_at = datetime(2026, 9, 13, 1, 2, 3)
+        accepted_row = dict(
+            live_row, live_risk_accepted_at=accepted_at, updated_at=accepted_at)
+        with patch('smart_money.mysql_config._load_enabled_relationship_row',
+                   return_value=accepted_row):
+            acceptance = load_enabled_mainnet_acceptance('7')
+        self.assertEqual(acceptance['policy'].relationship_id, '7')
+        self.assertEqual(acceptance['accepted_at'], accepted_at)
         second = dict(row, id=8, follower_wallet='0x' + '33' * 20)
         multi = rows_to_document([row, second])
         with tempfile.TemporaryDirectory() as folder:
@@ -3270,14 +3303,59 @@ class SafetyTests(unittest.TestCase):
         self.assertNotEqual(converted.relationships[0].ledger_scope,
                             converted.relationships[1].ledger_scope)
 
-        parsed = cli_parser().parse_args([
-            'monitor', '--paper-mysql', '--ledger-mysql', '--enable-mainnet-live',
-            '--paper-cycle-action', 'reuse',
-        ])
-        self.assertTrue(parsed.enable_mainnet_live)
+        automatic = cli_parser().parse_args(['run'])
+        self.assertEqual(automatic.command, 'run')
+        self.assertTrue(automatic.paper_mysql)
+        self.assertTrue(automatic.ledger_mysql)
+        self.assertTrue(automatic.relay_auto_associate)
+        self.assertEqual(automatic.paper_cycle_action, 'auto')
+        self.assertEqual(automatic.seconds, 0)
         status = cli_parser().parse_args([
             'relationship-status', '--relationship-id', '7'])
         self.assertEqual(status.relationship_id, '7')
+
+    def test_database_run_adds_relationship_wallet_and_reuses_budget_cycle(self):
+        policy = SimpleNamespace(
+            wallet=B, label='database-smart-wallet', ledger_scope='relationship-scope',
+            budget_limits={'USDG': '1000'},
+        )
+        config = SimpleNamespace(relationships=(policy,))
+        watchlist = monitoring_watchlist(ROOT / 'data/fomo_watchlist.csv', config)
+        self.assertEqual(watchlist[B]['source'], 'copy_relationships')
+        self.assertEqual(watchlist[B]['handle'], 'database-smart-wallet')
+
+        store = Store(':memory:')
+        cycle_id, created = prepare_runtime_budget_cycle(store, config, 'auto')
+        self.assertTrue(created)
+        self.assertEqual(store.active_paper_budget_cycle(), cycle_id)
+        self.assertEqual(store.paper_budget('relationship-scope', 'USDG')['limit_raw'], '1000')
+
+        store.connection.execute("""UPDATE paper_budgets SET invested_raw='400'
+            WHERE cycle_id=? AND wallet=? AND bucket='USDG'""", (
+                cycle_id, 'relationship-scope'))
+        store.connection.commit()
+        changed = SimpleNamespace(
+            relationships=(SimpleNamespace(
+                wallet=B, label='database-smart-wallet',
+                ledger_scope='relationship-scope', budget_limits={'USDG': '1500'}),
+            SimpleNamespace(
+                wallet=TOKEN, label='new-smart-wallet',
+                ledger_scope='new-relationship-scope', budget_limits={'USDG': '2000'})),
+        )
+        reused_id, reused_created = prepare_runtime_budget_cycle(store, changed, 'auto')
+        self.assertFalse(reused_created)
+        self.assertEqual(reused_id, cycle_id)
+        budget = store.paper_budget('relationship-scope', 'USDG')
+        self.assertEqual((budget['limit_raw'], budget['invested_raw']), ('1500', '400'))
+        self.assertEqual(
+            store.paper_budget('new-relationship-scope', 'USDG')['limit_raw'], '2000')
+
+        lowered = SimpleNamespace(relationships=(SimpleNamespace(
+            wallet=B, label='database-smart-wallet', ledger_scope='relationship-scope',
+            budget_limits={'USDG': '300'}),))
+        with self.assertRaisesRegex(ValueError, 'below occupied budget'):
+            prepare_runtime_budget_cycle(store, lowered, 'auto')
+        store.close()
 
     def test_same_smart_wallet_relationships_have_isolated_budget_and_proposals(self):
         async def scenario():
