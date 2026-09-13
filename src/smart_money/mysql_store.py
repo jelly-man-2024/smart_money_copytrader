@@ -48,9 +48,36 @@ class MySqlConnectionCompat:
         re.IGNORECASE | re.DOTALL,
     )
 
-    def __init__(self, connection):
+    # pymysql codes for a connection that is gone: 0 (socket already closed),
+    # 2003 (cannot connect), 2006 (server has gone away), 2013 (lost connection).
+    _RECOVERABLE_CODES = frozenset({0, 2003, 2006, 2013})
+
+    def __init__(self, connection, connection_factory=None):
         self._connection = connection
+        self._connection_factory = connection_factory
         self._in_transaction = False
+        self.reconnections = 0
+
+    @classmethod
+    def _recoverable(cls, exc: BaseException) -> bool:
+        if not isinstance(exc, (pymysql.err.InterfaceError, pymysql.err.OperationalError)):
+            return False
+        code = exc.args[0] if exc.args else 0
+        return not isinstance(code, int) or code in cls._RECOVERABLE_CODES
+
+    def _reconnect(self) -> None:
+        """Replace a dead connection; only legal outside a ledger transaction."""
+        try:
+            self._connection.close()
+        except Exception:
+            pass
+        if self._connection_factory is not None:
+            self._connection = self._connection_factory(
+                write=False, dict_rows=False, autocommit=True)
+        else:
+            self._connection.ping(reconnect=True)
+        self._in_transaction = False
+        self.reconnections += 1
 
     @classmethod
     def _sql(cls, sql: str, lock: bool = False) -> str:
@@ -77,20 +104,47 @@ class MySqlConnectionCompat:
         if sql.strip().upper() == "BEGIN IMMEDIATE":
             if self._in_transaction:
                 raise RuntimeError("nested MySQL ledger transaction")
-            self._connection.begin()
+            try:
+                self._connection.begin()
+            except (pymysql.err.InterfaceError, pymysql.err.OperationalError) as exc:
+                if not self._recoverable(exc):
+                    raise
+                self._reconnect()
+                self._connection.begin()
             self._in_transaction = True
             return _Cursor(self._connection.cursor())
-        cursor = self._connection.cursor()
-        cursor.execute(self._sql(sql, lock=self._in_transaction), params)
+        statement = self._sql(sql, lock=self._in_transaction)
+        try:
+            cursor = self._connection.cursor()
+            cursor.execute(statement, params)
+        except (pymysql.err.InterfaceError, pymysql.err.OperationalError) as exc:
+            if not self._recoverable(exc):
+                raise
+            if self._in_transaction:
+                # The server already discarded this transaction with the socket;
+                # the caller's rollback is a no-op and the operation fails closed.
+                self._in_transaction = False
+                raise
+            self._reconnect()
+            cursor = self._connection.cursor()
+            cursor.execute(statement, params)
         return _Cursor(cursor)
 
     def commit(self):
-        self._connection.commit()
-        self._in_transaction = False
+        try:
+            self._connection.commit()
+        finally:
+            self._in_transaction = False
 
     def rollback(self):
-        self._connection.rollback()
-        self._in_transaction = False
+        try:
+            self._connection.rollback()
+        except (pymysql.err.InterfaceError, pymysql.err.OperationalError) as exc:
+            if not self._recoverable(exc):
+                raise
+            # Nothing to roll back on a dead connection; the next statement reconnects.
+        finally:
+            self._in_transaction = False
 
     def close(self):
         self._connection.close()
@@ -102,5 +156,5 @@ class MySqlStore(Store):
     def __init__(self, connection_factory=mysql_connection):
         connection = connection_factory(
             write=False, dict_rows=False, autocommit=True)
-        self.connection = MySqlConnectionCompat(connection)
+        self.connection = MySqlConnectionCompat(connection, connection_factory)
         self.integrity_error = pymysql.IntegrityError

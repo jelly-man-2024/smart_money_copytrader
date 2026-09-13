@@ -4822,6 +4822,81 @@ class AggregatorExecutionTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_mysql_compat_reconnects_only_outside_transactions(self):
+        import pymysql
+        from smart_money.mysql_store import MySqlConnectionCompat
+
+        class FakeCursor:
+            def __init__(self, connection):
+                self.connection = connection
+                self.rowcount = 0
+
+            def execute(self, sql, params=None):
+                self.connection.statements.append(sql)
+                if self.connection.dead:
+                    raise pymysql.err.InterfaceError(0, '')
+
+            def fetchone(self):
+                return None
+
+            def fetchall(self):
+                return []
+
+        class FakeConnection:
+            def __init__(self):
+                self.dead = False
+                self.statements = []
+                self.closed = False
+
+            def cursor(self):
+                return FakeCursor(self)
+
+            def begin(self):
+                if self.dead:
+                    raise pymysql.err.OperationalError(2013, 'Lost connection')
+                self.statements.append('BEGIN')
+
+            def commit(self):
+                self.statements.append('COMMIT')
+
+            def rollback(self):
+                if self.dead:
+                    raise pymysql.err.InterfaceError(0, '')
+                self.statements.append('ROLLBACK')
+
+            def close(self):
+                self.closed = True
+
+        connections = [FakeConnection(), FakeConnection()]
+
+        def factory(**kwargs):
+            return connections.pop(0)
+
+        first = FakeConnection()
+        compat = MySqlConnectionCompat(first, factory)
+        compat.execute("SELECT 1")
+        first.dead = True
+        compat.execute("SELECT 2")
+        self.assertEqual(compat.reconnections, 1)
+        self.assertTrue(first.closed)
+        current = compat._connection
+        self.assertEqual(current.statements, ["SELECT 2"])
+        compat.execute("BEGIN IMMEDIATE")
+        current.dead = True
+        with self.assertRaises(pymysql.err.InterfaceError):
+            compat.execute("UPDATE t SET x=1")
+        self.assertFalse(compat._in_transaction)
+        self.assertEqual(compat.reconnections, 1)
+        compat.rollback()  # dead connection: rollback is a no-op, no exception
+        compat.execute("SELECT 3")  # reconnects lazily on the next statement
+        self.assertEqual(compat.reconnections, 2)
+        self.assertEqual(compat._connection.statements, ["SELECT 3"])
+        broken = FakeConnection()
+        compat_no_factory = MySqlConnectionCompat(broken)
+        broken.dead = True
+        with self.assertRaises(AttributeError):
+            compat_no_factory.execute("SELECT 1")  # ping() missing on the fake: surfaces
+
     def test_store_recovers_kyber_sell_route_from_attributed_lot(self):
         from smart_money.paper import aggregator_route_definition
         store = Store(':memory:')

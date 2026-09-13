@@ -895,6 +895,7 @@ async def monitor(args):
     async def heartbeat():
         while True:
             await asyncio.sleep(5)
+            stats["ledger_reconnections"] = getattr(store.connection, "reconnections", 0)
             report("health", healthy=health.healthy(), queued=queue.qsize(), counters=dict(stats),
                    candidate_states=store.candidate_counts(), chain_cursor=store.chain_cursor(),
                    latency_ms=timings.summary(), coverage=coverage_summary(stats))
