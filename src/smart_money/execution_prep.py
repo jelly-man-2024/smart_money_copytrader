@@ -193,6 +193,36 @@ def build_aggregator_execution_plan(
     reason = scope_reason(signal, allowed_protocols, allowed_assets, allowed_routes)
     if reason:
         raise ValueError(reason)
+    return _validated_aggregator_plan(signal, follower, relationship_id, proposal_id,
+        quote, minimum_amount_out_raw, swap, gas_limit, max_fee_per_gas, max_priority_fee_per_gas)
+
+
+def build_early_aggregator_execution_plan(
+        intent, follower_wallet, relationship_id, proposal_id, quote, minimum_amount_out_raw,
+        swap, gas_limit, max_fee_per_gas, max_priority_fee_per_gas,
+        allowed_protocols, allowed_assets, now=None):
+    """Separate typed-intent entrance; never promote intent into execution evidence."""
+    from .verified_feed_intent import VerifiedFeedIntent
+    if not isinstance(intent, VerifiedFeedIntent):
+        raise ValueError("verified Feed intent required for early construction")
+    signal = intent.quote_signal(time.time() if now is None else now)
+    source_protocol = "relay_solver" if signal.behavior == "BUY" else "kyber"
+    funding = signal.token_in if signal.behavior == "BUY" else signal.token_out
+    if source_protocol not in allowed_protocols or funding not in allowed_assets:
+        raise ValueError("early source or funding asset outside policy")
+    source_minimum = ((int(signal.amount_limit_raw) * int(quote.amount_in_raw)
+                       + int(signal.amount_in_raw) - 1) // int(signal.amount_in_raw))
+    # Unlike ordinary quote rounding tolerance, never shave one raw unit off the
+    # signed source intent's price limit.
+    if int(swap.minimum_amount_out_raw) < source_minimum:
+        raise ValueError("aggregator minimum violates verified source intent")
+    return _validated_aggregator_plan(signal, address(follower_wallet), relationship_id, proposal_id,
+        quote, minimum_amount_out_raw, swap, gas_limit, max_fee_per_gas, max_priority_fee_per_gas)
+
+
+def _validated_aggregator_plan(signal, follower, relationship_id, proposal_id, quote,
+        minimum_amount_out_raw, swap, gas_limit, max_fee_per_gas, max_priority_fee_per_gas):
+    """Common exact-calldata and router validation, independent of evidence stage."""
     if not isinstance(swap, KyberSwapTransaction):
         raise ValueError("aggregator transaction is not a verified Kyber swap")
     amount = _uint(quote.amount_in_raw, "quote amount in")

@@ -13,6 +13,7 @@ from hexbytes import HexBytes
 from .execution_prep import (
     EXECUTION_TARGETS, ReadOnlyExecutionPreflight, UnsignedExecutionPlan,
     build_aggregator_execution_plan, build_execution_plan,
+    build_early_aggregator_execution_plan,
     simulate_aggregator_execution,
 )
 from .key_source import LiveDatabaseSigner, OfflineDatabaseSigner
@@ -21,6 +22,37 @@ from .execution_controls import (
 )
 from .paper import AGGREGATOR_PROVIDERS
 from .quotes import assess_quote
+from .verified_feed_intent import VerifiedFeedIntent
+
+
+def check_early_execution_source(store, intent, signal, proposal, now=None):
+    """Revalidate the original typed intent at each asynchronous execution boundary."""
+    enrolled = "early_trial_id" in proposal["attribution"]
+    if intent is None and not enrolled:
+        return
+    if not enrolled or not isinstance(intent, VerifiedFeedIntent):
+        raise ValueError("early execution requires original verified intent and trial")
+    expected = intent.quote_signal(time.time() if now is None else now)
+    if signal.to_dict() != expected.to_dict():
+        raise ValueError("early execution signal differs from verified intent")
+    attr = proposal["attribution"]
+    if (attr.get("copy_operation_order_id") != intent.candidate.order_id
+            or attr.get("smart_wallet") != expected.wallet
+            or proposal["source_tx_hash"] != expected.tx_hash
+            or proposal["input_asset"] != expected.token_in
+            or proposal["output_asset"] != expected.token_out):
+        raise ValueError("early proposal differs from verified intent")
+    for (payload,) in store.connection.execute(
+            "SELECT payload FROM signals WHERE tx_hash=?", (expected.tx_hash,)).fetchall():
+        import json
+        current = json.loads(payload)
+        if current.get("wallet") == expected.wallet and (
+                current.get("canonical_status") == "orphaned"
+                or current.get("stage") == "failed"):
+            raise ValueError("early source failed or orphaned before execution")
+    store._check_early_trial(proposal["attribution"], now)
+    if proposal.get("status") == "reserved":
+        store.execution_budget_evidence(proposal["proposal_id"])
 
 
 def validate_transaction_matches_plan(transaction: dict,
@@ -122,9 +154,12 @@ class ExecutionPreparer:
                                  row["transaction"], row["preflight"], existing)
 
     async def prepare(self, signal, proposal_id: str,
-                      now: float | None = None) -> PreparedExecution:
+                      now: float | None = None, *, early_intent=None) -> PreparedExecution:
+        fixed_now = now
         existing = self.store.execution_plan(proposal_id)
         if existing:
+            check_early_execution_source(self.store, early_intent, signal,
+                                         self.store.paper_proposal(proposal_id), now)
             if existing["status"] != "prepared":
                 raise ValueError("execution plan is not reusable")
             return self._result(existing, True)
@@ -132,6 +167,9 @@ class ExecutionPreparer:
         if proposal is None or proposal["status"] != "reserved":
             raise ValueError("proposal is not reserved")
         attribution = proposal["attribution"]
+        check_early_execution_source(self.store, early_intent, signal, proposal, now)
+        if "early_trial_id" in attribution:
+            self.store.check_early_trial_proposal(proposal_id)
         follower = attribution.get("follower_wallet")
         relationship = attribution.get("relationship_id")
         snapshot = attribution.get("config_snapshot_hash")
@@ -151,6 +189,7 @@ class ExecutionPreparer:
             # keeps supplying the small reference quote for price-impact estimation.
             quote = replace(quote, amount_out_raw=swap.amount_out_raw,
                             gas_estimate_raw=str(swap.gas_estimate))
+        now = time.time() if fixed_now is None else fixed_now
         accepted, reason, risk = assess_quote(
             signal, quote, reference, self.quote_policy, gas_price_raw, now)
         if not accepted:
@@ -161,11 +200,16 @@ class ExecutionPreparer:
         if swap is not None:
             gas_limit = max(self.gas_limits.get(signal.protocol, 0),
                             swap.gas_estimate * 13 // 10 + 50_000)
-            plan = build_aggregator_execution_plan(
-                signal, follower, relationship, proposal_id, quote,
-                risk["minimum_amount_out_raw"], swap, gas_limit, str(max_fee), "0",
-                self.allowed_protocols, self.allowed_assets, self.allowed_routes,
-            )
+            if early_intent is not None:
+                plan = build_early_aggregator_execution_plan(
+                    early_intent, follower, relationship, proposal_id, quote,
+                    risk["minimum_amount_out_raw"], swap, gas_limit, str(max_fee), "0",
+                    self.allowed_protocols, self.allowed_assets, now)
+            else:
+                plan = build_aggregator_execution_plan(
+                    signal, follower, relationship, proposal_id, quote,
+                    risk["minimum_amount_out_raw"], swap, gas_limit, str(max_fee), "0",
+                    self.allowed_protocols, self.allowed_assets, self.allowed_routes)
             simulation = await simulate_aggregator_execution(self.rpc, plan)
             simulation["aggregator"] = swap.public_evidence()
         else:
@@ -179,6 +223,13 @@ class ExecutionPreparer:
             self.rpc, EXECUTION_TARGETS,
             self.quote_policy.max_gas_cost_wei).check(plan, now)
         preflight.update(simulation)
+        completed_at = time.time() if fixed_now is None else fixed_now
+        check_early_execution_source(self.store, early_intent, signal, proposal, completed_at)
+        accepted, reason, _ = assess_quote(
+            signal, quote, reference, self.quote_policy, gas_price_raw, completed_at)
+        if not accepted:
+            raise ValueError(f"execution quote expired or invalid after preflight: {reason}")
+        preflight["checked_at"] = completed_at
         reservation_id = hashlib.sha256(
             f"nonce:{proposal_id}:{follower}:{relationship}".encode()).hexdigest()
         nonce, status = self.store.reserve_execution_nonce(
@@ -220,8 +271,8 @@ class OfflineExecutionSigner:
         self.relationship_gate = relationship_gate
 
     async def sign(self, signal, proposal_id: str,
-                   now: float | None = None) -> OfflineSignedExecution:
-        return await self._sign(signal, proposal_id, now, recovering=False)
+                   now: float | None = None, *, early_intent=None) -> OfflineSignedExecution:
+        return await self._sign(signal, proposal_id, now, recovering=False, early_intent=early_intent)
 
     async def recover_signed(self, signal, proposal_id: str,
                              now: float | None = None) -> OfflineSignedExecution:
@@ -229,7 +280,8 @@ class OfflineExecutionSigner:
         return await self._sign(signal, proposal_id, now, recovering=True)
 
     async def _sign(self, signal, proposal_id: str, now: float | None,
-                    recovering: bool) -> OfflineSignedExecution:
+                    recovering: bool, early_intent=None) -> OfflineSignedExecution:
+        fixed_now = now
         row = self.store.execution_plan(proposal_id)
         expected_status = "signed" if recovering else "prepared"
         if (row is None or row["status"] != expected_status
@@ -243,6 +295,7 @@ class OfflineExecutionSigner:
                 or proposal["source_event_id"] != signal.event_id
                 or signal.canonical_status == "orphaned"):
             raise ValueError("source proposal or signal is no longer eligible")
+        check_early_execution_source(self.store, early_intent, signal, proposal, now)
         if self.relationship_gate is not None:
             self.relationship_gate.validate(
                 row["relationship_id"], row["follower_wallet"], signal.wallet,
@@ -281,7 +334,15 @@ class OfflineExecutionSigner:
             raise ValueError("reserved nonce is behind current pending nonce")
         if original.execution_provider in AGGREGATOR_PROVIDERS:
             preflight.update(await simulate_aggregator_execution(self.rpc, original))
+        now = time.time() if fixed_now is None else fixed_now
+        accepted, reason, risk = assess_quote(
+            signal, quote, reference, self.quote_policy, gas_price, now)
+        if not accepted:
+            raise ValueError(f"quote invalid immediately before signing: {reason}")
         signer = self._signer(row)
+        check_early_execution_source(self.store, early_intent, signal, proposal, now)
+        if "early_trial_id" in proposal["attribution"]:
+            self.store.check_early_trial_proposal(proposal_id)
         raw = signer.sign_transaction(row["transaction"])
         if Account.recover_transaction(raw).lower() != row["follower_wallet"]:
             raise ValueError("offline signature sender mismatch")
@@ -343,7 +404,8 @@ class ReadOnlyPreBroadcastReviewer:
         self.relationship_gate = relationship_gate
 
     async def review(self, signal, proposal_id: str, raw_transaction: bytes,
-                     now: float | None = None) -> ReadOnlyBroadcastReview:
+                     now: float | None = None, *, early_intent=None) -> ReadOnlyBroadcastReview:
+        fixed_now = now
         if (not isinstance(raw_transaction, bytes) or not raw_transaction
                 or len(raw_transaction) > 1024 * 1024):
             raise ValueError("invalid signed transaction bytes")
@@ -354,6 +416,7 @@ class ReadOnlyPreBroadcastReviewer:
                 or proposal["source_event_id"] != signal.event_id
                 or signal.canonical_status == "orphaned"):
             raise ValueError("signed execution is unavailable or stale")
+        check_early_execution_source(self.store, early_intent, signal, proposal, now)
         self._authorize(row)
         tx_hash = "0x" + keccak(raw_transaction).hex()
         if tx_hash != row["signed_tx_hash"]:
@@ -400,11 +463,23 @@ class ReadOnlyPreBroadcastReviewer:
             preflight.update(await simulate_aggregator_execution(self.rpc, original))
         evidence = {
             "read_only": True, "broadcast_performed": False,
+            "quote_max_age_seconds": self.quote_policy.max_age_seconds,
             "relationship_revalidated": True, "transaction_hash_verified": True,
             "sender_recovered": row["follower_wallet"], "budget": budget,
             "quote": quote.to_dict(), "reference_quote": reference.to_dict(),
             "risk": risk, "preflight": preflight,
         }
+        now = time.time() if fixed_now is None else fixed_now
+        accepted, reason, risk = assess_quote(
+            signal, quote, reference, self.quote_policy, gas_price, now)
+        if not accepted:
+            raise ValueError(f"quote invalid after broadcast preflight: {reason}")
+        evidence["risk"] = risk
+        check_early_execution_source(self.store, early_intent, signal, proposal, now)
+        if "early_trial_id" in proposal["attribution"]:
+            trial = self.store.check_early_trial_proposal(proposal_id)
+            evidence["early_trial_id"] = trial["trial_id"]
+            evidence["early_trial_expires_at"] = trial["expires_at"]
         return ReadOnlyBroadcastReview(proposal_id, tx_hash, now, evidence)
 
     def _authorize(self, row: dict) -> None:

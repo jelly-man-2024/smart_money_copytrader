@@ -18,6 +18,9 @@ LEDGER_TABLES = (
     "paper_fills", "paper_positions", "paper_position_reservations",
     "paper_realized_pnl", "paper_position_marks", "paper_decisions",
     "execution_nonce_reservations", "execution_plans", "execution_attempts",
+    "copy_operation_claims",
+    "early_trials", "early_trial_operations",
+    "early_feed_jobs",
 )
 
 _IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -88,6 +91,23 @@ def migrate_sqlite_ledger(path: str | Path, expected_sha256: str,
                 source_info = source.execute(
                     f"PRAGMA table_info({_identifier(table)})").fetchall()
                 if not source_info:
+                    if table == "early_feed_jobs":
+                        continue  # Optional evidence-only table in legacy ledgers.
+                    if table in {"copy_operation_claims", "early_trials", "early_trial_operations"}:
+                        # Only pre-migration, unenrolled ledgers may omit it.
+                        field = ("copy_operation_order_id" if table == "copy_operation_claims"
+                                 else "early_trial_id")
+                        enrolled = any(field in json.loads(row[0])
+                                       for row in source.execute(
+                                           "SELECT attribution_payload FROM paper_proposals"))
+                        if table in {"early_trials", "early_trial_operations"}:
+                            other = ("early_trial_operations" if table == "early_trials"
+                                     else "early_trials")
+                            if source.execute(f"PRAGMA table_info({_identifier(other)})").fetchall():
+                                enrolled = enrolled or bool(source.execute(
+                                    f"SELECT 1 FROM {_identifier(other)} LIMIT 1").fetchone())
+                        if not enrolled:
+                            continue
                     raise ValueError(f"SQLite ledger table missing: {table}")
                 columns = tuple(row[1] for row in source_info)
                 primary_key = tuple(row[1] for row in sorted(

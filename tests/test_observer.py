@@ -2838,6 +2838,35 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(result.tx_hash, tx_hash)
         send.assert_awaited_once_with(broadcaster._request, '0x' + raw.hex())
 
+        # Time spent in the final database gate must count against the original
+        # full/reference quote timestamps; it cannot renew either quote's TTL.
+        timed_review = SimpleNamespace(
+            proposal_id=review.proposal_id, signed_tx_hash=tx_hash,
+            evidence={'broadcast_performed': False, 'quote_max_age_seconds': 2.0,
+                      'quote': {'observed_at': 100.0},
+                      'reference_quote': {'observed_at': 99.0}})
+        with patch('smart_money.broadcast.require_mainnet_broadcast_enabled'), patch(
+                'smart_money.broadcast.time.time', return_value=102.0), patch(
+                'smart_money.broadcast.asyncio.to_thread', new=AsyncMock()) as send:
+            with self.assertRaisesRegex(ValueError, 'expired before broadcast'):
+                asyncio.run(broadcaster.broadcast(
+                    timed_review, raw, follower_wallet=follower, relationship_id='42',
+                    config_snapshot_hash='ab' * 32))
+            send.assert_not_called()
+
+        expired_trial_review = SimpleNamespace(
+            proposal_id=review.proposal_id, signed_tx_hash=tx_hash,
+            evidence={'broadcast_performed': False, 'early_trial_id': 'trial',
+                      'early_trial_expires_at': 101.0})
+        with patch('smart_money.broadcast.require_mainnet_broadcast_enabled'), patch(
+                'smart_money.broadcast.time.time', return_value=101.0), patch(
+                'smart_money.broadcast.asyncio.to_thread', new=AsyncMock()) as send:
+            with self.assertRaisesRegex(ValueError, 'trial expired before broadcast'):
+                asyncio.run(broadcaster.broadcast(
+                    expired_trial_review, raw, follower_wallet=follower, relationship_id='42',
+                    config_snapshot_hash='ab' * 32))
+            send.assert_not_called()
+
         with patch.dict(os.environ, live, clear=True), patch(
                 'smart_money.mysql_config.load_enabled_mainnet_acceptance',
                 return_value=accepted_mainnet_relationship(policy)), patch(
@@ -3151,6 +3180,18 @@ class SafetyTests(unittest.TestCase):
             signal = Signal(TXHASH, A, 'direct', 'BUY', 'call', R.V2_ROUTER,
                             '0x12345678', stage='swap_evidenced')
             self.assertTrue(store.put(signal))
+            store.start_paper_budget_cycle('migration-cycle', 'test')
+            store.configure_paper_budget(A, 'USDG', '1000')
+            trial = store.start_early_trial('migration-trial', B, [1])
+            self.assertTrue(store.reserve_paper_proposal({
+                'proposal_id': 'migration-proposal', 'source_event_id': signal.event_id,
+                'source_tx_hash': TXHASH, 'wallet': A, 'trigger_mode': 'evidenced',
+                'strategy_version': 'test', 'input_asset': R.USDG, 'output_asset': TOKEN,
+                'budget_bucket': 'USDG', 'amount_in_raw': '100',
+                'attribution': {'smart_wallet': A, 'follower_wallet': B,
+                                'relationship_id': '1', 'copy_operation_order_id': TXHASH,
+                                'source_behavior': 'BUY', 'early_trial_id': 'migration-trial'},
+            })[0])
             store.close()
             source = sqlite3.connect(path)
             tables = [row[0] for row in source.execute(
@@ -3167,16 +3208,25 @@ class SafetyTests(unittest.TestCase):
             factory = lambda write=False: target
             digest = sqlite_sha256(path)
             first = migrate_sqlite_ledger(path, digest, factory)
-            self.assertEqual(first['source_rows'], 1)
-            self.assertEqual(first['inserted_rows'], 1)
+            self.assertEqual(first['source_rows'], 7)
+            self.assertEqual(first['inserted_rows'], 7)
+            self.assertEqual(first['tables']['copy_operation_claims']['inserted_rows'], 1)
+            self.assertEqual(target.rows['early_trials'][('migration-trial',)]['expires_at'],
+                             trial['expires_at'])
             self.assertFalse(first['private_key_data_migrated'])
             second = migrate_sqlite_ledger(path, digest, factory)
             self.assertEqual(second['inserted_rows'], 0)
-            self.assertEqual(second['existing_identical_rows'], 1)
+            self.assertEqual(second['existing_identical_rows'], 7)
+            claim = next(iter(target.rows['copy_operation_claims'].values()))
+            self.assertEqual(claim['status'], 'held')
+            claim['status'] = 'released'
+            with self.assertRaisesRegex(ValueError, 'target row conflicts'):
+                migrate_sqlite_ledger(path, digest, factory)
+            claim['status'] = 'held'
             target.rows['signals'][(signal.event_id,)]['payload'] = '{}'
             with self.assertRaisesRegex(ValueError, 'target row conflicts'):
                 migrate_sqlite_ledger(path, digest, factory)
-            self.assertEqual(target.rollbacks, 1)
+            self.assertEqual(target.rollbacks, 2)
 
             wal = Path(str(path) + '-wal')
             wal.write_bytes(b'active-writer')
@@ -4560,9 +4610,9 @@ class AggregatorExecutionTests(unittest.TestCase):
         self.assertIn('no verified quotable direct V3 pool', payload['quote_error'])
         decision, payload, _ = scenario(('local', 'kyber'), False)
         self.assertEqual((decision.accepted, decision.reason), (False, 'quote_unavailable'))
-        with self.assertRaisesRegex(ValueError, 'execution providers'):
-            PaperEngine(Store(':memory:'), Quoter(True), QuotePolicy(), 'agg-v1',
-                        'evidenced', execution_providers=('kyber',))
+        decision, payload, _ = scenario(('kyber',), True)
+        self.assertTrue(decision.accepted, decision.reason)
+        self.assertEqual(payload['execution_provider'], 'kyber')
 
     def test_aggregator_plan_requires_router_recipient_and_minimum_floor(self):
         from smart_money.execution_prep import build_aggregator_execution_plan
@@ -4673,7 +4723,9 @@ class AggregatorExecutionTests(unittest.TestCase):
         enabled = load(['local', 'kyber'])
         self.assertEqual(enabled.relationships[0].execution_providers, ('local', 'kyber'))
         self.assertNotEqual(default.snapshot_hash, enabled.snapshot_hash)
-        for invalid in (['kyber'], ['local', 'okx'], ['local', 'local'], []):
+        self.assertEqual(load(['kyber']).relationships[0].execution_providers, ('kyber',))
+        self.assertNotEqual(load(['kyber']).snapshot_hash, enabled.snapshot_hash)
+        for invalid in (['local', 'okx'], ['local', 'local'], []):
             with self.assertRaisesRegex(ValueError, 'execution providers'):
                 load(invalid)
 

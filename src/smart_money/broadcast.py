@@ -5,6 +5,8 @@ import asyncio
 from dataclasses import dataclass
 import json
 import os
+import math
+import time
 import urllib.parse
 import urllib.request
 
@@ -65,7 +67,8 @@ class MainnetBroadcaster:
         return document["result"].lower()
 
     async def broadcast(self, review, raw_transaction: bytes, *, follower_wallet: str,
-                        relationship_id: str, config_snapshot_hash: str) -> BroadcastResult:
+                        relationship_id: str, config_snapshot_hash: str,
+                        early_trial_check=None) -> BroadcastResult:
         if (not isinstance(raw_transaction, bytes) or not raw_transaction
                 or len(raw_transaction) > 1024 * 1024):
             raise ValueError("invalid signed transaction bytes")
@@ -83,6 +86,29 @@ class MainnetBroadcaster:
             raise ValueError("signed transaction sender or chain mismatch")
         require_mainnet_broadcast_enabled(
             follower_wallet, relationship_id, config_snapshot_hash)
+        if "early_trial_id" in review.evidence:
+            expires = review.evidence.get("early_trial_expires_at")
+            if (isinstance(expires, bool) or not isinstance(expires, (int, float))
+                    or not math.isfinite(expires) or time.time() >= expires):
+                raise ValueError("early trial expired before broadcast")
+            if not callable(early_trial_check) or early_trial_check() is not True:
+                raise ValueError("early trial send fence not verified")
+            if time.time() >= expires:
+                raise ValueError("early trial expired during final check")
+        # A database gate can take time after review. Never reset the market
+        # clock to the review time; approval reviews have no market quote.
+        if "quote_max_age_seconds" in review.evidence:
+            max_age = review.evidence["quote_max_age_seconds"]
+            now = time.time()
+            if (isinstance(max_age, bool) or not isinstance(max_age, (int, float))
+                    or not math.isfinite(max_age) or not 0 < max_age <= 60):
+                raise ValueError("invalid broadcast quote age limit")
+            for name in ("quote", "reference_quote"):
+                quote = review.evidence.get(name)
+                observed = quote.get("observed_at") if isinstance(quote, dict) else None
+                if (isinstance(observed, bool) or not isinstance(observed, (int, float))
+                        or not math.isfinite(observed) or not 0 <= now - observed <= max_age):
+                    raise ValueError("market quote expired before broadcast")
         returned_hash = await asyncio.to_thread(
             self._request, "0x" + raw_transaction.hex())
         if returned_hash != local_hash:

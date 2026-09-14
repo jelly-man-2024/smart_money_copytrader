@@ -14,6 +14,9 @@ MAINNET_LIVE_MODE = "mainnet_live"
 
 
 def _stop_controls() -> None:
+    from .runtime_safety import execution_fault_latched
+    if execution_fault_latched():
+        raise PermissionError("execution stopped after a critical runtime failure")
     stop_file = Path(os.environ.get(
         "SMART_MONEY_EMERGENCY_STOP_FILE", "var/EXECUTION_STOP"))
     if stop_file.exists():

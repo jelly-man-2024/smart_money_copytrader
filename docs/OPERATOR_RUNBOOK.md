@@ -52,9 +52,9 @@ WHERE id = ?
 `docker/mysql/init/007_execution_providers.sql` 为 `copy_relationships` 增加 JSON 列
 `execution_providers`，默认 `["local"]`，已初始化的库同样只执行该迁移一次。含义：
 
-- `local`：只执行能在本地逐字段验证的 V2/V3/V4 路径（回执提取、预配置 `allowed_routes`、
-  V3 工厂直连池发现），与此前行为完全一致。必须是列表第一项。
-- `kyber`：本地路径不可用时，向 KyberSwap 官方聚合器 API（`aggregator-api.kyberswap.com`，
+- `local`：执行能在本地逐字段验证的 V2/V3/V4 路径（回执提取、预配置 `allowed_routes`、
+  V3 工厂直连池发现）。`["local","kyber"]` 保留本地优先的旧行为。
+- `kyber`：按配置顺序使用；`["kyber"]` 跳过本地寻路，直接向 KyberSwap 官方聚合器 API（`aggregator-api.kyberswap.com`，
   链名 `robinhood`，无需密钥）为 follower 自己的输入量询价并构建交易。只接受 Router 为
   `0x6131b5fae19ea4f9d964eac0408e4408b66337b5`、顶层 `swap` 描述里 dstReceiver 等于 follower、
   金额等于计划输入、无手续费、value 为 0 的 calldata；链上 minReturn 必须不低于按

@@ -8,6 +8,9 @@ import time
 
 from . import registry as R
 from .models import Signal, Transaction, address
+from .copy_operation import CopyOperationStore
+from .early_feed_lane import EarlyFeedJobStore
+from .source_position import SourcePositionStore
 
 STAGE_RANK = {"intent": 0, "execution_observed": 1, "needs_review": 1,
               "swap_evidenced": 2, "relay_sell_evidenced": 2,
@@ -55,7 +58,7 @@ def _paper_budget_bucket(asset: str) -> str | None:
     return None
 
 
-class Store:
+class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
     def __init__(self, path: str | Path):
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -113,6 +116,27 @@ class Store:
             rejection_reason TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(source_event_id,trigger_mode,strategy_version))""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS copy_operation_claims (
+            operation_key TEXT PRIMARY KEY, proposal_id TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK(status IN ('held','broadcast_attempted','released')),
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS early_trials (
+            trial_id TEXT PRIMARY KEY, follower_wallet TEXT NOT NULL UNIQUE,
+            relationships_payload TEXT NOT NULL, started_at REAL NOT NULL,
+            expires_at REAL NOT NULL, consumed_slots INTEGER NOT NULL DEFAULT 0
+                CHECK(consumed_slots>=0 AND consumed_slots<=100),
+            status TEXT NOT NULL CHECK(status IN ('active','stopped')))""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS early_trial_operations (
+            operation_key TEXT PRIMARY KEY, trial_id TEXT NOT NULL,
+            proposal_id TEXT NOT NULL UNIQUE, attempted_at REAL NOT NULL,
+            FOREIGN KEY(trial_id) REFERENCES early_trials(trial_id))""")
+        self.connection.execute("""CREATE TABLE IF NOT EXISTS early_feed_jobs (
+            tx_hash TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN
+                ('queued','done','expired','failed','interrupted')),
+            received_at REAL NOT NULL, updated_at REAL NOT NULL, result_payload TEXT)""")
+        self.connection.execute("""CREATE INDEX IF NOT EXISTS early_feed_jobs_status
+            ON early_feed_jobs(status)""")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS paper_reservations (
             proposal_id TEXT PRIMARY KEY, cycle_id TEXT NOT NULL, wallet TEXT NOT NULL,
             bucket TEXT NOT NULL, amount_raw TEXT NOT NULL,
@@ -825,6 +849,9 @@ class Store:
             return False, "input_asset_budget_bucket_mismatch"
         try:
             self.connection.execute("BEGIN IMMEDIATE")
+            if not self._claim_copy_operation(proposal):
+                self.connection.rollback()
+                return False, "copy_operation_already_claimed"
             active = self.connection.execute(
                 "SELECT cycle_id FROM paper_budget_cycles WHERE status='active'").fetchone()
             if active is None:
@@ -941,13 +968,20 @@ class Store:
                 "follower_wallet": attribution.get("follower_wallet"),
                 "relationship_id": attribution.get("relationship_id"),
             }
-        positions = self.connection.execute("""SELECT r.token_amount_raw,p.wallet,p.status
+        positions = self.connection.execute("""SELECT r.token_amount_raw,p.wallet,p.status,p.attribution_payload
             FROM paper_position_reservations r JOIN paper_positions p ON p.lot_id=r.lot_id
             WHERE r.proposal_id=? AND r.status='active'""", (proposal_id,)).fetchall()
         if (not positions or any(row[1] != proposal[0] or row[2] != "open"
                                  for row in positions)
                 or sum(int(row[0]) for row in positions) != int(proposal[1])):
             raise ValueError("execution position reservation is stale or inconsistent")
+        for position in positions:
+            attr = json.loads(position[3])
+            if attr.get("source_position_status", "confirmed") != "confirmed":
+                raise ValueError("source_position_basis_unconfirmed")
+            source = self.signal(attr.get("source_position_evidence_event_id", attr.get("source_event_id", "")))
+            if source is not None and source.canonical_status == "orphaned":
+                raise ValueError("source_position_basis_orphaned")
         return {
             "kind": "sell_position", "ledger_scope": proposal[0],
             "amount_raw": proposal[1], "lots": len(positions),
@@ -977,11 +1011,12 @@ class Store:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
             proposal = self.connection.execute(
-                "SELECT status FROM paper_proposals WHERE proposal_id=?",
+                "SELECT status,attribution_payload FROM paper_proposals WHERE proposal_id=?",
                 (proposal_id,)).fetchone()
             if proposal is None or proposal[0] != "reserved":
                 self.connection.rollback()
                 return False
+            self._release_unprepared_copy_operation(proposal_id, json.loads(proposal[1]))
             row = self.connection.execute("""SELECT r.cycle_id,r.wallet,r.bucket,r.amount_raw,
                     p.status FROM paper_reservations r JOIN paper_proposals p
                     ON p.proposal_id=r.proposal_id WHERE r.proposal_id=?""",
@@ -1051,6 +1086,13 @@ class Store:
             attribution = json.loads(row[7])
             position_attribution = dict(attribution)
             source_output = position_attribution.get("source_amount_out_raw")
+            if (position_attribution.get("source_stage") == "intent"
+                    or position_attribution.get("source_position_status") == "pending"):
+                position_attribution["source_position_status"] = "pending"
+                position_attribution["source_tx_hash"] = row[1]
+                source_output = None
+                position_attribution.pop("source_position_initial_raw", None)
+                position_attribution.pop("source_position_remaining_raw", None)
             if (isinstance(source_output, str) and source_output.isdecimal()
                     and int(source_output) > 0):
                 position_attribution["source_position_initial_raw"] = source_output
@@ -1089,6 +1131,16 @@ class Store:
                 updated_at=CURRENT_TIMESTAMP WHERE proposal_id=?""", (proposal_id,))
             self.connection.execute("""UPDATE paper_proposals SET status='filled',
                 updated_at=CURRENT_TIMESTAMP WHERE proposal_id=?""", (proposal_id,))
+            if position_attribution.get("source_position_status") == "pending":
+                for (payload,) in self.connection.execute(
+                        "SELECT payload FROM signals WHERE tx_hash=?", (row[1],)).fetchall():
+                    document = json.loads(payload)
+                    document.pop("event_id", None)
+                    source = Signal(**document)
+                    if source.canonical_status == "orphaned":
+                        self._invalidate_early_source_tx(row[1])
+                    else:
+                        self._reconcile_early_source_positions(row[2], source)
             self.connection.commit()
             return True
         except Exception:
@@ -1231,6 +1283,9 @@ class Store:
             return False, "sell_output_budget_bucket_mismatch"
         try:
             self.connection.execute("BEGIN IMMEDIATE")
+            if not self._claim_copy_operation(proposal):
+                self.connection.rollback()
+                return False, "copy_operation_already_claimed"
             existing = self.connection.execute(
                 "SELECT status FROM paper_proposals WHERE proposal_id=?",
                 (proposal["proposal_id"],)).fetchone()
@@ -1334,6 +1389,8 @@ class Store:
         source_left = target_source
         for token_initial, token_remaining, raw_attribution in rows:
             attribution = json.loads(raw_attribution)
+            if attribution.get("source_position_status", "confirmed") != "confirmed":
+                return None, "source_position_basis_unconfirmed"
             source_remaining = attribution.get("source_position_remaining_raw")
             if source_remaining is None:
                 source_initial = attribution.get("source_amount_out_raw")
@@ -1530,7 +1587,8 @@ class Store:
                         source_remaining = source.evidence.get(
                             "actual_output_credit_raw", source.amount_out_raw)
                 if (isinstance(source_remaining, str) and source_remaining.isdecimal()
-                        and int(source_remaining) > 0):
+                        and int(source_remaining) > 0
+                        and position_attribution.get("source_position_status", "confirmed") == "confirmed"):
                     source_value = int(source_remaining)
                     source_sold = (source_value if sold == token_remaining else
                                    source_value * sold // token_remaining)
@@ -1783,6 +1841,7 @@ class Store:
                 continue
             document["canonical_status"] = "orphaned"
             document["evidence"]["canonicality"] = "orphaned_by_reorg"
+            self._invalidate_early_source_tx(document["tx_hash"])
             self.connection.execute(
                 "UPDATE signals SET payload=?,updated_at=CURRENT_TIMESTAMP WHERE event_id=?",
                 (json.dumps(document, ensure_ascii=False, sort_keys=True), event_id),
@@ -1806,6 +1865,16 @@ class Store:
         return orphaned_signals, len(tx_rows)
 
     def put(self, signal: Signal) -> bool:
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            inserted = self._put_and_reconcile(signal)
+            self.connection.commit()
+            return inserted
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def _put_and_reconcile(self, signal: Signal) -> bool:
         payload = json.dumps(signal.to_dict(), ensure_ascii=False, sort_keys=True)
         rank = STAGE_RANK[signal.stage]
         old = self.connection.execute("SELECT stage_rank, payload FROM signals WHERE event_id=?", (signal.event_id,)).fetchone()
@@ -1820,7 +1889,10 @@ class Store:
             self.connection.execute("""INSERT OR IGNORE INTO solver_order_evidence(
                 evidence_id,order_id,kind,wallet,tx_hash,payload) VALUES(?,?,'source_deposit',?,?,?)""",
                 (signal.event_id, order_id, signal.wallet, signal.tx_hash, payload))
-        self.connection.commit()
+        if signal.canonical_status == "orphaned":
+            self._invalidate_early_source_tx(signal.tx_hash)
+        else:
+            self._reconcile_early_source_signal(signal)
         return True
 
     def record_solver_delivery(self, order_id: str, wallet: str, tx_hash: str,

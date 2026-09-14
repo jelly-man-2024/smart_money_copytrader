@@ -1,0 +1,261 @@
+{
+  "provenance": {
+    "sample": "A",
+    "retrieved_on": "2026-09-14",
+    "calldata_source": "data/relay_0a2b8f36_sample_a_2026-09-14.json",
+    "reproduce": ".venv/bin/python scripts/inspect_relay_permit2.py data/relay_0a2b8f36_sample_a_2026-09-14.json",
+    "relay_source_commit": "f937c6c0747a4685cc23a57f80840c4ec9ffcccc",
+    "abi_sources": [
+      "https://github.com/relayprotocol/relay-periphery/blob/f937c6c0747a4685cc23a57f80840c4ec9ffcccc/src/RelayApprovalProxy.sol",
+      "https://github.com/relayprotocol/relay-periphery/blob/f937c6c0747a4685cc23a57f80840c4ec9ffcccc/src/RelayRouter.sol",
+      "https://docs.relay.link/references/api/api_resources/contract-addresses"
+    ],
+    "limitations": [
+      "Official source snapshot is version 3.1; deployed v3 runtime bytecode was not matched against compiled source. Outer selector is recomputed and ABI prefix re-encodes exactly.",
+      "Nested 0x998b5942 layout re-encodes exactly, but function name, field semantics and fallback behavior are not source-verified.",
+      "No Permit2 signature verification was performed. Merely seeing a signature does not prove authorization.",
+      "Public historical input is inspected here; these same input bytes are available after Feed transaction decoding. Feed implementation was not changed."
+    ]
+  },
+  "feed_visible_decode": {
+    "tx_hash": "0xe470ccaf30f689ced78ee534059cc206d05baf86779d4038fdccf879f6e7c714",
+    "function": "permit2TransferAndMulticall(address,((address,uint256)[],uint256,uint256),(address,bool,uint256,bytes)[],address,address,bytes,bytes)",
+    "calldata_bytes": 12644,
+    "outer_roundtrip": true,
+    "funding_user": "0xf70da97812cb96acdf810712aa562db8dfa3dbef",
+    "permit": {
+      "permitted": [
+        {
+          "token": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+          "amount_raw": "347809641"
+        }
+      ],
+      "nonce": "41215628753794",
+      "deadline": "1789364955"
+    },
+    "refund_to": "0x1cfbe3af88266ccca29372661f45261c7d19be09",
+    "nft_recipient": "0x1cfbe3af88266ccca29372661f45261c7d19be09",
+    "metadata_hex": "0x4857a3de62af06656675ade5174a98113783417c2ede7f7d3688ef453163987100",
+    "permit_signature_bytes": 65,
+    "trailing_bytes_hex": "0x9b99837a83e896fe12c5a14916c0e7e0b51152f8d65abae8a980fd280e6bcf5c",
+    "trailer_note": "Not an ABI argument; sample A matches previously observed Relay orderId.",
+    "classification": "inspection_only_not_a_confirmed_trade",
+    "calls": [
+      {
+        "index": 0,
+        "target": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "allow_failure": false,
+        "native_value_raw": "0",
+        "selector": "0x095ea7b3",
+        "calldata_bytes": 68,
+        "function": "approve",
+        "spender": "0x039ec98a76f111092d4751365ff09dd2aec301e8",
+        "amount_raw": "347809641",
+        "note": "ERC20-shaped calldata, not proof of execution or token identity"
+      },
+      {
+        "index": 1,
+        "target": "0x039ec98a76f111092d4751365ff09dd2aec301e8",
+        "allow_failure": false,
+        "native_value_raw": "0",
+        "selector": "0x998b5942",
+        "calldata_bytes": 10788,
+        "abi_status": "inferred_layout_roundtrip_only_not_verified_semantics",
+        "header_words": [
+          "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+          "347809641",
+          "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+          "4296079466195047419727677",
+          "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
+          "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
+        ],
+        "boolean_parameter": true,
+        "extra_bytes_hex": "0x307831373839333631333534666538383633643766376564653263373134333837333131383961343731356564613537363635363630666132366564336137353834",
+        "extra_utf8": "0x1789361354fe8863d7f7ede2c71438731189a4715eda57665660fa26ed3a7584",
+        "routes": [
+          {
+            "index": 0,
+            "header_fields": [
+              "0x6131b5fae19ea4f9d964eac0408e4408b66337b5",
+              "0x6131b5fae19ea4f9d964eac0408e4408b66337b5",
+              "0",
+              "1500000"
+            ],
+            "selector": "0xe21fd0e9",
+            "calldata_bytes": 7108,
+            "execution_status": "unknown_from_calldata",
+            "kyber_description": {
+              "token_in": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+              "token_out": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+              "amount_in_raw": "347809641",
+              "min_return_raw": "4296779563803584172654591",
+              "recipient": "0x039ec98a76f111092d4751365ff09dd2aec301e8",
+              "flags": "512",
+              "client_data_utf8_untrusted": "{\"Source\":\"relay-fomo\",\"AmountInUSD\":\"349.408815\",\"AmountOutUSD\":\"0\",\"AmountOut\":\"7812326479642880313917439\",\"RouteID\":\"a78050a1-FFJy6Ib:f0492f79gqtKqp78\",\"Timestamp\":1789361355}"
+            }
+          },
+          {
+            "index": 1,
+            "header_fields": [
+              "0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef",
+              "0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef",
+              "0",
+              "1500000"
+            ],
+            "selector": "0xbb66eb41",
+            "calldata_bytes": 964,
+            "execution_status": "unknown_from_calldata"
+          },
+          {
+            "index": 2,
+            "header_fields": [
+              "0x0000000000001ff3684f28c67538d4d072c22734",
+              "0x0000000000001ff3684f28c67538d4d072c22734",
+              "0",
+              "1500000"
+            ],
+            "selector": "0x2213bc0b",
+            "calldata_bytes": 1508,
+            "execution_status": "unknown_from_calldata"
+          }
+        ]
+      },
+      {
+        "index": 2,
+        "target": "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
+        "allow_failure": false,
+        "native_value_raw": "0",
+        "selector": "0x9bb43718",
+        "calldata_bytes": 420,
+        "function": "cleanupErc20s",
+        "deliveries": [
+          {
+            "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+            "recipient": "0x1cfbe3af88266ccca29372661f45261c7d19be09",
+            "amount_parameter_raw": "0",
+            "amount_mode": "full_router_balance"
+          }
+        ],
+        "metadata_hex": "0x4857a3de62af06656675ade5174a98113783417c2ede7f7d3688ef453163987100"
+      }
+    ]
+  },
+  "receipt_only_confirmation": {
+    "source": "Read-only eth_getTransactionReceipt and historical eth_call(decimals/symbol) at block 62536632; NOT obtained from calldata",
+    "receipt_status": "0x1",
+    "block_hash": "0xdf5c1b151943cd1c34848890aeab09d3cbe1f83c535aa3fe210dc4c6191be43d",
+    "transfers": [
+      {
+        "token": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "from": "0xf70da97812cb96acdf810712aa562db8dfa3dbef",
+        "to": "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
+        "amount_raw": "347809641",
+        "log_index": 81
+      },
+      {
+        "token": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "from": "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
+        "to": "0x039ec98a76f111092d4751365ff09dd2aec301e8",
+        "amount_raw": "347809641",
+        "log_index": 84
+      },
+      {
+        "token": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "from": "0x039ec98a76f111092d4751365ff09dd2aec301e8",
+        "to": "0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef",
+        "amount_raw": "347809641",
+        "log_index": 89
+      },
+      {
+        "token": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "from": "0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef",
+        "to": "0x04ec161ef7ed7bbe0a9f7ce7ca8abe21bb7034d3",
+        "amount_raw": "173904",
+        "log_index": 90
+      },
+      {
+        "token": "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+        "from": "0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef",
+        "to": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "amount_raw": "347635737",
+        "log_index": 92
+      },
+      {
+        "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+        "from": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "to": "0x6f02324d20cc679d0e585290caa6b16bacbc0f77",
+        "amount_raw": "110242427124258938882526",
+        "log_index": 95
+      },
+      {
+        "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+        "from": "0x6f02324d20cc679d0e585290caa6b16bacbc0f77",
+        "to": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "amount_raw": "104730305768045991938400",
+        "log_index": 98
+      },
+      {
+        "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+        "from": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "to": "0x4e3468951d49f2eea976ed0d6e75ffcb44a9a544",
+        "amount_raw": "110242427124258938882526",
+        "log_index": 101
+      },
+      {
+        "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+        "from": "0x4e3468951d49f2eea976ed0d6e75ffcb44a9a544",
+        "to": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "amount_raw": "110242427124258938882526",
+        "log_index": 102
+      },
+      {
+        "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+        "from": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "to": "0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef",
+        "amount_raw": "7764216653179950981297921",
+        "log_index": 105
+      },
+      {
+        "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+        "from": "0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef",
+        "to": "0x039ec98a76f111092d4751365ff09dd2aec301e8",
+        "amount_raw": "7764216653179950981297921",
+        "log_index": 106
+      },
+      {
+        "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+        "from": "0x039ec98a76f111092d4751365ff09dd2aec301e8",
+        "to": "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
+        "amount_raw": "7764216653179950981297921",
+        "log_index": 108
+      },
+      {
+        "token": "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18",
+        "from": "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
+        "to": "0x1cfbe3af88266ccca29372661f45261c7d19be09",
+        "amount_raw": "7764216653179950981297921",
+        "log_index": 111
+      }
+    ],
+    "token_metadata": {
+      "0x5fc5360d0400a0fd4f2af552add042d716f1d168": {
+        "decimals": 6,
+        "symbol": "USDG"
+      },
+      "0xf4e134ea270cfe04cfe9a197c6f42fd4a6fa1e18": {
+        "decimals": 18,
+        "symbol": "APOPHENOTH"
+      }
+    }
+  },
+  "interpretation_zh": {
+    "summary": "样本A可在Feed阶段提取指向聪明钱收款人的换币/交付候选，不能只依据selector直接认定已确认聪明钱买入。",
+    "funding": "本链Permit2付款人为Relay solver，347.809641 USDG不是聪明钱EVM钱包的扣款，也不是源链350 USDC原始付款。",
+    "delivery": "cleanupErc20s明确指定目标Token和聪明钱地址；amount=0表示Router的全部余额，不是零到账，也没有提前给出确切成交数量。",
+    "identifiers": "末尾32字节与先前Relay orderId相同；嵌套extra UTF-8与requestId相同；顶层metadata是第三个不同的33字节值，不可混用。",
+    "metadata": "Kyber clientData Source=relay-fomo、AmountInUSD=349.408815、AmountOut=7812326479642880313917439 是不可信调用方元数据，不是成交凭据。",
+    "actual": "历史receipt中最终到账7764216653179950981297921 raw，即7764216.653179950981297921 APOPHENOTH；只可在receipt阶段使用。",
+    "routes": "calldata含Kyber、0xbb66eb41、0x AllowanceHolder三段路径；回执显示资金经过第二段目标，不能把所有嵌套swap都视为成交。",
+    "next": "可前移候选识别、按Token预取报价、按orderId/requestId并行查订单。正式提升为可跟单BUY需补齐未知wrapper语义、授权/归属及失败路径规则；此次不接入运行中的交易链路。"
+  }
+}

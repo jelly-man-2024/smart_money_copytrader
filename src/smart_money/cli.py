@@ -54,15 +54,24 @@ from .rpc import ReadOnlyRpc, RpcError
 from .relay_api import RelayApiError, RelayNotReady, RelayPublicClient
 from .solver import relay_confirmed_sell, relay_passive_buy
 from .store import Store
+from .early_feed_lane import EarlyFeedLane, EarlyEvidenceResolver
+from .early_runtime import EarlyRuntime
+from .execution_pipeline import check_early_execution_source
+from .runtime_safety import runtime_instance_lock, trip_execution_stop
 
 
 def report(event: str, **details):
-    print(json.dumps({"event": event, **details}, ensure_ascii=False), file=sys.stderr, flush=True)
+    print(json.dumps({"event": event, "observed_at": time.time(), **details}, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
 def emit(store, signal):
     if store.put(signal):
         print(json.dumps(signal.to_dict(), ensure_ascii=False), flush=True)
+        if signal.stage in {"swap_evidenced", "relay_buy_evidenced", "relay_sell_evidenced", "failed"}:
+            report("source_evidence_available", source_event_id=signal.event_id,
+                   source_tx_hash=signal.tx_hash, smart_wallet=signal.wallet,
+                   stage=signal.stage, order_id=signal.evidence.get("relay_order_id",
+                       signal.evidence.get("relay_deposit_order_id")))
 
 
 def runtime_paper_config(args):
@@ -340,6 +349,50 @@ async def monitor(args):
     stats = Counter()
     store = runtime_store(args)
     paper_engines = {}
+    # Trial scope remains enrolled in dedup even when a later restart omits the
+    # early flag, or the window is stopped/expired. Missing pre-upgrade schema is
+    # the only tolerated database error here.
+    try:
+        trial_scopes = store.connection.execute(
+            "SELECT follower_wallet,relationships_payload FROM early_trials").fetchall()
+    except Exception as exc:
+        if getattr(exc, "args", (None,))[0] != 1146:
+            raise
+        trial_scopes = []
+    operation_scopes = {(follower, relation) for follower, payload in trial_scopes
+                        for relation in json.loads(payload)}
+    early_lane = None
+    early_trial_id = getattr(args, "early_trial_id", None)
+    early_policies = ()
+    if early_trial_id:
+        trial = store.early_trial_status(early_trial_id)
+        if trial is None or paper_config is None:
+            raise ValueError("operator-started early trial and MySQL policies required")
+        early_policies = tuple(p for p in paper_config.relationships
+                               if p.relationship_id in trial["relationships"])
+        if (len(early_policies) != len(trial["relationships"])
+                or any(p.follower_wallet != trial["follower_wallet"]
+                       or p.run_mode != "mainnet_live" or p.execution_providers != ("kyber",)
+                       or p.trigger_mode != "evidenced" for p in early_policies)):
+            raise ValueError("early trial scope must match enabled Kyber-only live relationships")
+        for table in ("copy_operation_claims", "early_trial_operations", "early_feed_jobs"):
+            store.connection.execute(f"SELECT * FROM {table} LIMIT 0")
+        audit = store.execution_audit()
+        if (not audit["healthy"] or audit["prepared"]
+                or any(audit["attempt_statuses"].get(k, 0) for k in ("signed", "observed_pending", "orphaned"))):
+            raise ValueError("early startup requires operator review of unresolved executions")
+        for (payload,) in store.connection.execute(
+                "SELECT attribution_payload FROM paper_proposals WHERE status='reserved'").fetchall():
+            if "early_trial_id" in json.loads(payload):
+                raise ValueError("early restart has reserved work; operator reconciliation required")
+    if getattr(args, "early_feed_evidence", False) or early_trial_id:
+        # Fail startup before any recovery/execution if the optional schema is
+        # absent. One shared Feed receiver; this lane has no execution callback.
+        store.connection.execute("SELECT tx_hash FROM early_feed_jobs LIMIT 0")
+        early_lane = EarlyFeedLane(
+            store, EarlyEvidenceResolver(rpc, relay_client or RelayPublicClient(),
+                                         paper_config.wallets if paper_config else watchlist),
+            healthy=health.healthy)
     paper_executor = None
     live_pipelines = {}
     live_tracking_tasks = set()
@@ -406,6 +459,7 @@ async def monitor(args):
                     policy.allowed_routes, {policy.wallet: policy.label},
                     {policy.wallet: {"follower_wallet": policy.follower_wallet,
                                      "relationship_id": policy.relationship_id,
+                                     "operation_claims": (policy.follower_wallet, policy.relationship_id) in operation_scopes,
                                      "ledger_scope": policy.ledger_scope}},
                     policy.snapshot_hash,
                     execution_routes=policy.route_definitions,
@@ -483,9 +537,12 @@ async def monitor(args):
     async def track_live(policy, proposal_id):
         tracker = live_pipelines[policy.ledger_scope][4]
         previous = None
-        for _ in range(180):
+        attempts, errors = 0, 0
+        while early_trial_id or attempts < 180:
+            attempts += 1
             try:
                 observation = await tracker.observe(proposal_id)
+                errors = 0
                 if observation.status != previous:
                     report("live_execution_observed", proposal_id=proposal_id,
                            tx_hash=observation.tx_hash, status=observation.status,
@@ -503,6 +560,8 @@ async def monitor(args):
                                    live_trading=True)
                         except Exception as exc:
                             stats["live_errors"] += 1
+                            if early_trial_id:
+                                trip_execution_stop()
                             report("live_settlement_error", proposal_id=proposal_id,
                                    tx_hash=observation.tx_hash,
                                    error_type=type(exc).__name__, live_trading=True)
@@ -514,18 +573,30 @@ async def monitor(args):
                         report("live_execution_reverted_released", proposal_id=proposal_id,
                                tx_hash=observation.tx_hash, proposal_released=released,
                                live_trading=True)
+                    elif early_trial_id:
+                        trip_execution_stop()
+                        await asyncio.sleep(1)
+                        continue
                     return
                 stats["live_pending"] += observation.status == "observed_pending"
             except Exception as exc:
                 stats["live_errors"] += 1
+                errors += 1
+                if early_trial_id and errors >= 3:
+                    trip_execution_stop()
                 report("live_tracking_error", proposal_id=proposal_id,
                        error_type=type(exc).__name__, live_trading=True)
             await asyncio.sleep(1)
         report("live_tracking_timeout", proposal_id=proposal_id, live_trading=True)
 
-    async def execute_live_serialized(policy, signal, proposal_id):
+    async def execute_live_serialized(policy, signal, proposal_id, *, early_intent=None):
+        from .execution_controls import _stop_controls
+        _stop_controls()
         proposal = store.paper_proposal(proposal_id)
-        quote_signal = execution_quote_signal(
+        check_early_execution_source(store, early_intent, signal, proposal)
+        if "early_trial_id" in proposal["attribution"]:
+            store.check_early_trial_proposal(proposal_id)
+        quote_signal = signal if early_intent is not None else execution_quote_signal(
             signal, policy.route_definitions, proposal["output_asset"])
         if quote_signal.protocol in AGGREGATOR_PROVIDERS:
             if quote_signal.protocol not in policy.execution_providers:
@@ -537,12 +608,28 @@ async def monitor(args):
         elif quote_signal.protocol not in {"v2", "v3", "v4"}:
             raise ValueError("live execution route is not a verified V2/V3/V4 path")
         preparer, signer, reviewer, broadcaster, _ = live_pipelines[policy.ledger_scope]
+        early_options = {"early_intent": early_intent} if early_intent is not None else {}
         if quote_signal.token_in != NATIVE:
             spender = {"v2": V2_ROUTER, "v3": V3_ROUTER, **AGGREGATOR_ROUTERS}.get(
                 quote_signal.protocol)
             if spender is None:
                 raise ValueError("live token input route has no verified approval spender")
-            if proposal["attribution"].get("source_behavior") == "SELL":
+            if early_intent is not None:
+                # No new approval transaction is sent on an expiring early intent.
+                # Existing bounded allowance must suffice; otherwise strict fallback.
+                from eth_abi import encode, decode
+                from eth_utils import keccak
+                data = keccak(text="allowance(address,address)")[:4] + encode(
+                    ["address", "address"], [policy.follower_wallet, spender])
+                raw = await rpc.call("eth_call", [{"to": quote_signal.token_in,
+                                                     "data": "0x" + data.hex()}, "pending"])
+                allowance = decode(["uint256"], bytes.fromhex(raw[2:]))[0]
+                if allowance < int(proposal["amount_in_raw"]):
+                    raise ValueError("early_allowance_insufficient_strict_fallback")
+                check_early_execution_source(store, early_intent, signal, proposal)
+            if early_intent is not None:
+                approval = None
+            elif proposal["attribution"].get("source_behavior") == "SELL":
                 approval_amount = store.paper_open_position_amount(
                     policy.ledger_scope, quote_signal.token_in)
                 if int(approval_amount) < int(proposal["amount_in_raw"]):
@@ -560,7 +647,7 @@ async def monitor(args):
                 approval = await approve_relationship_token(
                     policy, rpc, relationship_gate, broadcaster,
                     quote_signal.token_in, proposal["amount_in_raw"], spender)
-            if approval.submitted:
+            if approval is not None and approval.submitted:
                 stats["live_approval_broadcast"] += 1
                 report("live_approval_broadcast", proposal_id=proposal_id,
                        tx_hash=approval.tx_hash, asset=approval.asset,
@@ -575,14 +662,17 @@ async def monitor(args):
                        live_trading=True, **confirmation)
         stage = "prepare"
         try:
-            prepared = await preparer.prepare(quote_signal, proposal_id)
+            prepared = await preparer.prepare(quote_signal, proposal_id, **early_options)
             stats["live_prepared"] += 1
+            report("live_execution_prepared", proposal_id=proposal_id)
             stage = "sign"
-            signed = await signer.sign(quote_signal, proposal_id)
+            signed = await signer.sign(quote_signal, proposal_id, **early_options)
             stats["live_signed"] += 1
+            report("live_execution_signed", proposal_id=proposal_id)
             stage = "review"
             reviewed = await reviewer.review(
-                quote_signal, proposal_id, signed.raw_transaction)
+                quote_signal, proposal_id, signed.raw_transaction, **early_options)
+            report("live_execution_reviewed", proposal_id=proposal_id)
         except (ValueError, RpcError) as exc:
             # A rejected requote, gate or simulation before any broadcast must not
             # leave a reserved nonce behind, or every later live plan for this
@@ -610,11 +700,54 @@ async def monitor(args):
                    operator_review_required=not (plan is None or plan_released),
                    relationship_id=policy.relationship_id, live_trading=True)
             raise
-        result = await broadcaster.broadcast(
-            reviewed, signed.raw_transaction,
-            follower_wallet=policy.follower_wallet,
-            relationship_id=policy.relationship_id,
-            config_snapshot_hash=policy.snapshot_hash)
+        if "copy_operation_order_id" in proposal["attribution"]:
+            try:
+                store.mark_copy_operation_broadcast_attempted(proposal_id)
+            except ValueError:
+                # The fence rolled back and the broadcaster has not received the
+                # bytes. Release this process's discarded signature/nonce so a
+                # trial expiring here cannot block later strict-evidence orders.
+                claim = store.connection.execute(
+                    "SELECT status FROM copy_operation_claims WHERE proposal_id=?", (proposal_id,)).fetchone()
+                if claim != ("held",):
+                    if early_trial_id:
+                        trip_execution_stop()
+                    raise
+                released = store.cancel_unbroadcast_signed_execution_plan(
+                    proposal_id, "send_fence_rejected_before_network")
+                if released:
+                    store.cancel_paper_proposal(proposal_id, "send_fence_rejected_before_network")
+                raise
+        def early_send_check():
+            if not health.healthy():
+                raise ValueError("Feed unhealthy before early broadcast")
+            # Slot has already been consumed. Recheck intent/source here without
+            # requiring another available trial slot (the 100th remains usable).
+            early_intent.revalidate(time.time())
+            for (payload,) in store.connection.execute(
+                    "SELECT payload FROM signals WHERE tx_hash=?", (signal.tx_hash,)).fetchall():
+                s = json.loads(payload)
+                if s.get("wallet") == signal.wallet and (
+                        s.get("canonical_status") == "orphaned" or s.get("stage") == "failed"):
+                    raise ValueError("early source failed or orphaned before send")
+            checked = store.check_early_trial_send_fence(proposal_id)
+            store.execution_budget_evidence(proposal_id)
+            early_intent.revalidate(time.time())
+            return checked
+        trial_send_options = ({"early_trial_check": early_send_check}
+                              if "early_trial_id" in proposal["attribution"] else {})
+        try:
+            report("live_execution_send_started", proposal_id=proposal_id)
+            result = await broadcaster.broadcast(
+                reviewed, signed.raw_transaction,
+                follower_wallet=policy.follower_wallet,
+                relationship_id=policy.relationship_id,
+                config_snapshot_hash=policy.snapshot_hash, **trial_send_options)
+        except Exception:
+            if early_trial_id:
+                trip_execution_stop()
+            # Signed attempt/fence remains durable; do not retry with another nonce.
+            raise
         stats["live_broadcast"] += 1
         report("live_execution_broadcast", proposal_id=proposal_id,
                plan_id=prepared.plan_id, tx_hash=result.tx_hash,
@@ -624,12 +757,16 @@ async def monitor(args):
         live_tracking_tasks.add(task)
         task.add_done_callback(live_tracking_tasks.discard)
 
-    async def execute_live(policy, signal, proposal_id):
+    async def execute_live(policy, signal, proposal_id, *, early_intent=None):
         # Approval transactions and copy transactions share the follower's
         # account nonce. Keep that entire sequence atomic per follower while
         # allowing distinct follower wallets to proceed concurrently.
         async with live_wallet_locks[policy.follower_wallet]:
-            await execute_live_serialized(policy, signal, proposal_id)
+            await execute_live_serialized(policy, signal, proposal_id, early_intent=early_intent)
+
+    if early_trial_id:
+        early_lane.handoff = EarlyRuntime(store, quoter, relationship_gate, early_policies,
+            early_trial_id, execute_live, health.healthy, report)
 
     async def paper_observe(signal, policies=None):
         if not paper_config or signal.wallet not in paper_config.wallets:
@@ -698,12 +835,39 @@ async def monitor(args):
                         timings.observe("live_execution_ms",
                                         time.monotonic() - execution_started)
 
+    async def observe_policy(signal, policy):
+        if early_trial_id and policy.run_mode == "mainnet_live":
+            from .execution_controls import _stop_controls
+            try:
+                _stop_controls()
+            except PermissionError:
+                report("live_new_decision_stopped", relationship_id=policy.relationship_id)
+                return
+        # Only explicitly configured Kyber-only policies opt into reuse. Each
+        # relationship owns a task-local cache, including while waiting on its
+        # wallet lock. Expired quotes are refreshed without resetting their age.
+        if policy.run_mode != "mainnet_live" or policy.execution_providers != ("kyber",):
+            return await paper_observe(signal, (policy,))
+        with quoter.execution_context(signal.event_id, policy.follower_wallet,
+                                      policy.snapshot_hash,
+                                      policy.quote_policy.max_age_seconds) as context:
+            try:
+                return await paper_observe(signal, (policy,))
+            finally:
+                report("execution_quote_requests", source_event_id=signal.event_id,
+                       relationship_id=policy.relationship_id,
+                       follower_wallet=policy.follower_wallet,
+                       route_requests=context["route_requests"],
+                       build_requests=context["build_requests"],
+                       quote_reuses=context["quote_reuses"],
+                       refreshes=context["refreshes"])
+
     async def safe_paper_observe(signal):
         if not paper_config or signal.wallet not in paper_config.wallets:
             return
         policies = paper_config.policies_for(signal.wallet)
         results = await asyncio.gather(
-            *(paper_observe(signal, (policy,)) for policy in policies),
+            *(observe_policy(signal, policy) for policy in policies),
             return_exceptions=True,
         )
         for policy, result in zip(policies, results):
@@ -956,6 +1120,7 @@ async def monitor(args):
             await asyncio.sleep(5)
             stats["ledger_reconnections"] = getattr(store.connection, "reconnections", 0)
             report("health", healthy=health.healthy(), queued=queue.qsize(), counters=dict(stats),
+                   early_feed_counters=dict(early_lane.stats) if early_lane else {},
                    candidate_states=store.candidate_counts(), chain_cursor=store.chain_cursor(),
                    latency_ms=timings.summary(), coverage=coverage_summary(stats))
 
@@ -977,6 +1142,8 @@ async def monitor(args):
                            confirmations=args.confirmations)
             except ReorgDetected as exc:
                 stats["reorg_detected"] += 1
+                if early_trial_id:
+                    trip_execution_stop()
                 try:
                     # Range scanning stores headers only at range boundaries and
                     # hit blocks, so the automatic rewind must be allowed to reach
@@ -1028,6 +1195,14 @@ async def monitor(args):
                                 if store.put_candidate(tx):
                                     stats["candidates"] += 1
                                     wake_dispatcher.set()
+                                    if early_lane:
+                                        try:
+                                            early_lane.submit(tx)
+                                        except Exception as exc:
+                                            stats["early_feed_enqueue_errors"] += 1
+                                            report("early_feed_enqueue_failed", tx_hash=tx.hash,
+                                                   error_type=type(exc).__name__,
+                                                   strict_fallback_preserved=True)
                                 else:
                                     stats["candidate_duplicates"] += 1
                         except DecodeError:
@@ -1040,6 +1215,8 @@ async def monitor(args):
                 await asyncio.sleep(1)
 
     await recover_paper_reservations()
+    if early_lane:
+        early_lane.start()
     workers = [asyncio.create_task(worker()) for _ in range(args.workers)]
     dispatch_task = asyncio.create_task(dispatcher())
     backfill_task = asyncio.create_task(backfill())
@@ -1070,10 +1247,13 @@ async def monitor(args):
                              return_exceptions=True)
         if live_tracking_tasks:
             await asyncio.gather(*live_tracking_tasks, return_exceptions=True)
+        if early_lane:
+            await early_lane.close()
         candidate_states = store.candidate_counts()
         chain_cursor = store.chain_cursor()
         store.close()
         report("monitor_finished", counters=dict(stats), candidate_states=candidate_states,
+               early_feed_counters=dict(early_lane.stats) if early_lane else {},
                chain_cursor=chain_cursor, latency_ms=timings.summary(),
                coverage=coverage_summary(stats), live_trading=bool(live_pipelines))
 
@@ -1196,6 +1376,9 @@ def parser():
     monitor_parser.add_argument(
         "--relay-auto-associate", action="store_true",
         help="Read Relay public order evidence for passive delivery candidates")
+    monitor_parser.add_argument(
+        "--early-feed-evidence", action="store_true",
+        help="Collect early intent evidence using the SAME Feed connection; does not enable early trading")
     monitor_source = monitor_parser.add_mutually_exclusive_group()
     monitor_source.add_argument("--paper-config")
     monitor_source.add_argument("--paper-mysql", action="store_true",
@@ -1209,6 +1392,11 @@ def parser():
     run_parser.add_argument(
         "--seconds", type=float, default=0,
         help="Duration; 0 runs until interrupted")
+    run_parser.add_argument(
+        "--early-feed-evidence", action="store_true",
+        help="Enable in-process evidence lane only, not early execution")
+    run_parser.add_argument("--early-trial-id",
+        help="Select an explicitly operator-started bounded trial; never creates or renews one")
     run_parser.set_defaults(
         watchlist="data/fomo_watchlist.csv", db="var/observer.sqlite3",
         workers=2, queue_size=256, confirmations=2, backfill_batch=2000,
@@ -1281,6 +1469,13 @@ def parser():
     relay_associate_parser.add_argument("--document", required=True)
     relay_associate_parser.add_argument("--db", default="var/observer.sqlite3")
     relay_associate_parser.add_argument("--ledger-mysql", action="store_true")
+    trial_start_parser = commands.add_parser("early-trial-start",
+        help="Operator-only: initialize a bounded window while the emergency stop remains active")
+    trial_start_parser.add_argument("--trial-id", required=True)
+    trial_start_parser.add_argument("--follower", required=True)
+    trial_start_parser.add_argument("--relationships", nargs="+", required=True)
+    trial_start_parser.add_argument("--confirm-risk-checklist", action="store_true")
+    trial_start_parser.set_defaults(ledger_mysql=True)
     for command_parser in (
             replay_parser, monitor_parser, reconcile_parser, cycle_parser,
             mark_parser, paper_export_parser, export_parser,
@@ -1315,7 +1510,30 @@ def main():
                     raise ValueError("paper mode requires explicit cycle action")
             elif any((args.paper_cycle_action, args.paper_cycle_id, args.paper_cycle_reason)):
                 raise ValueError("paper cycle options require --paper-config or --paper-mysql")
-            asyncio.run(monitor(args))
+            with runtime_instance_lock():
+                asyncio.run(monitor(args))
+        elif args.command == "early-trial-start":
+            if not args.confirm_risk_checklist:
+                raise ValueError("operator risk-checklist confirmation required")
+            from pathlib import Path
+            from .execution_controls import _risk_acceptance
+            if not Path(os.environ.get("SMART_MONEY_EMERGENCY_STOP_FILE", "var/EXECUTION_STOP")).exists():
+                raise ValueError("stop file must remain active while initializing a trial")
+            config = load_mysql_paper_config()
+            selected = [p for p in config.relationships if p.relationship_id in args.relationships]
+            if (len(selected) != len(set(args.relationships)) or len(set(args.relationships)) != len(args.relationships)
+                    or any(p.follower_wallet != args.follower or p.execution_providers != ("kyber",)
+                           or p.trigger_mode != "evidenced" or p.run_mode != "mainnet_live" for p in selected)):
+                raise ValueError("operator trial scope must match current enabled Kyber-only live policies")
+            for p in selected:
+                _risk_acceptance(p.follower_wallet, p.relationship_id, p.snapshot_hash)
+            store = runtime_store(args)
+            try:
+                result = store.start_early_trial(args.trial_id, args.follower, args.relationships)
+                print(json.dumps({**result, "broadcast_performed": False,
+                                  "stop_file_cleared": False, "budget_reset": False}))
+            finally:
+                store.close()
         elif args.command == "reconcile-reorg":
             require_existing_sqlite(args)
             if not 65 <= args.max_depth <= 100000:

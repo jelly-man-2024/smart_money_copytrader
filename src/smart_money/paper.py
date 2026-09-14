@@ -107,12 +107,18 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
                            output_asset: str | None = None) -> Signal:
     """Select one validated local quote route without changing source attribution."""
     output_asset = address(output_asset) if output_asset is not None else source.token_out
-    if source.protocol in {"v2", "v3", "v4"} and output_asset == source.token_out:
+    selected_route = source.evidence.get("local_execution_route")
+    selected_aggregator = (isinstance(selected_route, dict)
+                           and selected_route.get("provider") in AGGREGATOR_PROVIDERS)
+    if (source.protocol in {"v2", "v3", "v4"} and output_asset == source.token_out
+            and not selected_aggregator):
         return source
     if source.protocol not in {"v2", "v3", "v4", "0x", "kyber", "relay_solver"}:
         raise ValueError("source protocol has no paper execution route")
     matches = []
     definitions = list(routes or ())
+    if selected_aggregator:
+        definitions = []
     dynamic = source.evidence.get("local_execution_route")
     if isinstance(dynamic, dict):
         definitions.append(dynamic)
@@ -321,7 +327,7 @@ class PaperEngine:
         if trigger_mode not in TRIGGER_MODES or not strategy_version:
             raise ValueError("invalid paper engine configuration")
         providers = tuple(execution_providers)
-        if (not providers or providers[0] != "local"
+        if (not providers
                 or len(providers) != len(set(providers))
                 or not set(providers) <= SUPPORTED_EXECUTION_PROVIDERS):
             raise ValueError("invalid execution providers")
@@ -350,25 +356,29 @@ class PaperEngine:
                      if provider in AGGREGATOR_PROVIDERS and provider in configured)
 
     async def _select_buy_execution_signal(self, signal: Signal, amount: str) -> Signal:
-        """Local verified routes first, then the configured aggregator providers."""
+        """Honor the configured order; Kyber-only never discovers local pools."""
         failures = []
-        try:
-            return execution_quote_signal(signal, self.execution_routes)
-        except ValueError as exc:
-            failures.append(f"local: {exc}")
-        discover = getattr(self.quoter, "discover_v3_route", None)
-        if signal.protocol == "relay_solver" and callable(discover):
+        for provider in self.execution_providers:
+            if provider != "local":
+                if provider in self._available_aggregators():
+                    signal.evidence["local_execution_route"] = aggregator_route_definition(
+                        signal.token_in, signal.token_out, provider)
+                    self.store.put(signal)
+                    return execution_quote_signal(signal, self.execution_routes)
+                failures.append(f"{provider}: provider unavailable")
+                continue
             try:
-                signal.evidence["local_execution_route"] = await discover(signal, amount)
-                self.store.put(signal)
                 return execution_quote_signal(signal, self.execution_routes)
-            except (RpcError, ValueError) as exc:
-                failures.append(f"v3_discovery: {exc}")
-        for provider in self._available_aggregators():
-            signal.evidence["local_execution_route"] = aggregator_route_definition(
-                signal.token_in, signal.token_out, provider)
-            self.store.put(signal)
-            return execution_quote_signal(signal, self.execution_routes)
+            except ValueError as exc:
+                failures.append(f"local: {exc}")
+            discover = getattr(self.quoter, "discover_v3_route", None)
+            if signal.protocol == "relay_solver" and callable(discover):
+                try:
+                    signal.evidence["local_execution_route"] = await discover(signal, amount)
+                    self.store.put(signal)
+                    return execution_quote_signal(signal, self.execution_routes)
+                except (RpcError, ValueError) as exc:
+                    failures.append(f"v3_discovery: {exc}")
         raise ValueError("; ".join(failures) or "no execution route")
 
     def _id(self, signal: Signal, kind: str) -> str:
@@ -401,6 +411,11 @@ class PaperEngine:
         route = signal.evidence.get("local_execution_route")
         if isinstance(route, dict):
             result["local_execution_route"] = deepcopy(route)
+        if context.get("operation_claims") and signal.stage in {
+                "swap_evidenced", "relay_buy_evidenced", "relay_sell_evidenced"}:
+            order = signal.evidence.get("relay_order_id", signal.evidence.get("relay_deposit_order_id"))
+            if order:
+                result["copy_operation_order_id"] = order
         return result
 
     def _ledger_wallet(self, signal: Signal) -> str:
@@ -536,9 +551,17 @@ class PaperEngine:
             })
         try:
             try:
+                if self.execution_providers[0] in AGGREGATOR_PROVIDERS:
+                    provider = self.execution_providers[0]
+                    if provider not in self._available_aggregators():
+                        raise ValueError("configured aggregator unavailable")
+                    signal.evidence["local_execution_route"] = aggregator_route_definition(
+                        signal.token_in, principal_asset, provider)
                 quote_signal = execution_quote_signal(
                     signal, self.execution_routes, principal_asset)
             except ValueError:
+                if "local" not in self.execution_providers:
+                    raise ValueError("configured aggregator unavailable") from None
                 route, route_reason = self.store.paper_sell_execution_route(
                     self._ledger_wallet(signal), signal.token_in,
                     principal_asset, amount)

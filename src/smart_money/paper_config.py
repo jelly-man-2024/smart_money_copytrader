@@ -24,7 +24,7 @@ def _execution_providers(value) -> tuple[str, ...]:
         return DEFAULT_EXECUTION_PROVIDERS
     if (not isinstance(value, list) or not value
             or any(not isinstance(item, str) for item in value)
-            or len(value) != len(set(value)) or value[0] != "local"
+            or len(value) != len(set(value))
             or not set(value) <= SUPPORTED_EXECUTION_PROVIDERS):
         raise ValueError("invalid execution providers")
     return tuple(value)
@@ -156,6 +156,11 @@ def load_paper_config(path: str | Path) -> PaperConfig:
         document = json.loads(source.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("invalid paper config JSON") from exc
+    return parse_paper_config(document)
+
+
+def parse_paper_config(document: dict) -> PaperConfig:
+    """Validate an already captured public configuration without file I/O."""
     _fields(document, {
         "version", "strategy_version", "trigger_mode", "shadow_trigger_modes",
         "quote_policy", "allowed_protocols", "allowed_assets", "allowed_routes", "wallets",

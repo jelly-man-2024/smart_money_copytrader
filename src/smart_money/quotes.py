@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
+import hashlib
+import json
 import time
 
 from eth_abi import decode, encode
@@ -122,6 +127,8 @@ def assess_market_quote(quote: Quote, reference: Quote, policy: QuotePolicy,
     """Assess an executable quote without requiring a source-wallet execution price."""
     now = time.time() if now is None else now
     evidence = dict(evidence or {})
+    if now < reference.observed_at or now - reference.observed_at > policy.max_age_seconds:
+        return False, "reference_quote_missing_or_expired", evidence
     evidence.setdefault("quote_age_ms", str(max(0, int((now - quote.observed_at) * 1000))))
     if now < quote.observed_at or now - quote.observed_at > policy.max_age_seconds:
         return False, "quote_missing_or_expired", evidence
@@ -166,8 +173,34 @@ class LiveQuoter:
     def __init__(self, rpc, aggregators: dict | None = None):
         self.rpc = rpc
         self.aggregators = dict(aggregators or {})
+        self._context = ContextVar("execution_quote_context", default=None)
         if any(name not in AGGREGATOR_PROTOCOLS for name in self.aggregators):
             raise ValueError("unsupported aggregator provider")
+
+    @contextmanager
+    def execution_context(self, operation: str, follower: str, snapshot: str,
+                          max_age_seconds: float):
+        """Per-operation, per-task cache; never persists or resets quote timestamps.
+
+        All balance/allowance/nonce/config checks remain outside this cache.
+        Changed inputs miss it; expiry discards the entire market bundle.
+        """
+        if not operation or not follower or not snapshot or not 0 < max_age_seconds <= 60:
+            raise ValueError("invalid execution quote context")
+        context = {"binding": (operation, follower, snapshot), "max_age": max_age_seconds,
+                   "bundle": None, "routes": {}, "route_requests": 0,
+                   "build_requests": 0, "quote_reuses": 0, "refreshes": 0}
+        token = self._context.set(context)
+        try:
+            yield context
+        finally:
+            self._context.reset(token)
+
+    @staticmethod
+    def _quote_key(signal, amount):
+        return hashlib.sha256(json.dumps(
+            [signal.to_dict(), amount], sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
 
     def _quotable_protocols(self) -> frozenset[str]:
         return frozenset({"v2", "v3", "v4"} | set(self.aggregators))
@@ -191,8 +224,23 @@ class LiveQuoter:
         if not amount_in_raw.isdecimal() or int(amount_in_raw) <= 0:
             raise ValueError("invalid aggregator input amount")
         client = self._aggregator(signal.protocol)
-        route = await client.route(signal.token_in, signal.token_out, amount_in_raw)
-        return await client.build(route, follower_wallet, slippage_bps, deadline)
+        context = self._context.get()
+        key = self._quote_key(signal, amount_in_raw)
+        route = context["routes"].get(key) if context else None
+        if context and follower_wallet != context["binding"][1]:
+            raise ValueError("aggregator context follower mismatch")
+        if route is not None and not 0 <= time.time() - route.observed_at <= context["max_age"]:
+            raise ValueError("aggregator route expired before build")
+        if route is None:
+            if context:
+                context["route_requests"] += 1
+            route = await client.route(signal.token_in, signal.token_out, amount_in_raw)
+        if context:
+            context["build_requests"] += 1
+        swap = await client.build(route, follower_wallet, slippage_bps, deadline)
+        if context and not 0 <= time.time() - route.observed_at <= context["max_age"]:
+            raise ValueError("aggregator route expired during build")
+        return swap
 
     async def quote_exact_input(self, signal: Signal, amount_in_raw: str) -> Quote:
         if (signal.stage in {"needs_review", "failed"}
@@ -216,13 +264,35 @@ class LiveQuoter:
         reference_amount = max(1, amount // divisor)
         if reference_amount >= amount:
             raise ValueError("amount too small for a reference quote")
+        context = self._context.get() if signal.protocol in AGGREGATOR_PROTOCOLS else None
+        key = (self._quote_key(signal, amount_in_raw), divisor)
+        if context and context["bundle"]:
+            old_key, bundle = context["bundle"]
+            now = time.time()
+            if old_key == key and all(0 <= now - q.observed_at <= context["max_age"]
+                                      for q in bundle[:2]):
+                context["quote_reuses"] += 1
+                return bundle
+            context["bundle"] = None
+            context["routes"].clear()
+            context["refreshes"] += 1
         header = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
         if not isinstance(header, dict) or not isinstance(header.get("hash"), str):
             raise ValueError("quote block header missing")
-        quote = await self._quote_at(signal, amount_in_raw, header)
-        reference = await self._quote_at(signal, str(reference_amount), header)
-        gas_price = await self.rpc.call("eth_gasPrice")
-        return quote, reference, str(number(gas_price))
+        results = await asyncio.gather(
+            self._quote_at(signal, amount_in_raw, header),
+            self._quote_at(signal, str(reference_amount), header),
+            self.rpc.call("eth_gasPrice"), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                if context:
+                    context["routes"].clear()
+                raise result
+        quote, reference, gas_price = results
+        result = quote, reference, str(number(gas_price))
+        if context:
+            context["bundle"] = (key, result)
+        return result
 
     async def discover_v3_route(
             self, signal: Signal, amount_in_raw: str,
@@ -324,8 +394,13 @@ class LiveQuoter:
         if signal.protocol in AGGREGATOR_PROTOCOLS:
             # Aggregator quotes are API responses observed while this header was
             # latest; the block pin records the observation window, not a state read.
+            context = self._context.get()
+            if context:
+                context["route_requests"] += 1
             route = await self._aggregator(signal.protocol).route(
                 signal.token_in, signal.token_out, amount_in_raw)
+            if context:
+                context["routes"][self._quote_key(signal, amount_in_raw)] = route
             return Quote(signal.protocol, route.router, block_number,
                          header["hash"].lower(), route.observed_at, signal.token_in,
                          signal.token_out, amount_in_raw, route.amount_out_raw,

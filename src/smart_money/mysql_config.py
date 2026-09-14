@@ -21,7 +21,9 @@ MYSQL_ENV_KEYS = (
     "SMART_MONEY_MYSQL_DATABASE", "SMART_MONEY_MYSQL_SSL_CA",
 )
 def mysql_connection(write: bool = False, *, dict_rows: bool = True,
-                     autocommit: bool = False):
+                     autocommit: bool = False, read_timeout: int = 10):
+    if type(read_timeout) is not int or not 1 <= read_timeout <= 10:
+        raise ValueError("invalid MySQL read timeout")
     user_key = "SMART_MONEY_MYSQL_ADMIN_USER" if write else "SMART_MONEY_MYSQL_USER"
     password_key = (
         "SMART_MONEY_MYSQL_ADMIN_PASSWORD" if write else "SMART_MONEY_MYSQL_PASSWORD")
@@ -52,7 +54,7 @@ def mysql_connection(write: bool = False, *, dict_rows: bool = True,
             charset="utf8mb4", autocommit=autocommit,
             cursorclass=(pymysql.cursors.DictCursor if dict_rows
                          else pymysql.cursors.Cursor),
-            connect_timeout=5, read_timeout=10, write_timeout=10,
+            connect_timeout=5, read_timeout=read_timeout, write_timeout=10,
             ssl=ssl,
         )
     except (pymysql.MySQLError, RuntimeError, ValueError) as exc:

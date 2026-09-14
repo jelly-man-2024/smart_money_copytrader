@@ -2,6 +2,26 @@
 
 本项目由用户要求在原项目同级新建；不是原项目子目录或克隆远端交易机器人配置。
 
+- `docs/feedback/early_feed_context_replay_2026-09-14.json`：固定 156 笔跟单队列的八类业务表 SELECT，
+  同一 READ ONLY 事务与 UTC 核对；原日志固定前缀 68,133,064 bytes，SHA-256
+  `4a446c2e585c5380ea27dad5c60f86056681b2e554eaa852172bd718a11f3a9c`。
+  保存逐笔解析、原始新鲜度、历史决策、证据来源主键/行号与指纹，明确缺失/部分/晚到，
+  不导出密钥、连接凭据或原始签名。五个公开归档的匹配仅作索引，不当作提前归属证明。
+  旧 v1/v2 报告保留，但其中空 snapshots 不能单独证明数据库未保存证据。
+
+- `data/relay_race_runtime_2026-09-14.json`：使用现有只读 RPC 在明确 blockHash/requireCanonical 条件下
+  读取包装器 code、样本 A receipt；保存完整代码、Keccak、区块和原始路线事件。BaseScan 同地址公开
+  字节码匹配但源码未验证；本项目的参数解释由反汇编和独立内存 Py-EVM 行为测试支撑，不冒称官方 ABI。
+- `docs/feedback/early_feed_race_replay_2026-09-14.json`：v2 同一历史队列加对照共 381 条，业务查询
+  READ ONLY；另核验 120 个已保存严格证据对应历史块的 code。事后结果不写入历史 snapshots。
+- `docs/feedback/early-shadow-race-smoke-2026-09-14.jsonl`：60 秒独立只读现场采集，1186 帧及一笔
+  尚未支持的 Multicall3；无 race 候选，不提供提前资格、误跟率或提速证明。没有私钥或 RPC URL。
+
+- `data/relay_wrapper_signature_hint_2026-09-14.json`：OpenChain 公开 selector 查询响应，
+  函数签名本地 Keccak 重算通过。不是目标链合约验证；未知最低输出/路线语义继续阻止提前资格。
+- 独立影子采集首版初次实现时只有合成/公开固定样本离线测试，不能当实盘统计。
+  后续 60 秒现场窗口与局限见上方 race-smoke 记录；JSONL 分开保存早期与最终证据。
+
 - 原工程：git@github.com:dvzhang/Fomo_sniper.git；本机目录 `/home/jelly/applet/fomo_sniper`。
 - 初始研究基于原 `sniper/feed.py` 的 Nitro 拆包思路，新的模块独立实现，补充签名恢复、
   type 4、尺寸/递归限制和持续新鲜度检查。未复制旧私钥、钱包、.env 或运行数据库。
@@ -36,6 +56,14 @@
   包含 `relaySwapId`/`relayTransaction`。静态模块未复制进仓库，也没有登录、签名或提交交易；
   聚合器归属仍以来自 dRPC 的目标 UserOperation 链上证据为准。
 - 测试中的随机本地账户只用于离线编码/验签，没有资金、不会广播。
+- `data/relay_0a2b8f36_sample_a_2026-09-14.json`：2026-09-14 经只读
+  `eth_getTransactionByHash` 获取样本A公开calldata。包含链上已公开的Permit2签名字节，
+  不包含私钥、RPC地址或凭据；仅用于离线解析，不用于构造或重放链上交易。
+  `docs/feedback/relay_0a2b8f36_decoded_2026-09-14.json` 保留解析结果及同次历史receipt/
+  Token元数据只读复核，区分Feed字段和执行后字段。官方Relay源码固定于
+  `relayprotocol/relay-periphery@f937c6c0747a4685cc23a57f80840c4ec9ffcccc`；该源码版本为3.1，
+  未完成与本链v3部署字节码的编译比对。外层selector与ABI重编码已核验，嵌套
+  `0x998b5942`仅结构可重编码，其字段语义仍有未验证部分。
 
 纸面报价使用的 V3 Quoter `0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7` 和 V4 Quoter
 `0x8dc178efb8111bb0973dd9d722ebeff267c98f94` 来自 Uniswap 官方 SDK 地址注册表，并在
@@ -57,3 +85,20 @@ tuple 布局。
 
 原项目授权/许可证未独立确认；本工程暂不擅自声明上游代码或清单的开源许可。
 如果之后发布或商用分发，应先核对所有来源和依赖的授权条款。
+
+## 2026-09-14 Feed 提前资格回放
+
+- `data/early_feed_baseline_2026-09-14.json` 保存 09:07:10.620870 UTC 只读查询选出的 156 个源交易
+  hash，不包含钱包凭据；固定选择集合，不声称数据库内容不可变。
+- `data/early_feed_public_samples_2026-09-14.json` 从业务账本只读提取一笔直接 Kyber BUY 和一笔
+  Kyber SELL 的公开源交易参数，保留捕获来源与时间；不含 follower 私钥、签名 raw transaction
+  或 endpoint。calldata 中的用户操作/Permit2 签名已是公开链数据，夹具不能作为执行输入重放。
+- `docs/feedback/early_feed_replay_2026-09-14.json` 为新工具对 156 笔样本及 225 个对照的摘要。
+  对照按类别/hash 排序选择，每类最多 100，不是随机样本。未知样本不作为负例真值。
+  日志校验范围是打开时的固定前缀，SHA-256 和字节数随摘要保存。
+- UserOp v0.8 摘要与低 s 签名校验依据 eth-infinitism/account-abstraction 的 `releases/v0.8`
+  分支：`core/EntryPoint.sol`、`core/UserOperationLib.sol`、`accounts/Simple7702Account.sol`。
+  链接见 `EARLY_FEED_REFERENCE.md`；按规范独立实现散列和验签，没有复制完整 Solidity 源码。
+  26 笔历史公开签名及独立 EIP-712 编码器用于交叉测试；这不替代部署字节码身份核验。
+- `tests/test_early_feed.py` 中的 policy/portfolio/order/market/preparation 快照为显式合成测试数据，
+  不宣称在真实交易 Feed 时刻曾存在，不用这些正例提高历史覆盖率。

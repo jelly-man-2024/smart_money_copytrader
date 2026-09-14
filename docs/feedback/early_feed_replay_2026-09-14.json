@@ -1,0 +1,203 @@
+{
+  "rule_version": "early-intent-offline-v1",
+  "offline_only": true,
+  "live_enabled": false,
+  "input_records": 381,
+  "duplicate_records_skipped": 0,
+  "invalid_records": 0,
+  "copy_eligible": false,
+  "groups": {
+    "feed:BUY": {
+      "records": 119,
+      "parsed_records": 119,
+      "semantics_pass": 7,
+      "semantics_reject": 112,
+      "semantics_unverifiable": 0,
+      "attribution_pass": 0,
+      "attribution_reject": 0,
+      "attribution_unverifiable": 119,
+      "decision_pass": 0,
+      "decision_reject": 0,
+      "decision_unverifiable": 119,
+      "preparation_pass": 0,
+      "preparation_reject": 0,
+      "preparation_unverifiable": 119
+    },
+    "feed:SELL": {
+      "records": 26,
+      "parsed_records": 26,
+      "semantics_pass": 18,
+      "semantics_reject": 8,
+      "semantics_unverifiable": 0,
+      "attribution_pass": 0,
+      "attribution_reject": 0,
+      "attribution_unverifiable": 26,
+      "decision_pass": 0,
+      "decision_reject": 0,
+      "decision_unverifiable": 26,
+      "preparation_pass": 0,
+      "preparation_reject": 0,
+      "preparation_unverifiable": 26
+    },
+    "backfill:BUY": {
+      "records": 11,
+      "parsed_records": 11,
+      "semantics_pass": 0,
+      "semantics_reject": 0,
+      "semantics_unverifiable": 0,
+      "attribution_pass": 0,
+      "attribution_reject": 0,
+      "attribution_unverifiable": 0,
+      "decision_pass": 0,
+      "decision_reject": 0,
+      "decision_unverifiable": 0,
+      "preparation_pass": 0,
+      "preparation_reject": 0,
+      "preparation_unverifiable": 0
+    },
+    "feed:control:bulk": {
+      "records": 100,
+      "parsed_records": 0,
+      "semantics_pass": 0,
+      "semantics_reject": 0,
+      "semantics_unverifiable": 0,
+      "attribution_pass": 0,
+      "attribution_reject": 0,
+      "attribution_unverifiable": 0,
+      "decision_pass": 0,
+      "decision_reject": 0,
+      "decision_unverifiable": 0,
+      "preparation_pass": 0,
+      "preparation_reject": 0,
+      "preparation_unverifiable": 0
+    },
+    "feed:control:failed_nontrade": {
+      "records": 11,
+      "parsed_records": 0,
+      "semantics_pass": 0,
+      "semantics_reject": 0,
+      "semantics_unverifiable": 0,
+      "attribution_pass": 0,
+      "attribution_reject": 0,
+      "attribution_unverifiable": 0,
+      "decision_pass": 0,
+      "decision_reject": 0,
+      "decision_unverifiable": 0,
+      "preparation_pass": 0,
+      "preparation_reject": 0,
+      "preparation_unverifiable": 0
+    },
+    "feed:control:other_nontrade": {
+      "records": 14,
+      "parsed_records": 0,
+      "semantics_pass": 0,
+      "semantics_reject": 0,
+      "semantics_unverifiable": 0,
+      "attribution_pass": 0,
+      "attribution_reject": 0,
+      "attribution_unverifiable": 0,
+      "decision_pass": 0,
+      "decision_reject": 0,
+      "decision_unverifiable": 0,
+      "preparation_pass": 0,
+      "preparation_reject": 0,
+      "preparation_unverifiable": 0
+    },
+    "feed:control:unresolved_not_negative_truth": {
+      "records": 96,
+      "parsed_records": 0,
+      "semantics_pass": 0,
+      "semantics_reject": 0,
+      "semantics_unverifiable": 0,
+      "attribution_pass": 0,
+      "attribution_reject": 0,
+      "attribution_unverifiable": 0,
+      "decision_pass": 0,
+      "decision_reject": 0,
+      "decision_unverifiable": 0,
+      "preparation_pass": 0,
+      "preparation_reject": 0,
+      "preparation_unverifiable": 0
+    },
+    "backfill:control:unresolved_not_negative_truth": {
+      "records": 4,
+      "parsed_records": 0,
+      "semantics_pass": 0,
+      "semantics_reject": 0,
+      "semantics_unverifiable": 0,
+      "attribution_pass": 0,
+      "attribution_reject": 0,
+      "attribution_unverifiable": 0,
+      "decision_pass": 0,
+      "decision_reject": 0,
+      "decision_unverifiable": 0,
+      "preparation_pass": 0,
+      "preparation_reject": 0,
+      "preparation_unverifiable": 0
+    }
+  },
+  "rejection_or_missing_reasons": {
+    "wrapper_semantics_unverified": 109,
+    "order_snapshot_missing": 119,
+    "early_prerequisites_not_met": 145,
+    "decision_not_passed": 145,
+    "account_snapshot_missing": 26,
+    "zero_x_output_and_minimum_unparsed": 11,
+    "feed_was_not_fresh": 2,
+    "decision_time_missing": 11
+  },
+  "errors": [],
+  "notes": [
+    "groups count records; stage counts count parsed operations",
+    "posthoc truth never enters early evaluation",
+    "unknown labels are not negative truth; no live false-follow rate inferred",
+    "snapshots require trustworthy capture provenance; hashes are integrity, not authentication"
+  ],
+  "provenance": {
+    "source": "business_mysql_read_only",
+    "captured_at_utc": "2026-09-14 09:45:25.607037",
+    "selected_records": 156,
+    "limit": 200,
+    "selection": "proposals_with_confirmed_or_reverted_follower_attempt",
+    "historical_context_not_reconstructed_from_current_state": true
+  },
+  "original_log_baseline": {
+    "path": "var/log/sm-copy.log",
+    "prefix_bytes": 68133008,
+    "sha256": "0bf6477768782a566267847f25f576d919eb8ba859dc0a5bf633e54e4339d3cb",
+    "cohort_hash_count": 156,
+    "intent_count": 26,
+    "intent_sides": {
+      "SELL": 26
+    },
+    "intent_stale": 2,
+    "feed_decisions": 26,
+    "feed_accepted": 0,
+    "rejections": {
+      "asset_not_allowed": 26
+    }
+  },
+  "control_provenance": {
+    "captured_at_utc": "2026-09-14 09:45:26.450646",
+    "population_groups": 705,
+    "available": {
+      "unresolved_not_negative_truth": 105,
+      "bulk": 194,
+      "failed_nontrade": 11,
+      "other_nontrade": 14
+    },
+    "sampling": "up to 100 per category, hash-sorted, NOT random",
+    "labels": "existing ledger classifications; not independent ground truth"
+  },
+  "paths": {
+    "relay_wrapper": 120,
+    "relay_sell_kyber": 18,
+    "relay_sell_0x": 8,
+    "relay_direct_kyber": 7,
+    "relay_direct_0x": 3
+  },
+  "signature_valid_count": 26,
+  "posthoc": {
+    "matched": 156
+  }
+}

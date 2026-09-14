@@ -35,9 +35,11 @@ class RelayPublicClient:
             raise ValueError("invalid Relay transaction hash") from None
         return tx_hash.lower()
 
-    def _fetch(self, tx_hash: str, limit: int) -> dict:
+    def _fetch(self, tx_hash: str, limit: int, *, field: str = "hash") -> dict:
+        if field not in {"hash", "orderId", "id"}:
+            raise ValueError("unsupported Relay lookup field")
         query = urllib.parse.urlencode({
-            "hash": self._check_hash(tx_hash), "includeOrderData": "true",
+            field: self._check_hash(tx_hash), "includeOrderData": "true",
             "limit": str(limit),
         })
         request = urllib.request.Request(
@@ -77,6 +79,31 @@ class RelayPublicClient:
 
     async def lookup_by_destination_hash(self, tx_hash: str) -> dict:
         return await asyncio.to_thread(self._lookup, tx_hash)
+
+    def _lookup_order(self, order_id: str, request_id: str | None) -> dict:
+        order_id = self._check_hash(order_id)
+        lookup_id = self._check_hash(request_id) if request_id is not None else order_id
+        document = self._fetch(lookup_id, 2, field="id" if request_id is not None else "orderId")
+        if len(document["requests"]) != 1:
+            raise RelayApiError("Relay order is not unique")
+        request = document["requests"][0]
+        try:
+            matches = (self._check_hash(request["protocol"]["orderId"]) == order_id
+                       and (request_id is None
+                            or self._check_hash(request["id"]) == lookup_id))
+        except (KeyError, TypeError, ValueError):
+            matches = False
+        if not matches:
+            raise RelayApiError("Relay order lookup identity mismatch")
+        return document
+
+    async def lookup_by_order(self, order_id: str, request_id: str | None = None) -> dict:
+        """Lookup before destination inclusion; requestId and orderId are distinct.
+
+        This only verifies lookup identity. Economic attribution remains the
+        caller's responsibility; returned status is not proof of a purchase.
+        """
+        return await asyncio.to_thread(self._lookup_order, order_id, request_id)
 
     async def lookup_requests_by_hash(self, tx_hash: str, limit: int = 5) -> dict:
         """Return every request Relay attributes to one transaction hash.

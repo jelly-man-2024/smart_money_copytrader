@@ -1,0 +1,30 @@
+{
+  "provenance": {
+    "source": "https://api.openchain.xyz/signature-database/v1/lookup?function=0x998b5942",
+    "observed_date": "2026-09-14",
+    "method": "public_read_only_selector_lookup",
+    "scope": "selector_database_response_not_deployment_verification"
+  },
+  "response": {
+    "ok": true,
+    "result": {
+      "function": {
+        "0x998b5942": [
+          {
+            "name": "race(address,uint256,address,uint256,address,address,(address,address,uint256,uint256,bytes)[],bool,bytes)",
+            "filtered": false,
+            "hasVerifiedContract": true
+          }
+        ]
+      },
+      "event": {}
+    }
+  },
+  "local_selector_recomputed": "0x998b5942",
+  "target_chain_id": 4663,
+  "target_contract": "0x039ec98a76f111092d4751365ff09dd2aec301e8",
+  "target_runtime_bytecode_verified": false,
+  "minimum_output_semantics_verified": false,
+  "route_selection_semantics_verified": false,
+  "early_blocker": "wrapper_semantics_unverified"
+}

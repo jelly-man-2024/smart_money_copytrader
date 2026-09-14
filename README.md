@@ -1,10 +1,15 @@
 # Smart Money Copytrader
 
 Robinhood Chain 聪明钱跟单工程，独立于同级 `fomo_sniper`。
-当前 v0.1.0 是 **只读观察器 + 回放验证**：不读取私钥，不签名、不发送交易，不实现真实成交。
+项目由只读观察器和回放验证起步，当前还包含纸面跟单及受独立门禁控制的 `mainnet_live` 执行链路。
+普通只读观察/回放不签名；`sm-copy run` 会按 enabled relationship 的运行模式进入相应分支。
+当前实现、历史文档差异与运行限制以[流程及延时分析](docs/copy_trade_flow.md)为准。
 
 - [完整跟单方案](docs/COPYTRADING_PLAN.md)
-- [当前跟单流程与行为矩阵](docs/COPYTRADING_FLOW.md)
+- [当前跟单流程、行为矩阵与延时分析](docs/copy_trade_flow.md)
+- [Feed 提前资格规则与接口（离线）](docs/EARLY_FEED_REFERENCE.md)
+- [Feed 提前执行接线与操作员切换交接（尚未部署）](docs/EARLY_FEED_LIVE_HANDOFF.md)
+- [历史 Feed 覆盖回放操作](docs/HOWTO_REPLAY_EARLY_FEED.md)
 - [观察名单历史交易路径分析](docs/WATCHLIST_ROUTE_ANALYSIS_2026-09-12.md)
 - [继续开发交接](docs/HANDOFF.md)
 - [新服务器测试与开发交付](docs/SERVER_HANDOFF.md)
@@ -43,8 +48,17 @@ python3 -m venv .venv
 
 离线回放包含 11 笔历史样本、1 笔真实 feed 存款样本和可选的 230 地址批量分发。
 不需要网络、付费 RPC 或私钥。信号输出到 stdout（JSONL），统计输出到 stderr。
+新增独立的 `scripts/replay_early_feed.py` 可检查提前候选、UserOp 签名、订单归属和决策快照；
+它未接入 monitor，`--evaluate` 只启用离线检查，不修改实盘触发点。历史缺少当时证据会明确
+标为无法验证，不用事后成交补成提前成功。操作和已保存的覆盖报告见上方链接。
+`scripts/observe_early_feed.py` 另提供默认关闭的独立实时影子采集入口；首版只采集识别/归属和业务
+快照，不报价、构建或下单。用法及未完成边界见 [影子采集说明](docs/HOWTO_REPLAY_EARLY_FEED.md#独立实时影子采集首版识别与归属)。
+v2 增加固定 race 字节码适配和独立部署快照门禁；历史 BUY 语义覆盖为 116/119，仍不是提前下单通过数。
+`--reconstruct-context --mysql --log ...` 可进一步恢复已有历史报价并审计订单、决策及预检来源；
+避免把旧导入器的空 snapshots 误解为数据库无数据。解析加新鲜度覆盖为 133/145，完整提前资格另计。
 SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信号。
-目前单元测试共 177 项。服务器首次验证顺序为安装、单元测试、离线回放，
+当前测试共 361 项，包括 12 项需 `requirements-race-tests.txt` 的可选 EVM 测试；未安装可选依赖时会跳过。
+服务器首次验证顺序为安装、单元测试、离线回放，
 再执行下面的 60 秒实时只读监听；完整历史验证记录见 [VALIDATION](docs/VALIDATION.md)。
 
 ## 实时只读监听
@@ -77,7 +91,8 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 取得固定区块的实时报价；只有第二次报价仍通过原始 `minOut`、时效、偏离、价格冲击和 Gas
 门控，才写入本地 paper fill。`run_mode=paper` 全过程没有签名、广播或真实订单。显式的
 `mainnet_live` 测试模式默认只执行最终能严格验证为本地 V2/V3/V4 的路径；关系的
-`execution_providers` 追加 `kyber` 后，本地路径不可用时改由 KyberSwap 聚合器为 follower 询价
+`execution_providers=["local","kyber"]` 时，本地路径不可用后改由 KyberSwap 聚合器为 follower 询价；
+显式设为 `["kyber"]` 则跳过本地寻路，直接由聚合器询价
 并构建交易，经 Router 白名单、顶层 calldata 反解、滑点下限和签名前 `eth_call` 模拟四道门禁后
 执行（见 `docs/OPERATOR_RUNBOOK.md`）。`mainnet_live` 还要求 MySQL
 配置/账本、逐条 enabled live relationship、全局 stop file 和签名/广播前的 MySQL 配置快照复核；
@@ -88,7 +103,11 @@ follower ERC-20 净差额结算收益 lot；当前仍不能用于无人值守运
 `allowed_assets` 是可信本金、结算币和中间路由币集合，不是可以买入的 token 白名单。
 对于回执已经形成严格兑换证据的 BUY，目标 token 动态放行；SELL 的来源 token 只有存在该
 relationship 的归因持仓 lot 才能卖。路径中的其他端点和所有中间资产仍必须出现在
-`allowed_assets`，未确认的 feed 意向不能获得动态放行。`allowed_routes` 可为空；其中列出的
+`allowed_assets`，旧 `feed_intent` 影子分支不会动态放行未确认目标币。新提前入口则仅在
+`run --early-trial-id` 显式选择试运行、原始意向及归属重新验证后动态接受目标币，本金/结算币
+仍须受信，预算/持仓/授权/时效检查仍保留。主 `trigger_mode=evidenced` 保留为严格后备；
+仅将它改成旧 `feed_intent` 不会启用新提前入口。详见上方操作员交接文档。
+`allowed_routes` 可为空；其中列出的
 V2/V3/V4 路径只作为预配置本地路由（含 fee/tickSpacing/hook/hookData）。严格证据中的动态目标
 直连池或仅经过可信中间币的池不要求事先枚举 meme token 合约。对 0x、Kyber 或 Relay Solver 源信号，
 同一配置必须能得到唯一的本地 V2/V3/V4 报价路径；它既可来自预配置，也可来自同一 receipt
