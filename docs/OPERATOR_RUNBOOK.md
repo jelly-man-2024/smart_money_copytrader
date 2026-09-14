@@ -111,6 +111,16 @@ replacement 提价、replacement parent 状态以及最终 block number/hash；�
 - `--paper-cycle-action reset --paper-cycle-id ... --paper-cycle-reason ...`：人工开启新周期。
 - 跟卖成交会按该 relationship 的归因持仓释放累计投入额度；失败、revert 或 UNKNOWN 不释放。
 
+### 规范链回补的范围扫描
+
+回补不再逐块拉取完整区块。每一轮用 `eth_getLogs` 在一个区块范围（`run` 默认 2000 块，
+`--backfill-batch` 上限 5000）内查询"发送方或接收方是监听钱包"的 ERC-20 Transfer 日志，只对命中的
+交易再取交易体，RPC 被拒绝或日志超过上限时自动对半拆分范围。任何可跟的买入或卖出都必然移动聪明钱
+的 ERC-20 余额，因此不会漏掉交易；单纯授权等不移动代币的调用不再进入回补候选。回补的监听集合只包含
+enabled 关系里的聪明钱，CSV 观察地址继续只走实时 feed。父哈希连续性在范围起点、每个命中区块和范围
+终点核对，`canonical_blocks` 只在这些高度落库，因此重组检测从逐块降为逐段，自动回退深度放宽到
+`max(64, backfill_batch + 1)`；健康日志的 `chain_cursor` 应在几分钟内追平安全链头。
+
 数据库驱动的 `sm-copy run` 会自动沿用当前活动周期，绝不因重启重置已投入额度。第一次运行没有
 活动周期时才自动创建一个；新增 relationship 会在同一周期初始化自己的额度。修改额度会保留已有
 invested/reserved 数值，若新上限低于已占用额度则启动失败，不会偷偷清零。

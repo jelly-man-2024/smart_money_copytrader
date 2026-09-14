@@ -16,7 +16,7 @@ from .approval import (
     approve_relationship_token, approve_relationship_usdg,
     confirm_relationship_token_approval,
 )
-from .backfill import BlockScanner, ReorgDetected, relevant
+from .backfill import MAX_RANGE_BLOCKS, BlockScanner, ReorgDetected, relevant
 from .broadcast import MainnetBroadcaster
 from .config import load_endpoint_env
 from .decode import Decoder
@@ -321,6 +321,12 @@ async def monitor(args):
     paper_config = runtime_paper_config(args)
     watchlist = monitoring_watchlist(args.watchlist, paper_config)
     watched_bytes = [bytes.fromhex(a[2:]) for a in watchlist]
+    # Backfill only needs the wallets whose trades we may copy; the CSV
+    # observation set keeps flowing through the live feed. Fewer topics also
+    # means fewer passive candidates and Relay lookups per range.
+    backfill_watchlist = (
+        {wallet: watchlist[wallet] for wallet in paper_config.wallets if wallet in watchlist}
+        if paper_config and paper_config.wallets else watchlist)
     rpc = ReadOnlyRpc(os.environ.get("ROBINHOOD_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"))
     relay_client = RelayPublicClient() if args.relay_auto_associate else None
     feed_url = os.environ.get("ROBINHOOD_FEED_URL", "wss://feed.mainnet.chain.robinhood.com")
@@ -916,8 +922,8 @@ async def monitor(args):
             if candidates:
                 wake_dispatcher.set()
 
-        scanner = BlockScanner(rpc, store, watchlist, args.confirmations, args.backfill_batch,
-                               progress=progress)
+        scanner = BlockScanner(rpc, store, backfill_watchlist, args.confirmations,
+                               args.backfill_batch, progress=progress)
         while True:
             try:
                 result = await scanner.scan_once()
@@ -927,7 +933,11 @@ async def monitor(args):
             except ReorgDetected as exc:
                 stats["reorg_detected"] += 1
                 try:
-                    resolution = await scanner.reconcile_reorg()
+                    # Range scanning stores headers only at range boundaries and
+                    # hit blocks, so the automatic rewind must be allowed to reach
+                    # back one full range to find a stored common ancestor.
+                    resolution = await scanner.reconcile_reorg(
+                        max_depth=max(64, args.backfill_batch + 1))
                     stats["reorg_orphaned_signals"] += resolution.orphaned_signals
                     stats["reorg_candidates_requeued"] += resolution.candidates_requeued
                     report("reorg_reconciled", common_ancestor=resolution.common_ancestor,
@@ -991,7 +1001,9 @@ async def monitor(args):
     beat = asyncio.create_task(heartbeat())
     receiver = asyncio.create_task(receive())
     try:
-        report("monitor_started", wallets=len(watchlist), seconds=args.seconds,
+        report("monitor_started", wallets=len(watchlist),
+               backfill_wallets=len(backfill_watchlist),
+               backfill_range_blocks=args.backfill_batch, seconds=args.seconds,
                live_trading=bool(live_pipelines))
         if args.seconds > 0:
             try:
@@ -1133,7 +1145,8 @@ def parser():
     monitor_parser.add_argument("--workers", type=int, default=2)
     monitor_parser.add_argument("--queue-size", type=int, default=256)
     monitor_parser.add_argument("--confirmations", type=int, default=2)
-    monitor_parser.add_argument("--backfill-batch", type=int, default=20)
+    monitor_parser.add_argument("--backfill-batch", type=int, default=2000,
+                                help="Blocks per address-filtered log range scan")
     monitor_parser.add_argument("--backfill-interval", type=float, default=1.0)
     monitor_parser.add_argument(
         "--relay-auto-associate", action="store_true",
@@ -1153,7 +1166,7 @@ def parser():
         help="Duration; 0 runs until interrupted")
     run_parser.set_defaults(
         watchlist="data/fomo_watchlist.csv", db="var/observer.sqlite3",
-        workers=2, queue_size=256, confirmations=2, backfill_batch=20,
+        workers=2, queue_size=256, confirmations=2, backfill_batch=2000,
         backfill_interval=1.0, relay_auto_associate=True,
         paper_config=None, paper_mysql=True,
         paper_cycle_action="auto", paper_cycle_id=None,
@@ -1240,7 +1253,7 @@ def main():
             replay(args)
         elif args.command in {"monitor", "run"}:
             if (args.seconds < 0 or not 1 <= args.workers <= 8 or not 1 <= args.queue_size <= 10000
-                    or args.confirmations < 0 or not 1 <= args.backfill_batch <= 1000
+                    or args.confirmations < 0 or not 1 <= args.backfill_batch <= MAX_RANGE_BLOCKS
                     or not 0.1 <= args.backfill_interval <= 60):
                 raise ValueError("invalid monitor limits")
             if args.paper_config or args.paper_mysql:

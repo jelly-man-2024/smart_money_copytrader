@@ -4209,62 +4209,80 @@ class SafetyTests(unittest.TestCase):
             store.set_chain_cursor(99, '0x' + 'cc' * 32)
         store.close()
 
-    def test_block_scanner_initializes_then_backfills_rpc_visible_candidate(self):
+    @staticmethod
+    def _range_rpc(latest, sender, hit_height=101, log_side='from', hit_hash=TXHASH):
+        """Fake RPC for the address-filtered range scanner (headers, logs, transactions)."""
         class Rpc:
-            latest = 102
+            def __init__(self):
+                self.latest = latest
+                self.calls = []
 
             async def call(self, method, params=None):
+                self.calls.append((method, params))
                 if method == 'eth_blockNumber':
                     return hex(self.latest)
                 if method == 'eth_getLogs':
+                    query = params[0]
+                    start, end = int(query['fromBlock'], 16), int(query['toBlock'], 16)
+                    topics = query['topics']
+                    matched = (log_side == 'from' and topics[1] and addr_topic(A) in topics[1]) or (
+                        log_side == 'to' and topics[2] and addr_topic(A) in topics[2])
+                    if matched and start <= hit_height <= end:
+                        return [{'transactionHash': hit_hash, 'removed': False,
+                                 'blockNumber': hex(hit_height),
+                                 'topics': [TRANSFER, addr_topic(sender), addr_topic(A)]}]
                     return []
+                if method == 'eth_getTransactionByHash':
+                    return {'hash': hit_hash, 'from': sender, 'to': TOKEN, 'input': '0x',
+                            'value': '0x0', 'chainId': hex(R.CHAIN_ID), 'nonce': '0x1',
+                            'type': '0x2', 'blockNumber': hex(hit_height),
+                            'blockHash': '0x' + format(hit_height, '064x')}
                 height = int(params[0], 16)
-                transaction = {
-                    'hash': TXHASH, 'from': A, 'to': TOKEN, 'input': '0x',
-                    'value': '0x0', 'chainId': hex(R.CHAIN_ID), 'nonce': '0x1', 'type': '0x2',
-                }
+                self.calls.append(('full_block', params[1]))
                 return {'number': hex(height), 'hash': '0x' + format(height, '064x'),
-                        'parentHash': '0x' + format(height - 1, '064x'), 'timestamp': '0x64',
-                        'transactions': [transaction] if height == 101 else []}
+                        'parentHash': '0x' + format(height - 1, '064x'), 'timestamp': '0x64'}
+        return Rpc()
 
+    def test_block_scanner_initializes_then_backfills_rpc_visible_candidate(self):
         store = Store(':memory:')
-        rpc = Rpc()
+        rpc = self._range_rpc(latest=102, sender=A)
         progress = []
-        scanner = BlockScanner(rpc, store, {A: {}}, confirmations=2,
+        scanner = BlockScanner(rpc, store, {A: {}}, confirmations=2, max_blocks=2000,
                                progress=lambda candidates, passive: progress.append((candidates, passive)))
         self.assertTrue(asyncio.run(scanner.scan_once()).initialized)
         self.assertEqual(store.chain_cursor()[0], 100)
         rpc.latest = 103
         result = asyncio.run(scanner.scan_once())
-        self.assertEqual((result.blocks, result.candidates), (1, 1))
+        self.assertEqual((result.blocks, result.candidates, result.passive_candidates), (1, 1, 0))
         self.assertEqual(progress, [(1, 0)])
+        self.assertEqual(store.chain_cursor()[0], 101)
+        # No full blocks are ever requested; only headers, logs and matched transactions.
+        self.assertNotIn(('full_block', True), rpc.calls)
         candidate = store.claim_candidates(1)[0]
         self.assertEqual((candidate.observation_source, candidate.fresh), ('backfill', False))
         store.close()
 
-    def test_block_scanner_finds_passive_transfer_recipient(self):
-        class Rpc:
-            latest = 102
-
-            async def call(self, method, params=None):
-                if method == 'eth_blockNumber':
-                    return hex(self.latest)
-                if method == 'eth_getLogs':
-                    return [{'transactionHash': TXHASH, 'removed': False,
-                             'topics': [TRANSFER, addr_topic(B), addr_topic(A)]}]
-                height = int(params[0], 16)
-                transaction = {
-                    'hash': TXHASH, 'from': B, 'to': TOKEN, 'input': '0x',
-                    'value': '0x0', 'chainId': hex(R.CHAIN_ID), 'nonce': '0x1', 'type': '0x2',
-                }
-                return {'number': hex(height), 'hash': '0x' + format(height, '064x'),
-                        'parentHash': '0x' + format(height - 1, '064x'), 'timestamp': '0x64',
-                        'transactions': [transaction] if height == 101 else []}
-
+    def test_block_scanner_range_covers_many_blocks_with_few_calls(self):
         store = Store(':memory:')
-        rpc = Rpc()
+        rpc = self._range_rpc(latest=100, sender=A, hit_height=1500)
+        scanner = BlockScanner(rpc, store, {A: {}}, confirmations=0, max_blocks=2000)
+        asyncio.run(scanner.scan_once())
+        rpc.latest = 5000
+        result = asyncio.run(scanner.scan_once())
+        self.assertEqual((result.blocks, result.candidates), (2000, 1))
+        self.assertEqual(store.chain_cursor()[0], 2100)
+        self.assertEqual(store.chain_block_hash(1500), '0x' + format(1500, '064x'))
+        self.assertIsNone(store.chain_block_hash(1499))
+        methods = Counter(method for method, _ in rpc.calls if method != 'full_block')
+        self.assertEqual(methods['eth_getLogs'], 2)
+        self.assertLessEqual(methods['eth_getBlockByNumber'], 4)
+        store.close()
+
+    def test_block_scanner_finds_passive_transfer_recipient(self):
+        store = Store(':memory:')
+        rpc = self._range_rpc(latest=102, sender=B, log_side='to')
         progress = []
-        scanner = BlockScanner(rpc, store, {A: {}}, confirmations=2,
+        scanner = BlockScanner(rpc, store, {A: {}}, confirmations=2, max_blocks=2000,
                                progress=lambda candidates, passive: progress.append((candidates, passive)))
         asyncio.run(scanner.scan_once())
         rpc.latest = 103
@@ -4281,6 +4299,8 @@ class SafetyTests(unittest.TestCase):
             async def call(self, method, params=None):
                 if method == 'eth_blockNumber':
                     return '0x65'
+                if method == 'eth_getLogs':
+                    return []
                 height = int(params[0], 16)
                 return {'number': hex(height),
                         'hash': '0x' + ('aa' if height == 100 else 'bb') * 32,
@@ -4292,6 +4312,37 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(ReorgDetected):
             asyncio.run(BlockScanner(Rpc(), store, {A: {}}, confirmations=0).scan_once())
         self.assertEqual(store.chain_cursor(), (100, '0x' + 'aa' * 32))
+        store.close()
+
+    def test_block_scanner_splits_ranges_the_rpc_refuses(self):
+        from smart_money.rpc import RpcError
+
+        class Rpc:
+            def __init__(self):
+                self.ranges = []
+
+            async def call(self, method, params=None):
+                if method == 'eth_blockNumber':
+                    return hex(108)
+                if method == 'eth_getLogs':
+                    start, end = int(params[0]['fromBlock'], 16), int(params[0]['toBlock'], 16)
+                    self.ranges.append((start, end))
+                    if end - start + 1 > 4:
+                        raise RpcError('query returned more than 10000 results')
+                    return []
+                height = int(params[0], 16)
+                return {'number': hex(height), 'hash': '0x' + format(height, '064x'),
+                        'parentHash': '0x' + format(height - 1, '064x'), 'timestamp': '0x64'}
+
+        store = Store(':memory:')
+        store.set_chain_cursor(100, '0x' + format(100, '064x'))
+        rpc = Rpc()
+        result = asyncio.run(BlockScanner(rpc, store, {A: {}}, confirmations=0, max_blocks=8).scan_once())
+        self.assertEqual(result.blocks, 8)
+        self.assertEqual(store.chain_cursor()[0], 108)
+        self.assertIn((101, 108), rpc.ranges)
+        self.assertIn((101, 104), rpc.ranges)
+        self.assertIn((105, 108), rpc.ranges)
         store.close()
 
     def test_reorg_preserves_intent_and_orphans_execution_evidence(self):
