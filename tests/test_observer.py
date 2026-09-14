@@ -78,11 +78,14 @@ from smart_money.paper import (
 from smart_money.paper_config import load_paper_config
 from smart_money.quotes import LiveQuoter, Quote, QuotePolicy, assess_quote, validate_quote
 from smart_money.receipts import (
-    BEFORE, DEPOSIT_RECORDED, SWAPS, TRANSFER, USEROP, TRADE_BEHAVIORS, enrich,
+    BEFORE, DEPOSIT_RECORDED, PONS_V2_SWAP, SWAPS, TRANSFER, USEROP, TRADE_BEHAVIORS,
+    enrich,
 )
 from smart_money.rpc import ReadOnlyRpc
 from smart_money.relay_api import RelayNotReady, RelayPublicClient
-from smart_money.solver import relay_delivery_evidence, relay_passive_buy
+from smart_money.solver import (
+    relay_confirmed_sell, relay_delivery_evidence, relay_passive_buy,
+)
 from smart_money.store import MAX_CANDIDATE_ATTEMPTS, Store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -4979,6 +4982,130 @@ class AggregatorExecutionTests(unittest.TestCase):
         self.assertEqual((status, route['protocol'], route['provider'], route['router']),
                          ('selected', 'kyber', 'kyber', R.KYBER_META_AGGREGATION_ROUTER_V2))
         store.close()
+
+
+class RelaySellConfirmationTests(unittest.TestCase):
+    """Relay-order confirmation of a sell whose venue emitted no recognised Swap."""
+
+    TX = "0x4a9fefb4d4ff4602715dcf2099636c5938473c24395ef0e3fe2c1d5f57a22d3f"
+    WALLET = "0x1cfbe3af88266ccca29372661f45261c7d19be09"
+    SOLD = "0xba1ad98f097c924c3b5894ae05ab363be3bc0c22"
+    ORDER = "0x8ea23cf693c029149424b3a175661a5fc45470edcc5000697d80f40e8ebef9fc"
+    DEBIT = "10446315194677918327013232"
+    DEPOSIT = "85841118"
+
+    def document(self):
+        return json.loads(
+            (ROOT / "data/relay_sell_evidence_2026-09-13.json").read_text())
+
+    def candidate(self, **overrides):
+        evidence = {
+            "source_orchestrator": "relay", "relay_deposit_order_id": self.ORDER,
+            "relay_deposit_path": "0", "relay_deposit_amount_raw": self.DEPOSIT,
+            "swap_event_count_in_scope": 0,
+            "wallet_erc20_deltas_raw": {self.SOLD: "-" + self.DEBIT, R.USDG: "0"},
+        }
+        evidence.update(overrides.pop("evidence", {}))
+        fields = dict(
+            stage="needs_review", execution_status="success", execution_success=True,
+            token_in=self.SOLD, token_out=R.USDG, amount_in_raw=self.DEBIT,
+            recipient=R.RELAY_ROUTER, protocol="kyber",
+            reasons=["relay_sell_evidence_not_uniquely_closed"], evidence=evidence)
+        fields.update(overrides)
+        wallet = fields.pop("wallet", self.WALLET)
+        return Signal(self.TX, wallet, "userop", "SELL", "0", B, "0xe21fd0e9", **fields)
+
+    def test_pons_swap_topic_counts_as_swap_event(self):
+        self.assertEqual(SWAPS[PONS_V2_SWAP], "pons_v2")
+        self.assertEqual(
+            PONS_V2_SWAP,
+            "0x8113d738abdcb6b38357e9d53a54a7157861a09031b453651f0fe7fe151f59df")
+        self.assertEqual(len(SWAPS), 4)
+
+    def test_relay_order_confirms_sell_among_bundled_requests(self):
+        document = self.document()
+        self.assertEqual(len(document["requests"]), 2)
+        confirmed = relay_confirmed_sell(document, self.candidate())
+        self.assertEqual(confirmed.stage, "relay_sell_evidenced")
+        self.assertEqual(confirmed.behavior, "SELL")
+        self.assertEqual(confirmed.amount_in_raw, self.DEBIT)
+        self.assertEqual(confirmed.amount_out_raw, self.DEPOSIT)
+        self.assertEqual(confirmed.evidence["actual_input_debit_raw"], self.DEBIT)
+        self.assertEqual(confirmed.evidence["actual_output_deposit_raw"], self.DEPOSIT)
+        self.assertEqual(confirmed.evidence["actual_output_credit_raw"], self.DEPOSIT)
+        self.assertEqual(confirmed.evidence["relay_order_id"], self.ORDER)
+        self.assertEqual(confirmed.evidence["relay_request_id"],
+                         "0x1789305280a526a5b4701bb239125232cd83126c7fede6012bf6b4b6293ab5b2")
+        self.assertEqual(confirmed.evidence["relay_destination_chain_id"], "792703809")
+        self.assertEqual(confirmed.evidence["relay_destination_amount_raw"], "85204699")
+        self.assertEqual(confirmed.evidence["relay_destination_recipient"],
+                         "4zFEFU8gtZ2uQVn3pkWLaD829a7gdxTsexGY89KePW3j")
+        self.assertNotIn("relay_sell_evidence_not_uniquely_closed", confirmed.reasons)
+        self.assertIn("relay_order_confirms_sell_without_recognized_swap_event",
+                      confirmed.reasons)
+        self.assertFalse(confirmed.copy_eligible)
+        # The original signal is untouched; the caller decides what to emit.
+        self.assertEqual(self.candidate().stage, "needs_review")
+
+    def test_relay_order_confirmation_rejects_every_identity_mismatch(self):
+        document = self.document()
+        cases = {
+            "not owned": dict(wallet="0xbb0d687957a43cf9046341ce697d7f45764368c3"),
+            "wallet debit does not match": dict(amount_in_raw="1"),
+            "not uniquely present": dict(evidence={
+                "relay_deposit_order_id": "0x" + "ab" * 32}),
+            "local deposit event": dict(evidence={"relay_deposit_amount_raw": "85841117"}),
+            "sold currency": dict(token_in=TOKEN, evidence={
+                "wallet_erc20_deltas_raw": {TOKEN: "-" + self.DEBIT}}),
+            "moved more than": dict(evidence={"wallet_erc20_deltas_raw": {
+                self.SOLD: "-" + self.DEBIT, TOKEN: "5"}}),
+            "not an unclosed": dict(reasons=["wallet_exchange_flows_not_closed"]),
+            "must debit one token into the USDG": dict(token_out=TOKEN),
+        }
+        for message, overrides in cases.items():
+            with self.subTest(message):
+                with self.assertRaisesRegex(ValueError, message):
+                    relay_confirmed_sell(document, self.candidate(**overrides))
+        forged = self.document()
+        forged["requests"][0]["data"]["inTxs"][0]["hash"] = "0x" + "cd" * 32
+        with self.assertRaisesRegex(ValueError, "input transaction"):
+            relay_confirmed_sell(forged, self.candidate())
+        forged = self.document()
+        forged["requests"][0]["protocol"]["deposit"]["origin"]["amount"] = "85841119"
+        with self.assertRaisesRegex(ValueError, "origin deposit|local deposit event"):
+            relay_confirmed_sell(forged, self.candidate())
+        forged = self.document()
+        forged["requests"][0]["data"]["metadata"]["currencyIn"]["amount"] = "1"
+        with self.assertRaisesRegex(ValueError, "sold currency"):
+            relay_confirmed_sell(forged, self.candidate())
+        forged = self.document()
+        forged["requests"][0]["status"] = "pending"
+        with self.assertRaisesRegex(ValueError, "not uniquely present"):
+            relay_confirmed_sell(forged, self.candidate())
+        with self.assertRaisesRegex(ValueError, "empty"):
+            relay_confirmed_sell({"requests": []}, self.candidate())
+
+    def test_relay_sell_closure_records_deposit_amount_for_later_confirmation(self):
+        signals = self.example_signals()
+        trade = next(item for item in signals if item.behavior == "SELL")
+        deposit = next(item for item in signals if item.behavior == "INTENT_DEPOSIT")
+        self.assertEqual(trade.evidence["relay_deposit_amount_raw"], deposit.amount_in_raw)
+
+    def example_signals(self):
+        watch = R.load_watchlist(ROOT / "data/fomo_watchlist.csv")
+        decoder = Decoder(watch, R.snapshot_delegations(ROOT / "data/account_codes.json"))
+        rows = json.loads((ROOT / "data/transaction_examples.json").read_text())
+        row = next(r for r in rows["examples"]
+                   if r["transaction"]["hash"].startswith("0x23419e"))
+        source = Transaction.from_rpc(row["transaction"])
+        return enrich(source, decoder.decode(source), row["receipt"], watch)
+
+    def test_relay_client_many_lookup_is_bounded(self):
+        client = RelayPublicClient()
+        with self.assertRaisesRegex(ValueError, "limit"):
+            client._lookup_many(self.TX, 0)
+        with self.assertRaisesRegex(ValueError, "invalid Relay"):
+            client._lookup_many("0x1234", 5)
 
 
 if __name__ == '__main__':

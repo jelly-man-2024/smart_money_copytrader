@@ -15,12 +15,16 @@ def topic(signature: str) -> str:
 
 
 TRANSFER = topic("Transfer(address,address,uint256)")
+PONS_V2_SWAP = "0x8113d738abdcb6b38357e9d53a54a7157861a09031b453651f0fe7fe151f59df"
 USEROP = topic("UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)")
 BEFORE = topic("BeforeExecution()")
 SWAPS = {
     topic("Swap(address,uint256,uint256,uint256,uint256,address)"): "v2",
     topic("Swap(address,address,int256,int256,uint160,uint128,int24)"): "v3",
     topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)"): "v4",
+    # Pons V2 pools (factory 0x7ed598bc...) emit their own Swap signature:
+    # two indexed addresses plus amountIn, amountOut, fee and a reserved word.
+    PONS_V2_SWAP: "pons_v2",
 }
 DEPOSIT_RECORDED = "0x49fed1d0b752ce30eee63c7a81133f3363b532fec5d4d7dd1ccfd005de4555e1"
 TRADE_BEHAVIORS = {"BUY", "SELL", "TOKEN_SWAP"}
@@ -290,6 +294,13 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
             actual_input = -int(net.get(signal.token_in, "0"))
         except (TypeError, ValueError):
             actual_input = 0
+        if (len(deposits) == 1
+                and deposits[0].evidence.get("solver_order_status") == "source_deposit_evidenced"
+                and deposits[0].evidence.get("order_id") == signal.evidence.get("relay_deposit_order_id")
+                and deposits[0].token_in == signal.token_out and deposits[0].amount_in_raw):
+            # Keep the proven depository amount even when the swap itself stays
+            # unproven, so a later Relay-order confirmation can cross-check it.
+            signal.evidence["relay_deposit_amount_raw"] = deposits[0].amount_in_raw
         if (signal.execution_status != "success" or len(deposits) != 1
                 or deposits[0].evidence.get("solver_order_status") != "source_deposit_evidenced"
                 or deposits[0].evidence.get("order_id") != signal.evidence.get("relay_deposit_order_id")

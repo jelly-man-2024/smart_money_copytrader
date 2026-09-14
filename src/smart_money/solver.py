@@ -213,3 +213,136 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
     })
     result.copy_eligible = False
     return result
+
+
+def relay_confirmed_sell(document: dict, candidate: Signal) -> Signal:
+    """Close one Relay-orchestrated SELL from the Relay order when no swap event
+    was recognised locally.
+
+    The local receipt already proves the wallet's token debit and the USDG deposit
+    into the Relay depository under one order id; what it could not prove is that
+    the debit was a swap rather than an arbitrary transfer (the venue emitted an
+    unknown event). Relay's own request for that order states which token and
+    amount the user sold and how much USDG the deposit carried. Only a request
+    whose user, order id, origin deposit, sold currency and input transaction all
+    equal the local evidence is accepted; several users can share one bundled
+    transaction, so the response is filtered rather than assumed unique.
+    """
+    if (candidate.behavior != "SELL" or candidate.stage != "needs_review"
+            or candidate.protocol not in {"0x", "kyber"}
+            or candidate.evidence.get("source_orchestrator") != "relay"
+            or candidate.execution_status != "success"
+            or candidate.execution_success is not True
+            or "relay_sell_evidence_not_uniquely_closed" not in candidate.reasons):
+        raise ValueError("signal is not an unclosed successful relay sell")
+    order_id = str(candidate.evidence.get("relay_deposit_order_id", "")).lower()
+    if len(order_id) != 66 or not order_id.startswith("0x"):
+        raise ValueError("relay sell has no deposit order id")
+    if not candidate.token_in or candidate.token_out != R.USDG:
+        raise ValueError("relay sell must debit one token into the USDG deposit")
+    deltas = candidate.evidence.get("wallet_erc20_deltas_raw", {})
+    try:
+        debit = -int(deltas.get(candidate.token_in, "0"))
+        declared = int(candidate.amount_in_raw or "0")
+    except (TypeError, ValueError):
+        raise ValueError("relay sell wallet debit is invalid") from None
+    if debit <= 0 or debit != declared:
+        raise ValueError("relay sell wallet debit does not match the declared amount")
+    for token, raw in deltas.items():
+        try:
+            amount = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if amount != 0 and token.lower() != candidate.token_in:
+            raise ValueError("relay sell wallet moved more than the sold token")
+
+    requests = document.get("requests")
+    if not isinstance(requests, list) or not requests:
+        raise ValueError("relay order response is empty")
+    matches = []
+    for request in requests:
+        if not isinstance(request, dict) or request.get("status") != "success":
+            continue
+        protocol = request.get("protocol", {})
+        if str(protocol.get("orderId", "")).lower() != order_id:
+            continue
+        matches.append(request)
+    if len(matches) != 1:
+        raise ValueError("relay order id is not uniquely present in the response")
+    request = matches[0]
+    checked_order_id, request_id = _request_identity(request)
+    if checked_order_id != order_id:
+        raise ValueError("relay order identity mismatch")
+    metadata = request.get("data", {}).get("metadata", {})
+    if (str(request.get("user", "")).lower() != candidate.wallet
+            or str(metadata.get("sender", "")).lower() != candidate.wallet):
+        raise ValueError("relay request is not owned by the candidate wallet")
+    protocol = request.get("protocol", {})
+    origin = protocol.get("deposit", {}).get("origin", {})
+    try:
+        deposit_amount = int(origin.get("amount", "0"))
+    except (TypeError, ValueError):
+        raise ValueError("relay origin amount is invalid") from None
+    expected_origin = {
+        "chainId": candidate.chain_id, "currency": candidate.token_out,
+        "depositor": candidate.wallet, "depository": R.DEPOSITORY,
+        "transactionId": candidate.tx_hash,
+    }
+    if deposit_amount <= 0 or any(
+            str(origin.get(key, "")).lower() != str(value).lower()
+            for key, value in expected_origin.items()):
+        raise ValueError("relay origin deposit does not match the local receipt")
+    if str(candidate.evidence.get("relay_deposit_amount_raw")) != str(deposit_amount):
+        raise ValueError("relay origin amount does not match the local deposit event")
+    currency_in = metadata.get("currencyIn", {})
+    sold = currency_in.get("currency", {})
+    try:
+        sold_amount = int(currency_in.get("amount", "0"))
+    except (TypeError, ValueError):
+        raise ValueError("relay sold amount is invalid") from None
+    if (sold.get("chainId") != candidate.chain_id
+            or str(sold.get("address", "")).lower() != candidate.token_in
+            or sold_amount != debit):
+        raise ValueError("relay sold currency does not match the wallet debit")
+    in_txs = request.get("data", {}).get("inTxs", [])
+    if (len(in_txs) != 1
+            or str(in_txs[0].get("hash", "")).lower() != candidate.tx_hash
+            or in_txs[0].get("chainId") != candidate.chain_id
+            or in_txs[0].get("status") != "success"):
+        raise ValueError("relay input transaction is not uniquely this sell")
+    currency_out = metadata.get("currencyOut", {})
+    destination = currency_out.get("currency", {})
+    destination_chain = destination.get("chainId")
+    destination_currency = _opaque(destination.get("address"), "destination currency", 128)
+    try:
+        destination_amount = int(currency_out.get("amount", "0"))
+    except (TypeError, ValueError):
+        raise ValueError("relay destination amount is invalid") from None
+    if (not isinstance(destination_chain, int) or destination_amount <= 0
+            or destination_amount > deposit_amount):
+        raise ValueError("relay destination settlement is not a plausible payout")
+
+    result = deepcopy(candidate)
+    result.stage = "relay_sell_evidenced"
+    result.amount_out_raw = str(deposit_amount)
+    result.reasons = [
+        reason for reason in result.reasons
+        if reason != "relay_sell_evidence_not_uniquely_closed"
+    ] + [
+        "relay_order_confirms_sell_without_recognized_swap_event",
+        "relay_destination_chain_not_independently_rechecked",
+        "relay_source_deposit_is_not_destination_finality_or_trade_approval",
+    ]
+    result.evidence.update({
+        "relay_order_id": order_id, "relay_request_id": request_id,
+        "actual_input_debit_raw": str(debit),
+        "actual_output_deposit_raw": str(deposit_amount),
+        "actual_output_credit_raw": str(deposit_amount),
+        "relay_destination_chain_id": str(destination_chain),
+        "relay_destination_currency": destination_currency,
+        "relay_destination_amount_raw": str(destination_amount),
+        "relay_destination_recipient": _opaque(request.get("recipient"), "recipient", 128),
+        "order_attribution": "relay_api_order_and_local_deposit_exact_match",
+    })
+    result.copy_eligible = False
+    return result

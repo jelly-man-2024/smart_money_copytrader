@@ -125,6 +125,26 @@ enabled 关系里的聪明钱，CSV 观察地址继续只走实时 feed。父哈
 活动周期时才自动创建一个；新增 relationship 会在同一周期初始化自己的额度。修改额度会保留已有
 invested/reserved 数值，若新上限低于已占用额度则启动失败，不会偷偷清零。
 
+### Relay 跨链卖出的订单确认
+
+Fomo 聪明钱的卖出经 Relay 编排：本链用 0x/Kyber 把代币换成 USDG 后存入 Relay Depository，
+USDG 再桥到聪明钱的 Solana 地址。回执规则只有在"代币支出、唯一存款订单、范围内至少一个已识别
+Swap 事件"同时成立时才给出 `relay_sell_evidenced`；若卖出发生在事件签名未知的池子（例如 Pons V2
+池，其 Swap topic `0x8113d738…59df` 已加入识别表），信号会停在 `needs_review` 并带
+`relay_sell_evidence_not_uniquely_closed`。
+
+对这类信号，receipt 工作线程会用交易哈希查询 Relay 公共接口 `requests/v2`（同一笔打包交易可能返回
+多个用户的订单，因此按订单号筛选而不是假设唯一），只在下列全部成立时把信号升级为
+`relay_sell_evidenced`：订单 `status=success`；`user` 与 `data.metadata.sender` 都是该聪明钱；
+`protocol.orderId` 等于本地存款事件的订单号；`protocol.deposit.origin` 的链、币种（USDG）、存款人、
+Depository、交易哈希与本地回执一致，金额等于本地存款事件金额；`data.metadata.currencyIn` 的代币和数量
+等于钱包的代币支出；`inTxs` 只有这一笔交易且成功。升级后 `amount_out_raw` 取存款金额，证据新增
+`relay_request_id`、`relay_destination_chain_id/currency/amount_raw/recipient`，reasons 携带
+`relay_order_confirms_sell_without_recognized_swap_event`。Relay 尚未返回订单时事件为
+`relay_lookup_pending` 并按候选重试；不一致时事件为 `relay_sell_confirmation_rejected`，信号保持
+`needs_review`。心跳计数器 `relay_sell_confirmed` 统计成功升级次数。该路径与本地路由发现一致：
+升级后仍需 follower 侧有可用的本地或聚合器卖出路径才会真正跟卖。
+
 ## 停止控制
 
 任一层都应 fail closed：

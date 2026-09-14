@@ -624,3 +624,19 @@ Router；聚合器买入的 lot 卖出时同样走 Kyber。运维手册"执行�
 `final_review.released_nonce`），事件 `live_execution_abandoned` 携带原因；`copy_execution_error` 和
 `paper_decisions.payload.quote_error` 现在保存具体错误文本。本机账本中 3 条残留已按此清理，审计
 healthy。188/188 unittest、pip check、13 笔回放、diff check 通过。
+
+## 2026-09-14 Relay 订单确认跨链卖出与 Pons Swap 识别
+
+操作员截图核实两个问题：跟卖弱、回补落后。回补已改为地址过滤的范围日志扫描（c749bfa）。跟卖弱的
+根因是聪明钱 `0x1cfbe3af…9be09` 在 Pons V2 池（factory `0x7ed598bc…ec7e`，池
+`0x9febd871…2c0b`）卖出，该池 Swap 事件签名不在识别表，信号停在 `needs_review`
+（`relay_sell_evidence_not_uniquely_closed`），而 Relay 订单显示 USDG 已桥到该聪明钱固定的 Solana
+地址 `4zFEFU8g…PW3j`。操作员确认这类跨链卖出应视为聪明钱卖出。
+
+实现：`receipts.SWAPS` 加入 Pons V2 Swap topic；`RelayPublicClient.lookup_requests_by_hash` 允许
+同一哈希返回多个订单；`solver.relay_confirmed_sell` 按订单号、用户、存款来源、卖出币种数量、输入交易
+逐项与本地回执比对后才升级为 `relay_sell_evidenced`；回执规则在未闭合时也记录
+`relay_deposit_amount_raw` 供交叉校验；`sm-copy run` 的 receipt 工作线程对未闭合 Relay 卖出自动
+查询并升级，事件 `relay_sell_order_confirmed` / `relay_sell_confirmation_rejected` /
+`relay_lookup_pending`，计数器 `relay_sell_confirmed`。真实样本
+`data/relay_sell_evidence_2026-09-13.json`（含另一用户的打包订单）作为测试夹具。196/196 unittest。

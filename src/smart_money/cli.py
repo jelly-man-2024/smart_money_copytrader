@@ -52,7 +52,7 @@ from .registry import (
 )
 from .rpc import ReadOnlyRpc, RpcError
 from .relay_api import RelayApiError, RelayNotReady, RelayPublicClient
-from .solver import relay_passive_buy
+from .solver import relay_confirmed_sell, relay_passive_buy
 from .store import Store
 
 
@@ -432,6 +432,7 @@ async def monitor(args):
         "live_confirmed", "live_reverted", "live_orphaned", "live_errors",
         "live_settled", "live_approval_broadcast", "live_approval_confirmed",
         "relay_lookup_pending", "relay_lookup_errors", "relay_buy_associated",
+        "relay_sell_confirmed",
         "local_v3_routes_verified",
     ):
         stats[name] = 0
@@ -836,6 +837,50 @@ async def monitor(args):
                             except (RelayApiError, RpcError, ValueError) as exc:
                                 stats["relay_lookup_errors"] += 1
                                 report("relay_buy_auto_association_rejected",
+                                       source_event_id=signal.event_id,
+                                       error_type=type(exc).__name__, live_trading=False)
+                        if (relay_client is not None
+                                and signal.behavior == "SELL"
+                                and signal.stage == "needs_review"
+                                and signal.protocol in {"0x", "kyber"}
+                                and signal.evidence.get("source_orchestrator") == "relay"
+                                and "relay_sell_evidence_not_uniquely_closed"
+                                in signal.reasons):
+                            try:
+                                document = await relay_client.lookup_requests_by_hash(
+                                    signal.tx_hash)
+                                confirmed = relay_confirmed_sell(document, signal)
+                                try:
+                                    confirmed.evidence["local_execution_route"] = \
+                                        await discover_v3_execution_route(
+                                            rpc, receipt, confirmed.token_in,
+                                            confirmed.token_out,
+                                            confirmed.evidence.get(
+                                                "actual_output_credit_raw"))
+                                    stats["local_v3_routes_verified"] += 1
+                                except (RpcError, ValueError) as exc:
+                                    report("local_execution_route_not_in_receipt",
+                                           source_event_id=confirmed.event_id,
+                                           error_type=type(exc).__name__,
+                                           active_discovery_deferred=True,
+                                           live_trading=False)
+                                emit(store, confirmed)
+                                observed = confirmed
+                                stats["relay_sell_confirmed"] += 1
+                                stats["receipt_relay_sell_evidenced"] += 1
+                                report("relay_sell_order_confirmed",
+                                       source_event_id=confirmed.event_id,
+                                       relay_order_id=confirmed.evidence.get("relay_order_id"),
+                                       swap_event_count_in_scope=confirmed.evidence.get(
+                                           "swap_event_count_in_scope"),
+                                       live_trading=False)
+                            except RelayNotReady:
+                                stats["relay_lookup_pending"] += 1
+                                defer_completion = True
+                                continue
+                            except (RelayApiError, RpcError, ValueError) as exc:
+                                stats["relay_lookup_errors"] += 1
+                                report("relay_sell_confirmation_rejected",
                                        source_event_id=signal.event_id,
                                        error_type=type(exc).__name__, live_trading=False)
                         route_before = observed.evidence.get("local_execution_route")
