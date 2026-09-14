@@ -499,6 +499,14 @@ async def monitor(args):
                             report("live_settlement_error", proposal_id=proposal_id,
                                    tx_hash=observation.tx_hash,
                                    error_type=type(exc).__name__, live_trading=True)
+                    elif observation.status == "reverted":
+                        # The nonce was consumed and gas paid, but no assets moved;
+                        # the proposal cannot fill any more, so its budget goes back.
+                        released = store.cancel_paper_proposal(
+                            proposal_id, "live_execution_reverted")
+                        report("live_execution_reverted_released", proposal_id=proposal_id,
+                               tx_hash=observation.tx_hash, proposal_released=released,
+                               live_trading=True)
                     return
                 stats["live_pending"] += observation.status == "observed_pending"
             except Exception as exc:
