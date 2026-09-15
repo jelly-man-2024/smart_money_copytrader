@@ -80,6 +80,32 @@ class EarlyRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.execute.assert_awaited_once()
         self.assertEqual(self.store.paper_proposal(pid)["status"], "reserved")
 
+    async def test_wrapper_handoff_keeps_periodic_code_provenance_and_live_revocation(self):
+        from test_deployment_monitor import DeploymentMonitorTests
+        f = DeploymentMonitorTests()
+        f.setUp()
+        await f.monitor.check_once()
+        self.runtime.deployment_monitor = f.monitor
+        self.policy.wallet = f.wallet
+        self.f.quoter.quote_with_reference.return_value = (
+            replace(self.f.quote, input_asset=f.c.token_in, output_asset=f.c.token_out),
+            replace(self.f.reference, input_asset=f.c.token_in, output_asset=f.c.token_out), "1")
+        evidence = {"candidates": [{"recognized_intent": True, "candidate": f.c.to_dict(),
+                                    "snapshots": f.observations()}]}
+        await self.runtime(f.tx, evidence)
+        self.execute.assert_awaited_once()
+        _, signal, pid = self.execute.call_args.args
+        verification = self.store.paper_proposal(pid)["attribution"]["early_deployment_verification"]
+        self.assertEqual(verification["validation_mode"], "periodic_monitor")
+        self.assertEqual(verification["observed_at"], 90.)
+        intent = self.execute.call_args.kwargs["early_intent"]
+        intent.revalidate(104.)
+        check_early_execution_source(self.store, intent, signal, self.store.paper_proposal(pid), now=104.)
+        f.code = "0x"
+        await f.monitor.check_once()
+        with self.assertRaisesRegex(ValueError, "deployment_code_changed"):
+            check_early_execution_source(self.store, intent, signal, self.store.paper_proposal(pid), now=104.)
+
     async def test_unprepared_failure_releases_budget_for_strict_fallback(self):
         self.execute.side_effect = ValueError("early_allowance_insufficient_strict_fallback")
         await self.runtime(self.f.tx, self.result)
@@ -144,6 +170,6 @@ class EarlyRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prepared.nonce, 0)
             self.assertFalse(review.evidence["broadcast_performed"])
             with self.assertRaises(ValueError):
-                await reviewer.review(signal, pid, signed.raw_transaction, now=104, early_intent=intent)
+                await reviewer.review(signal, pid, signed.raw_transaction, now=106.001, early_intent=intent)
         with self.assertRaises(ValueError):
             check_early_execution_source(self.store, None, signal, self.store.paper_proposal(pid), 100.1)

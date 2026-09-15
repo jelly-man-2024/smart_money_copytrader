@@ -8,6 +8,8 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
+from .simulation_diagnostics import rpc_error_diagnostic
+
 
 ALLOWED_METHODS = frozenset({
     "eth_chainId", "eth_blockNumber", "eth_getCode", "eth_getTransactionByHash",
@@ -18,7 +20,9 @@ ALLOWED_METHODS = frozenset({
 
 
 class RpcError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, diagnostic: dict | None = None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class ReadOnlyRpc:
@@ -42,7 +46,11 @@ class ReadOnlyRpc:
             if result.get("id") != request_id:
                 raise RpcError("RPC response id mismatch")
             if "error" in result:
-                raise RpcError(f"RPC {method} error code {result['error'].get('code', 'unknown')}")
+                diagnostic = rpc_error_diagnostic(method, result["error"], self.url)
+                code = diagnostic["code"]
+                raise RpcError(
+                    f"RPC {method} error code {code if code is not None else 'unknown'}",
+                    diagnostic=diagnostic)
             if "result" not in result:
                 raise RpcError("RPC result missing")
             return result["result"]
@@ -50,7 +58,10 @@ class ReadOnlyRpc:
             raise
         except Exception as exc:
             # Do not leak provider credentials embedded in URLs or response bodies.
-            raise RpcError(f"RPC transport failure: {type(exc).__name__}") from None
+            raise RpcError(f"RPC transport failure: {type(exc).__name__}", diagnostic={
+                "kind": "transport_or_response_error", "code": None,
+                "exception_type": type(exc).__name__,
+            }) from None
 
     async def call(self, method: str, params: list | None = None):
         if method not in ALLOWED_METHODS:

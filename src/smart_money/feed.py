@@ -15,6 +15,7 @@ from .registry import CHAIN_ID
 
 MAX_PAYLOAD = 8 * 1024 * 1024
 MAX_TRANSACTIONS = 10000
+DEFAULT_FEED_MAX_AGE_SECONDS = 3.0
 
 
 class DecodeError(ValueError):
@@ -95,7 +96,7 @@ def decode_raw(raw: bytes, **metadata) -> Transaction:
 
 @dataclass
 class FeedHealth:
-    max_age_seconds: float = 3.0
+    max_age_seconds: float = DEFAULT_FEED_MAX_AGE_SECONDS
     max_silence_seconds: float = 5.0
     last_sequence: int | None = None
     last_timestamp: int | None = None

@@ -112,13 +112,16 @@ def _planned_amount(c, policy, portfolio, attribution):
     return amount, principal
 
 
-def evaluate_candidate(c: Candidate, at: float, snapshots: dict, enabled=False) -> dict:
+def evaluate_candidate(c: Candidate, at: float, snapshots: dict, enabled=False,
+                       *, feed_max_age_seconds=3.0, deployment_monitor=None) -> dict:
     """Enable only the OFFLINE evaluator. Result never grants live eligibility.
 
     Supplied snapshots are trusted recorded inputs, not authenticated by this
     function. Missing historical context is not replaced by today's state.
     """
     at = timestamp(at)
+    if type(feed_max_age_seconds) not in (int, float) or not 0 < feed_max_age_seconds <= 6:
+        raise ValueError("invalid_feed_max_age_seconds")
     checks, details = {}, {}
 
     def check(name, fn):
@@ -142,7 +145,8 @@ def evaluate_candidate(c: Candidate, at: float, snapshots: dict, enabled=False) 
         if c.received_at is None or c.feed_timestamp is None:
             raise MissingEvidence("feed_timing_missing")
         received, source = timestamp(c.received_at), timestamp(c.feed_timestamp)
-        if not source <= received <= at or at - source > 3 or at - received > 3:
+        if (not source <= received <= at or at - source > feed_max_age_seconds
+                or at - received > feed_max_age_seconds):
             raise ValueError("feed_intent_expired")
         if c.side == "BUY" and uint(c.metadata["permit_deadline"]) < at:
             raise ValueError("permit_expired")
@@ -153,7 +157,11 @@ def evaluate_candidate(c: Candidate, at: float, snapshots: dict, enabled=False) 
                            if c.blockers else {"status": "pass"})
 
     def deployment():
-        state = _snapshot(snapshots, "deployment", at, 3)
+        if deployment_monitor is not None:
+            deployment_monitor.require_ready()
+        # Only the explicitly injected runtime monitor removes the deployment
+        # TTL. Historical replay and account/market/portfolio TTLs are unchanged.
+        state = _snapshot(snapshots, "deployment", at, 3 if deployment_monitor is None else None)
         hash32(state.payload.get("block_hash"))
         result = verify_deployment(state.payload)
         return {**result, "block_hash": state.payload["block_hash"],

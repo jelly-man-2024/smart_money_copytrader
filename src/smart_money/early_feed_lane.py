@@ -15,6 +15,7 @@ import time
 from . import registry as R
 from .early_intent import parse_candidates
 from .early_replay import evaluate_candidate
+from .early_timing import EARLY_FEED_MAX_AGE_SECONDS
 from .relay_race import RACE_ADDRESS, RACE_RULE
 
 
@@ -55,14 +56,16 @@ def fresh_feed(tx, now):
             and type(tx.received_at) in (int, float) and math.isfinite(tx.received_at)
             and type(tx.timestamp) in (int, float) and math.isfinite(tx.timestamp)
             and tx.timestamp <= tx.received_at <= now
-            and now - tx.received_at <= 3 and now - tx.timestamp <= 3)
+            and now - tx.received_at <= EARLY_FEED_MAX_AGE_SECONDS
+            and now - tx.timestamp <= EARLY_FEED_MAX_AGE_SECONDS)
 
 
 class EarlyEvidenceResolver:
     """Uses existing read-only clients; never creates a Feed subscription."""
-    def __init__(self, rpc, relay, wallets):
+    def __init__(self, rpc, relay, wallets, *, deployment_monitor=None):
         self.rpc, self.relay = rpc, relay
         self.wallets = tuple(wallets)
+        self.deployment_monitor = deployment_monitor
 
     async def _code(self, wallet, deployment=False):
         block = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
@@ -98,21 +101,30 @@ class EarlyEvidenceResolver:
                     except Exception as exc:
                         errors[name] = type(exc).__name__
                 jobs = []
-                initial = evaluate_candidate(candidate, time.time(), {}, enabled=False)
+                initial = evaluate_candidate(candidate, time.time(), {}, enabled=False,
+                                             feed_max_age_seconds=EARLY_FEED_MAX_AGE_SECONDS)
                 if (not candidate.blockers and fresh_feed(tx, time.time())
                         and initial["checks"]["freshness"]["status"] == "pass"):
                     if candidate.side == "BUY":
                         jobs.append(capture("order", lambda: self.relay.lookup_by_order(
                             candidate.order_id, candidate.metadata.get("request_hint"))))
                         if candidate.route_kind == "relay_wrapper":
-                            jobs.append(capture("deployment", lambda: self._code(RACE_ADDRESS, True)))
+                            if self.deployment_monitor is None:
+                                jobs.append(capture("deployment", lambda: self._code(RACE_ADDRESS, True)))
+                            else:
+                                try:
+                                    snapshots["deployment"] = self.deployment_monitor.snapshot()
+                                except ValueError as exc:
+                                    errors["deployment"] = str(exc)
                     else:
                         jobs.append(capture("account", lambda: self._code(wallet)))
                 # No cancellation/replacement of blocking HTTP threads on timeout:
                 # transport timeouts bound workers; late results cannot qualify.
                 await asyncio.gather(*jobs)
                 checked_at = time.time()
-                evaluation = evaluate_candidate(candidate, checked_at, snapshots, enabled=False)
+                evaluation = evaluate_candidate(candidate, checked_at, snapshots, enabled=False,
+                                                feed_max_age_seconds=EARLY_FEED_MAX_AGE_SECONDS,
+                                                deployment_monitor=self.deployment_monitor)
                 required = ["freshness", "semantics", "attribution"]
                 if candidate.route_kind == "relay_wrapper":
                     required.append("deployment")
@@ -122,6 +134,7 @@ class EarlyEvidenceResolver:
                                 "checks": evaluation["checks"], "errors": errors,
                                 "copy_eligible": False, "live_handoff": "not_connected"})
         return {"candidates": results, "parse_rejections": rejections, "copy_eligible": False,
+                "feed_max_age_seconds": EARLY_FEED_MAX_AGE_SECONDS,
                 "recognized_count": sum(r["recognized_intent"] for r in results)}
 
 

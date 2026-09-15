@@ -1,7 +1,7 @@
 """Synthetic offline checks; no keys, RPC or real trading."""
 from dataclasses import asdict, replace
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from test_early_feed import samples, snapshot, order_for, A
 from smart_money import registry as R
@@ -80,7 +80,7 @@ class EarlyDecisionTests(IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "already_consumed"):
             await self.evaluate()
         with self.assertRaises(ValueError):
-            self.intent.revalidate(104)
+            self.intent.revalidate(106.001)
 
     async def test_bad_quote_and_reference_rejected(self):
         for quote, reference in [(replace(self.quote, output_asset=A), self.reference),
@@ -90,6 +90,50 @@ class EarlyDecisionTests(IsolatedAsyncioTestCase):
             self.quoter.quote_with_reference.return_value = (quote, reference, "1")
             with self.assertRaises(ValueError):
                 await self.evaluate()
+
+    async def test_runtime_intent_accepts_six_seconds_but_not_beyond(self):
+        for at in (103.001, 105, 106):
+            with self.subTest(at=at):
+                self.intent.revalidate(at)
+        with self.assertRaisesRegex(ValueError, "feed_intent_expired"):
+            self.intent.revalidate(106.001)
+        self.assertEqual(self.intent.quote_signal(105).evidence["feed_max_age_seconds"], 6)
+
+    async def test_offline_replay_keeps_original_three_second_default(self):
+        from smart_money.early_replay import evaluate_candidate
+        self.assertEqual(evaluate_candidate(self.c, 104, self.observations)
+                         ["checks"]["freshness"]["reason"], "feed_intent_expired")
+        for invalid in (True, 0, -1, 6.001, float("nan"), float("inf"), "6"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                evaluate_candidate(self.c, 104, self.observations, feed_max_age_seconds=invalid)
+
+    async def test_execution_boundary_revalidates_six_second_limit(self):
+        from smart_money.execution_pipeline import check_early_execution_source
+        store = MagicMock()
+        store.connection.execute.return_value.fetchall.return_value = []
+        signal = self.intent.quote_signal(100)
+        proposal = dict(source_tx_hash=self.c.tx_hash, input_asset=self.c.token_in,
+                        output_asset=self.c.token_out, proposal_id="synthetic", status="reserved",
+                        attribution=dict(early_trial_id="synthetic", smart_wallet=self.c.wallet,
+                                         copy_operation_order_id=self.c.order_id))
+        for at in (104, 106):
+            check_early_execution_source(store, self.intent, signal, proposal, now=at)
+        store._check_early_trial.assert_called_with(proposal["attribution"], 106)
+        with self.assertRaisesRegex(ValueError, "feed_intent_expired"):
+            check_early_execution_source(store, self.intent, signal, proposal, now=106.001)
+
+    async def test_six_second_intent_still_needs_fresh_quote_and_portfolio(self):
+        self.policy["observed_at"] = self.portfolio["observed_at"] = 104
+        self.quoter.quote_with_reference.return_value = (
+            replace(self.quote, observed_at=104), replace(self.reference, observed_at=104), "1")
+        result = await self.engine.evaluate(self.intent, self.policy, self.portfolio, now=105)
+        self.assertTrue(result["decision_checks_passed"])
+        self.quoter.quote_with_reference.return_value = (self.quote, self.reference, "1")
+        with self.assertRaisesRegex(ValueError, "quote_missing_or_expired"):
+            await self.engine.evaluate(self.intent, self.policy, self.portfolio, now=105)
+        self.portfolio["observed_at"] = 100
+        with self.assertRaisesRegex(ValueError, "snapshot expired"):
+            await self.engine.evaluate(self.intent, self.policy, self.portfolio, now=105)
 
     async def test_proportional_buy_uses_order_payment_not_destination_actual(self):
         self.policy["buy_rule"] = {"mode": "proportional", "ratio_ppm": 100}

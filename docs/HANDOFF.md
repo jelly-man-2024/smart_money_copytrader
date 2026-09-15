@@ -2,6 +2,128 @@
 
 历史交接记录起始于 2026-09-12，后续进展按日期追加。
 
+## 2026-09-15 部署代码后台检查（已实现，未重启）
+
+按用户明确选择，把部署代码检查与交易时效解耦，不引入缓存最长有效期。新增
+`deployment_monitor.py`，仅在 monitor/run 启用提前通道时创建同进程后台任务，不新增 Feed、
+进程或数据库表。第一次检查在提前 worker 启动前进行，之后每轮结束等待 30 秒再检查；
+复用既有受限 RPC，查询 chain ID、latest 块及 blockHash/requireCanonical 对应的 code。
+RPC 自身超时仍有界，单任务串行检查，不因超时创建并行替代请求。
+
+范围仅为 `relay_race.py` 已登记的包装器 `0x039ec98a76f111092d4751365ff09dd2aec301e8`，
+固定 4721 bytes/Keccak/rule；不是任意 Relay Proxy、账户委托或内层 Router 的升级监控。
+沿用公开证据 `data/relay_race_runtime_2026-09-14.json` 和原 EVM 测试，不声称取得验证源码或
+完成升级能力审计。没有开放新的代码版本；要支持其他代理/实现须另做适配。
+
+- 首次未取得有效代码：该包装提前路径不开放，其他路径及严格后备继续原规则；后台继续尝试。
+- 验证通过：候选读取缓存，保存完整证据副本；后续决策/构建/签名/发送仍重验本地语义和停用状态，
+  不再调用部署 RPC，也不按部署快照年龄拒绝。不能重置或伪造原采集时间。
+- 请求失败/畸形响应/错误链：`deployment_check_failed` 仅记录异常类型、连续失败数和距上次成功
+  时间，不输出 RPC URL/错误原文，继续保留已有验证结果。连续失败可能无限延长变化盲区，
+  是用户接受的策略，不是假设“查询失败则交易必然失败”。
+- 成功取得但代码不匹配（含空代码）：`deployment_code_changed` 将该路径锁为停用，旧意向的
+  后续执行复核同样拒绝。后续即使恢复原哈希也不自动解锁；需人工复核后重启。不会自动适配新代码。
+- 通过日志 `deployment_check_passed`、锁定后日志 `deployment_check_still_disabled`；启动和 health
+  的 `deployment_verification` 报告状态。停止 monitor 时回收后台任务。
+- 提案归因新增 `early_deployment_verification`：所用原始 code hash、rule、区块、采集时间、
+  provenance、validation_mode；完整代码仍在 early_feed_jobs 快照，现有源失败/不匹配归因照常。
+  这些字段支持追溯，并不能仅凭代码变化就证明某一笔误跟。
+
+历史回放及未注入监控器的离线入口仍保留部署快照 3 秒规则，不把当前缓存回填旧交易。
+Feed 6 秒、SELL 账户委托 3 秒、报价/策略/持仓、permit、预算、trial、防重和模拟均未放宽。
+新增 11 项离线测试及已有 monitor 接线断言，覆盖首次失败后恢复、连续失败保留、代码变化
+撤销已有意向/锁定、旧快照复用无 RPC、未来/篡改证据拒绝、历史和账户 TTL、定时/关闭及归因入库。
+本轮不改变运行进程、生产配置/数据，不重启、不提交推送、不签名广播；需操作员后续重启加载。
+不能把取消部署 TTL 当成已经解决另一笔 Kyber `Call failed` 模拟回滚。
+验证结果：394 项全部通过（使用既有临时 EVM 依赖）；普通虚拟环境同为 394 项，跳过 12 项
+可选 EVM 测试。pip check、compileall、git diff --check 均通过；没有使用主网调用作为测试。
+
+## 2026-09-15 提前意向窗口改为 6 秒（尚未重启）
+
+用户最终明确选择 6 秒，不是此前讨论的 5 秒。`early_timing.py` 集中定义运行时提前意向年龄，
+同一 Feed 接收入口（启用提前通道时）、队列、识别及 VerifiedFeedIntent 重验统一使用该值。
+决策/构建/签名前/广播前继续调用原重验接口，未删除检查。源时间及本地收到时间均须在窗口内，
+不把本地接收时刻重置为源时间。普通观察器与严格分支的旧 feed_intent shadow 仍为 3 秒；
+离线历史 evaluate_candidate 默认仍为 3 秒，运行时显式传 6，避免改变旧回放口径。
+
+报价 TTL、账户/部署快照与策略/持仓快照 TTL、滑点、permit deadline、健康静默时间、预算及
+24 小时/100 次提前广播上限均不变。快照过期仍会单独拒绝，不承诺 6 秒以内必能发送。
+新提案记录 early_feed_max_age_seconds、early_feed_timestamp、early_decision_exceeds_3s，
+最后一项只表示决策时年龄超过旧门槛，不代表实际广播。新启动事件报告 early_feed_max_age_seconds。
+本轮没有重放旧失败提案、重建 trial、改变生产配置或预算，也没有停启运行中的实盘程序。
+重启须沿用原 trial，由操作员执行；不要将代码修改当成运行进程已加载新阈值。
+
+新增 6 项离线回归覆盖恰好 6 秒、超过 6 秒、双时钟/未来时间、识别接线、执行边界复核、
+旧离线默认 3 秒以及报价/快照 TTL 不变。其余旧历史记录保持原时点语义。
+全量 383 项测试通过（使用既有临时可选 EVM 依赖）；普通虚拟环境为 383 项、跳过 12 项，
+pip check、compileall、diff check 通过。只读重启前审计 healthy=true、prepared=0、
+signed/pending/orphaned attempt 均为 0，历史 attempt 为 155 confirmed / 2 reverted。
+当次核对仍运行 PID 71847，旧进程未重启，因此尚未加载 6 秒设置；这些数值是检查时快照。
+
+## 2026-09-15 模拟失败现场诊断已实现（本次改动未重启上线）
+
+操作员已自行创建 `feed-early-20260915` 并启动提前实盘；00:33 的只读检查确认 PID 52642、
+单一 Feed 连接、六条 Kyber-only 关系和有效风险确认。下节“未启动”保留为更早的停机准备记录，
+不是此后运行状态。任何后续接手仍须重新核对进程和日志，不能把这些历史 PID 当成当前状态。
+
+本次按用户同意，仅新增诊断代码和离线测试，未重启/停止进程、改生产配置或迁移业务数据库，
+未访问真实密钥或签名/广播。运行中的旧进程不会因修改源码自动获得新日志；需由操作员按现有
+运行手册完成安全重启后，新的失败才会携带诊断。不要重建 trial、重置预算或绕过启动审计。
+
+### 现场证据与不能推断的结论
+
+- 原提前买入 proposal：`98a4607fb5af1ec080a4eb1da05e928597154b826c1fcf79bb0197575c9d5bdf`；
+  source tx：`0x0439f64de6196e698720fbc942c047598ff259007be3d02fc10a6c68e302d678`。
+  依据业务 MySQL 中该 proposal、reservation、claim 的只读查询，以及
+  `var/log/sm-copy-early-20260915.log` 第 408–419 行：识别和决策通过，输入 `100000` raw USDG，
+  prepare 阶段 `eth_call` 返回错误码 3；提案取消，预算和 operation claim 释放，无 execution plan。
+- 当时执行方案在模拟通过后才入库，RPC 层又丢弃了具体 error data；因此缺少原始 calldata 和
+  回滚详情，不能声称已确定那次失败根因。
+- 经用户明确授权，于约 00:42:50 使用同钱包/币对/输入量向现有 RPC 和 Kyber 官方 API 做
+  新报价与只读模拟。原报价块 62951422 和当时 pending 余额均为 `11929877` raw USDG，
+  Router allowance 均为 `1988700000`；新方案在 Gas 600000 与 2000000 下都模拟成功，
+  输出均为 `76313842399386127938` raw，Router 报告 Gas 用量 `221594`。
+  新 build 响应摘要 `9f60f0654967527020a0192afb099c06b123ed0da09879f89095ead24d70604b`。
+  源交易回执 status=1，但回执成功本身不等于各用户子操作的资产兑换证明。
+  新报价/状态与原现场不同，不能据此倒推原失败一定是 Gas、滑点或路由，也没有补写成实盘成交。
+
+### 新记录和读取方式
+
+`rpc.py` 只为错误保留受限的结构化诊断，RPC 方法白名单不变。`execution_prep.py` 的模拟失败
+抛出仍属于 ValueError 的 `AggregatorSimulationError`；现有 monitor 取消/释放路径保持原样，
+在原 `live_execution_abandoned` JSONL 事件内追加 `simulation_failure`，不创建新的执行许可。
+prepare / sign / review 三个阶段均覆盖；该字段也适用于严格证据分支，不只提前分支。
+
+- 事件关联：proposal、relationship、source event/tx、early_trial_id（严格分支为空）。
+- 精确调用：from、to、data、value、gas、`eth_call` 和 `block_parameter=pending`。
+  不含 nonce、私钥、签名或 raw signed transaction。JSON-RPC 参数中的 value/gas 保持原协议 hex；
+  输入金额、最低输出、计划费用等 `*_raw` 继续为十进制字符串。
+- 时间和上下文：模拟开始/结束墙钟、单调时钟耗时；原 unsigned plan 的报价时间/区块号/hash。
+  `quote_context_basis=unsigned_plan` 不代表签名复核时新取得的报价；
+  `pending_state_pinned=false`、`quote_block_is_simulation_block=false` 明确不能重建原 pending 状态。
+  不额外调用 RPC 获取另一个时点的“最新块”冒充模拟块。
+- 错误：有界 RPC code、固定 message_category、解出的 Error(string) 原因或 Panic(uint256) 代码；
+  未知自定义错误只保留 selector、长度和 SHA-256，不猜 ABI，不倾倒任意响应对象或未知参数。
+  传输/响应处理异常仅保留类型；空响应、不可解码响应、输出低于下限也保留现场，仍拒绝执行。
+- 大小和脱敏：仅检查最多 8 KiB revert data；原因最多 512 字符，URL/端点凭证/疑似密钥/控制字符
+  会整段隐去。未签名 calldata 最多保留 64 KiB，超限 data=null，并明确
+  `calldata_omitted_size_limit=true`，仍保存原长度、完整 calldata hash 和 request hash，不能当成
+  可完整重放样本。即使已脱敏，日志也包含钱包/交易意向，按业务运行日志权限和保留策略管理。
+
+从仓库根目录只读提取（不要将 data 自动发送到广播接口）：
+
+```bash
+jq -c 'select(.event == "live_execution_abandoned" and .simulation_failure != null) |
+  {observed_at, stage, proposal_id, relationship_id, source_tx_hash, early_trial_id, simulation_failure}' \
+  var/log/sm-copy-early-20260915.log
+```
+
+诊断使用现有 stderr JSONL 持久化，不修改数据库 schema；未重定向或删除运行日志会丢失记录，
+无法靠现有 proposal 表补回失败前的 calldata。没有自动重试、放宽滑点/Gas/报价 TTL、增加 Feed
+订阅或修复其他延迟问题。新增 16 项离线测试，覆盖脱敏/大小边界、三阶段 monitor 接线、
+原有清理及不广播；全量 377 项通过（含现有临时依赖中的 12 项可选 EVM 测试），
+pip check、compileall、diff check 通过。不能据此宣称原回滚根因已修复或新增记录已在实盘生效。
+
 ## 2026-09-15 已推送与停机准备完成（未启动实盘）
 
 按用户明确选择，将提前链路实现、测试和相关公开证据推送到 `origin/main`，功能提交 `3dfb71b`。

@@ -13,13 +13,16 @@ from .verified_feed_intent import VerifiedFeedIntent
 from .execution_pipeline import check_early_execution_source
 from .runtime_safety import trip_execution_stop
 from .execution_controls import _stop_controls
+from .early_timing import EARLY_FEED_MAX_AGE_SECONDS
 
 
 class EarlyRuntime:
-    def __init__(self, store, quoter, gate, policies, trial_id, execute, healthy, report):
+    def __init__(self, store, quoter, gate, policies, trial_id, execute, healthy, report,
+                 *, deployment_monitor=None):
         self.store, self.quoter, self.gate = store, quoter, gate
         self.policies, self.trial_id, self.execute = tuple(policies), trial_id, execute
         self.healthy, self.report = healthy, report
+        self.deployment_monitor = deployment_monitor
 
     def snapshots(self, intent, policy):
         started = time.time()
@@ -83,7 +86,7 @@ class EarlyRuntime:
                     if not self.healthy():
                         raise ValueError("early Feed unhealthy")
                     intent = VerifiedFeedIntent.verify(tx, policy.wallet, candidate["path"],
-                                                       item["snapshots"], time.time())
+                        item["snapshots"], time.time(), deployment_monitor=self.deployment_monitor)
                     trial = self.store.early_trial_status(self.trial_id)
                     if not trial or not trial["eligible"]:
                         raise ValueError("early trial inactive")
@@ -103,6 +106,11 @@ class EarlyRuntime:
                             source_amount_out_raw=None, source_position_status="pending",
                             copy_operation_order_id=intent.candidate.order_id, early_trial_id=self.trial_id,
                             early_received_at=tx.received_at, early_checked_at=decision["checked_at"],
+                            early_feed_timestamp=tx.timestamp,
+                            early_feed_max_age_seconds=EARLY_FEED_MAX_AGE_SECONDS,
+                            early_deployment_verification=intent.deployment_evidence(),
+                            early_decision_exceeds_3s=(decision["checked_at"] - tx.timestamp > 3
+                                                      or decision["checked_at"] - tx.received_at > 3),
                             amount_basis=decision["amount_basis"], early_decision=decision)
                         proposal = dict(proposal_id=proposal_id,
                             source_event_id="early:" + decision["relationship_key"],

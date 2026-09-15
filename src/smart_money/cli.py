@@ -20,7 +20,7 @@ from .backfill import MAX_RANGE_BLOCKS, BlockScanner, ReorgDetected, relevant
 from .broadcast import MainnetBroadcaster
 from .config import load_endpoint_env
 from .decode import Decoder
-from .feed import DecodeError, FeedHealth, decode_raw, envelopes
+from .feed import DEFAULT_FEED_MAX_AGE_SECONDS, DecodeError, FeedHealth, decode_raw, envelopes
 from .execution_receipts import ReadOnlyExecutionTracker
 from .execution_controls import require_mainnet_broadcast_enabled
 from .execution_pipeline import (
@@ -56,8 +56,11 @@ from .solver import relay_confirmed_sell, relay_passive_buy
 from .store import Store
 from .early_feed_lane import EarlyFeedLane, EarlyEvidenceResolver
 from .early_runtime import EarlyRuntime
+from .deployment_monitor import DeploymentMonitor
+from .early_timing import EARLY_FEED_MAX_AGE_SECONDS
 from .execution_pipeline import check_early_execution_source
 from .runtime_safety import runtime_instance_lock, trip_execution_stop
+from .simulation_diagnostics import AggregatorSimulationError
 
 
 def report(event: str, **details):
@@ -345,7 +348,9 @@ async def monitor(args):
         raise ValueError("RPC is connected to the wrong chain")
     decoder = Decoder(watchlist)
     queue = asyncio.Queue(maxsize=args.queue_size)
-    health = FeedHealth()
+    early_trial_id = getattr(args, "early_trial_id", None)
+    early_enabled = bool(getattr(args, "early_feed_evidence", False) or early_trial_id)
+    health = FeedHealth(max_age_seconds=EARLY_FEED_MAX_AGE_SECONDS) if early_enabled else FeedHealth()
     stats = Counter()
     store = runtime_store(args)
     paper_engines = {}
@@ -362,7 +367,7 @@ async def monitor(args):
     operation_scopes = {(follower, relation) for follower, payload in trial_scopes
                         for relation in json.loads(payload)}
     early_lane = None
-    early_trial_id = getattr(args, "early_trial_id", None)
+    deployment_monitor = None
     early_policies = ()
     if early_trial_id:
         trial = store.early_trial_status(early_trial_id)
@@ -389,9 +394,11 @@ async def monitor(args):
         # Fail startup before any recovery/execution if the optional schema is
         # absent. One shared Feed receiver; this lane has no execution callback.
         store.connection.execute("SELECT tx_hash FROM early_feed_jobs LIMIT 0")
+        deployment_monitor = DeploymentMonitor(rpc, report)
         early_lane = EarlyFeedLane(
             store, EarlyEvidenceResolver(rpc, relay_client or RelayPublicClient(),
-                                         paper_config.wallets if paper_config else watchlist),
+                paper_config.wallets if paper_config else watchlist,
+                deployment_monitor=deployment_monitor),
             healthy=health.healthy)
     paper_executor = None
     live_pipelines = {}
@@ -694,11 +701,20 @@ async def monitor(args):
             if plan is None or plan_released:
                 proposal_released = store.cancel_paper_proposal(
                     proposal_id, f"live_{stage}_rejected")
+            simulation_details = {}
+            if isinstance(exc, AggregatorSimulationError):
+                simulation_details = {
+                    "simulation_failure": exc.diagnostic,
+                    "source_event_id": proposal["attribution"].get("source_event_id", signal.event_id),
+                    "source_tx_hash": signal.tx_hash,
+                    "early_trial_id": proposal["attribution"].get("early_trial_id"),
+                }
             report("live_execution_abandoned", proposal_id=proposal_id, stage=stage,
                    error_type=type(exc).__name__, error=str(exc)[:300],
                    plan_released=plan_released, proposal_released=proposal_released,
                    operator_review_required=not (plan is None or plan_released),
-                   relationship_id=policy.relationship_id, live_trading=True)
+                   relationship_id=policy.relationship_id, live_trading=True,
+                   **simulation_details)
             raise
         if "copy_operation_order_id" in proposal["attribution"]:
             try:
@@ -766,7 +782,8 @@ async def monitor(args):
 
     if early_trial_id:
         early_lane.handoff = EarlyRuntime(store, quoter, relationship_gate, early_policies,
-            early_trial_id, execute_live, health.healthy, report)
+            early_trial_id, execute_live, health.healthy, report,
+            deployment_monitor=deployment_monitor)
 
     async def paper_observe(signal, policies=None):
         if not paper_config or signal.wallet not in paper_config.wallets:
@@ -908,7 +925,7 @@ async def monitor(args):
                 await asyncio.gather(*(account_impl(a) for a in candidates))
                 signals = decoder.decode(tx)
                 # Freshness is checked again after queue and RPC waiting.
-                fresh = bool(tx.timestamp and health.healthy() and time.time() - tx.timestamp <= health.max_age_seconds)
+                fresh = bool(tx.timestamp and health.healthy() and time.time() - tx.timestamp <= DEFAULT_FEED_MAX_AGE_SECONDS)
                 for signal in signals:
                     signal.fresh = fresh
                     signal.evidence["account_state_source"] = "latest_not_historical"
@@ -948,7 +965,7 @@ async def monitor(args):
                     final_signals = enrich(tx, signals, receipt, watchlist, pool_checks, native_checks)
                     defer_completion = False
                     for signal in final_signals:
-                        signal.fresh = bool(tx.timestamp and health.healthy() and time.time() - tx.timestamp <= health.max_age_seconds)
+                        signal.fresh = bool(tx.timestamp and health.healthy() and time.time() - tx.timestamp <= DEFAULT_FEED_MAX_AGE_SECONDS)
                         signal.evidence["account_state_source"] = "transaction_prestate_trace"
                         signal.evidence["observation_source"] = tx.observation_source
                         if signal.stage == "relay_sell_evidenced":
@@ -1121,6 +1138,7 @@ async def monitor(args):
             stats["ledger_reconnections"] = getattr(store.connection, "reconnections", 0)
             report("health", healthy=health.healthy(), queued=queue.qsize(), counters=dict(stats),
                    early_feed_counters=dict(early_lane.stats) if early_lane else {},
+                   deployment_verification=deployment_monitor.status() if deployment_monitor else None,
                    candidate_states=store.candidate_counts(), chain_cursor=store.chain_cursor(),
                    latency_ms=timings.summary(), coverage=coverage_summary(stats))
 
@@ -1216,7 +1234,12 @@ async def monitor(args):
 
     await recover_paper_reservations()
     if early_lane:
-        early_lane.start()
+        await deployment_monitor.start()
+        try:
+            early_lane.start()
+        except Exception:
+            await deployment_monitor.close()
+            raise
     workers = [asyncio.create_task(worker()) for _ in range(args.workers)]
     dispatch_task = asyncio.create_task(dispatcher())
     backfill_task = asyncio.create_task(backfill())
@@ -1224,6 +1247,8 @@ async def monitor(args):
     receiver = asyncio.create_task(receive())
     try:
         report("monitor_started", wallets=len(watchlist),
+               early_feed_max_age_seconds=EARLY_FEED_MAX_AGE_SECONDS if early_lane else None,
+               deployment_verification=deployment_monitor.status() if deployment_monitor else None,
                backfill_wallets=len(backfill_watchlist),
                backfill_range_blocks=args.backfill_batch, seconds=args.seconds,
                live_trading=bool(live_pipelines))
@@ -1248,7 +1273,10 @@ async def monitor(args):
         if live_tracking_tasks:
             await asyncio.gather(*live_tracking_tasks, return_exceptions=True)
         if early_lane:
-            await early_lane.close()
+            try:
+                await early_lane.close()
+            finally:
+                await deployment_monitor.close()
         candidate_states = store.candidate_counts()
         chain_cursor = store.chain_cursor()
         store.close()

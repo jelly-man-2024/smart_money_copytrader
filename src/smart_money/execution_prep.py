@@ -19,6 +19,7 @@ from .registry import (
     V2_ROUTER, V3_ROUTER, WETH,
 )
 from .rpc import RpcError
+from .simulation_diagnostics import AggregatorSimulationError, simulation_failure
 
 POOL_KEY = "(address,address,uint24,int24,address)"
 LOCAL_EXECUTION_TARGETS = frozenset({V2_ROUTER, V3_ROUTER, UNIVERSAL_ROUTER})
@@ -276,20 +277,33 @@ async def simulate_aggregator_execution(rpc, plan: "UnsignedExecutionPlan") -> d
         raise ValueError("aggregator router is not allowlisted")
     call = {"from": plan.follower_wallet, "to": plan.to, "data": plan.data,
             "value": hex(_uint(plan.value_raw, "value")), "gas": hex(plan.gas_limit)}
+    started_at, started_clock = time.time(), time.monotonic()
+
+    def failure(message, kind, rpc_error=None, result_evidence=None):
+        return AggregatorSimulationError(message, simulation_failure(
+            plan, call, started_at, time.time(), (time.monotonic() - started_clock) * 1000,
+            kind, rpc_error, result_evidence))
+
     try:
         raw = await rpc.call("eth_call", [call, "pending"])
     except RpcError as exc:
-        raise ValueError(
-            f"aggregator execution simulation reverted: {str(exc)[:120]}") from None
+        detail = exc.diagnostic or {"kind": "rpc_failure", "code": None}
+        # Never interpolate arbitrary provider/transport text into durable logs.
+        code = detail.get("code")
+        suffix = f"RPC eth_call error code {code}" if type(code) is int else "RPC eth_call failed"
+        raise failure(f"aggregator execution simulation reverted: {suffix}",
+                      "rpc_failure", detail) from None
     if not isinstance(raw, str) or not raw.startswith("0x") or len(raw) < 130:
-        raise ValueError("aggregator execution simulation returned no output")
+        raise failure("aggregator execution simulation returned no output", "missing_output")
     try:
         return_amount, gas_used = decode(["uint256", "uint256"], bytes.fromhex(raw[2:]))
     except (ValueError, DecodingError):
-        raise ValueError("aggregator execution simulation result is undecodable") from None
+        raise failure("aggregator execution simulation result is undecodable", "undecodable_output") from None
     minimum = _uint(plan.minimum_amount_out_raw, "minimum amount out")
     if int(return_amount) < minimum:
-        raise ValueError("aggregator execution simulation output is below the minimum")
+        raise failure("aggregator execution simulation output is below the minimum", "below_minimum",
+                      result_evidence={"return_amount_raw": str(int(return_amount)),
+                                       "gas_used_raw": str(int(gas_used))})
     return {
         "simulated": True, "simulated_return_amount_raw": str(int(return_amount)),
         "simulated_gas_used": str(int(gas_used)), "simulation_block": "pending",

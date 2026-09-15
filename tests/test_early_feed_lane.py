@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from smart_money import cli, registry as R
-from smart_money.early_feed_lane import EarlyEvidenceResolver, EarlyFeedLane
+from smart_money.early_feed_lane import EarlyEvidenceResolver, EarlyFeedLane, fresh_feed
 from smart_money.early_intent import parse_candidates
 from smart_money.store import Store
 from test_early_shadow import fixture
@@ -63,6 +63,26 @@ class LaneTests(unittest.IsolatedAsyncioTestCase):
         self.lane.healthy = lambda: False
         self.assertFalse(self.lane.submit(self.tx))
         self.resolver.assert_not_called()
+
+    async def test_six_second_window_checks_source_and_received_clocks(self):
+        from smart_money.feed import FeedHealth
+        self.assertFalse(FeedHealth().observe(1, 100, 104))
+        self.assertTrue(FeedHealth(max_age_seconds=6).observe(1, 100, 106))
+        tx = replace(self.tx, timestamp=100, received_at=101., fresh=True)
+        self.assertTrue(fresh_feed(tx, 106.))
+        self.assertFalse(fresh_feed(tx, 106.001))
+        self.assertFalse(fresh_feed(replace(tx, received_at=107.), 106.))
+        self.assertFalse(fresh_feed(replace(tx, timestamp=102), 106.))
+
+    async def test_resolver_accepts_four_second_old_feed_with_new_evidence(self):
+        candidate = parse_candidates(self.tx, self.wallet).candidates[0]
+        at = int(candidate.metadata["permit_deadline"]) - 1
+        tx = replace(self.tx, timestamp=at-4, received_at=float(at-3))
+        relay = MagicMock(lookup_by_order=AsyncMock(return_value=order_for(candidate)))
+        with patch("smart_money.early_feed_lane.time.time", return_value=float(at)):
+            result = await EarlyEvidenceResolver(MagicMock(), relay, [self.wallet])(tx)
+        self.assertTrue(result["candidates"][0]["recognized_intent"])
+        self.assertEqual(result["feed_max_age_seconds"], 6)
 
     async def test_health_rechecked_after_queue_wait(self):
         self.store.put_candidate(self.tx)
@@ -173,6 +193,11 @@ class MonitorLaneTests(unittest.IsolatedAsyncioTestCase):
             completed.set()
         class Rpc:
             async def call(self, method, params=None):
+                if method == "eth_getBlockByNumber":
+                    return {"hash": "0x" + "ab" * 32, "number": "0xa"}
+                if method == "eth_getCode":
+                    return json.loads((Path(__file__).resolve().parents[1] /
+                        "data/relay_race_runtime_2026-09-14.json").read_text())["runtime_code"]
                 return hex(R.CHAIN_ID)
             async def receipt(self, tx_hash):
                 await completed.wait()
@@ -195,16 +220,22 @@ class MonitorLaneTests(unittest.IsolatedAsyncioTestCase):
              patch.object(cli, "Decoder", return_value=MagicMock(delegations={}, decode=MagicMock(return_value=[]))), \
              patch.object(cli, "envelopes", return_value=[(b"raw", {"fresh": True})]), \
              patch.object(cli, "decode_raw", return_value=tx), \
-             patch.object(cli, "EarlyEvidenceResolver", return_value=AsyncMock(return_value={"candidates": []})), \
+             patch.object(cli, "EarlyEvidenceResolver", return_value=AsyncMock(return_value={"candidates": []})) as resolver, \
              patch.object(cli, "EarlyRuntime", return_value=handoff) as runtime, \
              patch.object(cli, "PaperEngine", wraps=cli.PaperEngine) as engines, \
              patch.object(cli.websockets, "connect", return_value=Socket()) as connect, patch.object(cli, "report"):
             health.return_value.healthy.return_value = True
             health.return_value.gap = False
             await asyncio.wait_for(cli.monitor(args), 2)
+            health.assert_called_once_with(max_age_seconds=6.0)
             self.assertTrue(completed.is_set())
             self.assertEqual(connect.call_count, 1)
             runtime.assert_called_once()
+            monitor = runtime.call_args.kwargs["deployment_monitor"]
+            self.assertIs(monitor, resolver.call_args.kwargs["deployment_monitor"])
+            self.assertIsNotNone(monitor.last_success_at)
+            self.assertTrue(monitor._task.done())
+            self.assertTrue(monitor._closed)
             self.assertTrue(engines.call_args.args[9][wallet]["operation_claims"])
 
     async def test_one_feed_connection_resolves_while_receipt_waits(self):
