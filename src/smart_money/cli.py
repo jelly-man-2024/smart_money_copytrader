@@ -782,9 +782,11 @@ async def monitor(args):
             await execute_live_serialized(policy, signal, proposal_id, early_intent=early_intent)
 
     if early_trial_id:
+        quoter.shared_routes_enabled = True
         early_lane.handoff = EarlyRuntime(store, quoter, relationship_gate, early_policies,
             early_trial_id, execute_live, health.healthy, report,
             deployment_monitor=deployment_monitor)
+        early_lane.resolver.prefetch = getattr(early_lane.handoff, "prefetch", None)
 
     async def paper_observe(signal, policies=None):
         if not paper_config or signal.wallet not in paper_config.wallets:
@@ -879,6 +881,7 @@ async def monitor(args):
                        build_requests=context["build_requests"],
                        quote_reuses=context["quote_reuses"],
                        refreshes=context["refreshes"],
+                       shared_route_reuses=context.get("shared_route_reuses", 0),
                        route_retry=context.get("route_retry"))
 
     async def safe_paper_observe(signal):
@@ -1158,6 +1161,7 @@ async def monitor(args):
             await asyncio.sleep(5)
             stats["ledger_reconnections"] = getattr(store.connection, "reconnections", 0)
             report("health", healthy=health.healthy(), queued=queue.qsize(), counters=dict(stats),
+                   relay_http_timings=list(getattr(relay_client, "timings", ()))[-8:],
                    early_feed_counters=dict(early_lane.stats) if early_lane else {},
                    deployment_verification=deployment_monitor.status() if deployment_monitor else None,
                    candidate_states=store.candidate_counts(), chain_cursor=store.chain_cursor(),
@@ -1300,6 +1304,8 @@ async def monitor(args):
                 await deployment_monitor.close()
         candidate_states = store.candidate_counts()
         chain_cursor = store.chain_cursor()
+        if relay_client is not None:
+            relay_client.close()
         store.close()
         report("monitor_finished", counters=dict(stats), candidate_states=candidate_states,
                early_feed_counters=dict(early_lane.stats) if early_lane else {},

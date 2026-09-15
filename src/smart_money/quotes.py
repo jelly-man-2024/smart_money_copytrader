@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from collections import OrderedDict
 import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -174,6 +175,9 @@ class LiveQuoter:
         self.rpc = rpc
         self.aggregators = dict(aggregators or {})
         self._context = ContextVar("execution_quote_context", default=None)
+        self.shared_routes_enabled = False
+        self._shared_routes = OrderedDict()
+        self._route_flights = {}
         if any(name not in AGGREGATOR_PROTOCOLS for name in self.aggregators):
             raise ValueError("unsupported aggregator provider")
 
@@ -239,8 +243,50 @@ class LiveQuoter:
         kwargs = {}
         if signal.protocol == "kyber" and context and context["excluded_sources"]:
             kwargs["excluded_sources"] = context["excluded_sources"]
-        return await self._aggregator(signal.protocol).route(
-            signal.token_in, signal.token_out, amount_in_raw, **kwargs)
+        key = None
+        if self.shared_routes_enabled and context and signal.protocol == "kyber":
+            # Share market data, NEVER a decision/authorization or built transaction.
+            key = (signal.chain_id, signal.tx_hash, signal.wallet,
+                   context["binding"][1:], signal.protocol, signal.token_in,
+                   signal.token_out, amount_in_raw, tuple(kwargs.get("excluded_sources", ())))
+            route = self._shared_routes.get(key)
+            if route is not None:
+                if 0 <= time.time() - route.observed_at <= context["max_age"]:
+                    context["shared_route_reuses"] = context.get("shared_route_reuses", 0) + 1
+                    return deepcopy(route)
+                del self._shared_routes[key]
+            if key in self._route_flights:
+                route = await asyncio.shield(self._route_flights[key])
+                if 0 <= time.time() - route.observed_at <= context["max_age"]:
+                    context["shared_route_reuses"] = context.get("shared_route_reuses", 0) + 1
+                    return deepcopy(route)
+            if len(self._route_flights) >= 64:
+                key = None
+        future = None
+        if key is not None:
+            future = asyncio.get_running_loop().create_future()
+            future.add_done_callback(lambda f: None if f.cancelled() else f.exception())
+            self._route_flights[key] = future
+        try:
+            if context:
+                context["route_requests"] += 1
+            route = await self._aggregator(signal.protocol).route(
+                signal.token_in, signal.token_out, amount_in_raw, **kwargs)
+            if key is not None:
+                self._shared_routes[key] = deepcopy(route)
+                self._shared_routes.move_to_end(key)
+                while len(self._shared_routes) > 64:
+                    self._shared_routes.popitem(last=False)
+                future.set_result(deepcopy(route))
+            return route
+        except BaseException as exc:
+            if future is not None and not future.done():
+                future.set_exception(ValueError("shared route request cancelled")
+                                     if isinstance(exc, asyncio.CancelledError) else exc)
+            raise
+        finally:
+            if key is not None and self._route_flights.get(key) is future:
+                del self._route_flights[key]
 
     async def build_aggregator_transaction(self, signal: Signal, amount_in_raw: str,
                                            follower_wallet: str, slippage_bps: int,
@@ -263,8 +309,6 @@ class LiveQuoter:
         if route is not None and not 0 <= time.time() - route.observed_at <= context["max_age"]:
             raise ValueError("aggregator route expired before build")
         if route is None:
-            if context:
-                context["route_requests"] += 1
             route = await self._request_route(signal, amount_in_raw)
         if context:
             context["build_requests"] += 1
@@ -423,11 +467,9 @@ class LiveQuoter:
         block_number = number(header["number"])
         block_tag = hex(block_number)
         if signal.protocol in AGGREGATOR_PROTOCOLS:
-            # Aggregator quotes are API responses observed while this header was
-            # latest; the block pin records the observation window, not a state read.
+            # Header is sampled at consumption (a shared route may predate it).
+            # Keep the API's ORIGINAL observed_at; this is not a pinned state read.
             context = self._context.get()
-            if context:
-                context["route_requests"] += 1
             route = await self._request_route(signal, amount_in_raw)
             if context:
                 context["routes"][self._quote_key(signal, amount_in_raw)] = route

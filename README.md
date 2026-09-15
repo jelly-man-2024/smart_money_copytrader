@@ -58,7 +58,7 @@ v2 增加固定 race 字节码适配和独立部署快照门禁；历史 BUY 语
 `--reconstruct-context --mysql --log ...` 可进一步恢复已有历史报价并审计订单、决策及预检来源；
 避免把旧导入器的空 snapshots 误解为数据库无数据。解析加新鲜度覆盖为 133/145，完整提前资格另计。
 SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信号。
-当前测试共 447 项，包括 12 项需 `requirements-race-tests.txt` 的可选 EVM 测试；未安装可选依赖时会跳过。
+当前测试共 464 项，包括 12 项需 `requirements-race-tests.txt` 的可选 EVM 测试；未安装可选依赖时会跳过。
 服务器首次验证顺序为安装、单元测试、离线回放，
 再执行下面的 60 秒实时只读监听；完整历史验证记录见 [VALIDATION](docs/VALIDATION.md)。
 

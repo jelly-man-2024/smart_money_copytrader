@@ -3,8 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import http.client
+import queue
+import ssl
+import time
+from collections import deque
 import urllib.parse
-import urllib.request
 
 
 class RelayApiError(RuntimeError):
@@ -19,10 +23,31 @@ class RelayPublicClient:
     def __init__(self, endpoint: str = "https://api.relay.link", timeout: float = 10):
         parsed = urllib.parse.urlsplit(endpoint)
         if (parsed.scheme != "https" or parsed.hostname != "api.relay.link"
-                or parsed.path not in {"", "/"}):
+                or parsed.path not in {"", "/"} or parsed.port not in {None, 443}
+                or parsed.username or parsed.password or parsed.query or parsed.fragment):
             raise ValueError("Relay endpoint must be the official HTTPS API origin")
         self.endpoint = endpoint.rstrip("/")
         self.timeout = timeout
+        self._connections = queue.LifoQueue(maxsize=4)
+        for _ in range(4):
+            self._connections.put(None)
+        self._tls = ssl.create_default_context()
+        self.timings = deque(maxlen=128)
+        self._closed = False
+
+    def close(self):
+        self._closed = True
+        slots = []
+        while True:
+            try:
+                connection = self._connections.get_nowait()
+            except queue.Empty:
+                break
+            if connection is not None:
+                connection.close()
+            slots.append(None)
+        for slot in slots:
+            self._connections.put_nowait(slot)
 
     @staticmethod
     def _check_hash(tx_hash: str) -> str:
@@ -36,29 +61,63 @@ class RelayPublicClient:
         return tx_hash.lower()
 
     def _fetch(self, tx_hash: str, limit: int, *, field: str = "hash") -> dict:
+        if self._closed:
+            raise RelayApiError("Relay client closed")
         if field not in {"hash", "orderId", "id"}:
             raise ValueError("unsupported Relay lookup field")
         query = urllib.parse.urlencode({
             field: self._check_hash(tx_hash), "includeOrderData": "true",
             "limit": str(limit),
         })
-        request = urllib.request.Request(
-            f"{self.endpoint}/requests/v2?{query}",
-            headers={"Accept": "application/json",
-                     "User-Agent": "smart-money-observer/0.1"},
-        )
+        connection = None
+        started = time.perf_counter()
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                if urllib.parse.urlsplit(response.geturl()).hostname != "api.relay.link":
-                    raise RelayApiError("Relay response redirected outside official origin")
-                raw = response.read(4 * 1024 * 1024 + 1)
+            connection = self._connections.get(timeout=self.timeout)
+        except queue.Empty:
+            raise RelayApiError("Relay connection pool busy") from None
+        try:
+            if connection is None:
+                connection = http.client.HTTPSConnection(
+                    "api.relay.link", timeout=self.timeout, context=self._tls)
+            acquired = time.perf_counter()
+            reused = connection.sock is not None
+            if not reused:
+                connection.connect()
+            connected = time.perf_counter()
+            # A connection belongs to exactly one worker until the body is read.
+            # No redirects or hidden retries; broken connections are discarded.
+            connection.request("GET", f"/requests/v2?{query}", headers={
+                "Accept": "application/json", "User-Agent": "smart-money-observer/0.1"})
+            response = connection.getresponse()
+            received = time.perf_counter()
+            if response.status != 200:
+                raise RelayApiError("Relay HTTP status " + str(response.status))
+            raw = response.read(4 * 1024 * 1024 + 1)
             if len(raw) > 4 * 1024 * 1024:
                 raise RelayApiError("Relay response exceeds size limit")
             document = json.loads(raw)
+            finished = time.perf_counter()
+            self.timings.append(dict(reused=reused, status=response.status,
+                pool_wait_ms=round((acquired-started)*1000, 3),
+                connect_ms=round((connected-acquired)*1000, 3),
+                response_ms=round((received-connected)*1000, 3),
+                body_parse_ms=round((finished-received)*1000, 3),
+                total_ms=round((finished-started)*1000, 3)))
         except RelayApiError:
+            if connection is not None:
+                connection.close()
+                connection = None
             raise
         except Exception as exc:
+            if connection is not None:
+                connection.close()
+                connection = None
             raise RelayApiError(f"Relay lookup failed: {type(exc).__name__}") from None
+        finally:
+            if self._closed and connection is not None:
+                connection.close()
+                connection = None
+            self._connections.put_nowait(connection)
         requests = document.get("requests") if isinstance(document, dict) else None
         if not isinstance(requests, list):
             raise RelayApiError("Relay response has no requests list")

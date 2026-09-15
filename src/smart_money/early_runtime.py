@@ -4,6 +4,7 @@ No keys, signing, broadcasts or Feed connections in this module. The monitor
 supplies its executor only when an existing operator-started trial is selected.
 """
 from dataclasses import asdict
+import asyncio
 import hashlib
 import time
 
@@ -14,6 +15,8 @@ from .execution_pipeline import check_early_execution_source
 from .runtime_safety import trip_execution_stop
 from .execution_controls import _stop_controls
 from .early_timing import EARLY_FEED_MAX_AGE_SECONDS
+from .models import Signal
+from . import registry as R
 
 
 class EarlyRuntime:
@@ -23,6 +26,37 @@ class EarlyRuntime:
         self.policies, self.trial_id, self.execute = tuple(policies), trial_id, execute
         self.healthy, self.report = healthy, report
         self.deployment_monitor = deployment_monitor
+
+    async def prefetch(self, candidate):
+        """Bounded read-only hints. No order identity, budget or execution permission."""
+        if candidate.side != "BUY" or candidate.token_in != R.USDG or not self.healthy():
+            return
+        for policy in self.policies:
+            rule = policy.buy_rules.get("USDG")
+            if (policy.wallet != candidate.wallet or rule is None or rule.mode != "fixed"
+                    or policy.execution_providers != ("kyber",)
+                    or R.USDG not in policy.allowed_assets
+                    or "relay_solver" not in policy.allowed_protocols):
+                continue
+            amount = int(rule.fixed_amount_raw)
+            if amount < 2 or amount > int(policy.budget_limits["USDG"]):
+                continue
+            signal = Signal(candidate.tx_hash, candidate.wallet, "third_party", "BUY",
+                candidate.path, None, "", token_in=candidate.token_in,
+                token_out=candidate.token_out, protocol="kyber")
+            started = time.time()
+            with self.quoter.execution_context(candidate.operation_key, policy.follower_wallet,
+                    policy.snapshot_hash, policy.quote_policy.max_age_seconds) as context:
+                results = await asyncio.gather(
+                    self.quoter._request_route(signal, str(amount)),
+                    self.quoter._request_route(signal, str(max(1, amount // 100))),
+                    return_exceptions=True)
+                self.report("early_quote_prefetch", source_tx_hash=candidate.tx_hash,
+                    relationship_id=policy.relationship_id,
+                    elapsed_ms=round((time.time() - started) * 1000, 3),
+                    success=not any(isinstance(r, BaseException) for r in results),
+                    route_requests=context["route_requests"],
+                    shared_route_reuses=context.get("shared_route_reuses", 0))
 
     def snapshots(self, intent, policy):
         started = time.time()
@@ -146,4 +180,5 @@ class EarlyRuntime:
                         self.report("early_quote_requests", proposal_id=proposal_id,
                             relationship_id=policy.relationship_id,
                             route_retry=context.get("route_retry"),
+                            shared_route_reuses=context.get("shared_route_reuses", 0),
                             **{k: context.get(k, 0) for k in ("route_requests", "build_requests", "quote_reuses", "refreshes")})

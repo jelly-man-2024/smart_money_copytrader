@@ -66,6 +66,7 @@ class EarlyEvidenceResolver:
         self.rpc, self.relay = rpc, relay
         self.wallets = tuple(wallets)
         self.deployment_monitor = deployment_monitor
+        self.prefetch = None
 
     async def _code(self, wallet, deployment=False):
         block = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
@@ -108,6 +109,10 @@ class EarlyEvidenceResolver:
                     if candidate.side == "BUY":
                         jobs.append(capture("order", lambda: self.relay.lookup_by_order(
                             candidate.order_id, candidate.metadata.get("request_hint"))))
+                        if (self.prefetch is not None
+                                and initial["checks"]["semantics"]["status"] == "pass"):
+                            # This callback only fetches market data. It cannot grant eligibility.
+                            jobs.append(capture("quote_prefetch", lambda: self.prefetch(candidate)))
                         if candidate.route_kind == "relay_wrapper":
                             if self.deployment_monitor is None:
                                 jobs.append(capture("deployment", lambda: self._code(RACE_ADDRESS, True)))
