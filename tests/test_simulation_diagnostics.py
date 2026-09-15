@@ -242,7 +242,7 @@ class MonitorDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
                 rpc = SimpleNamespace(call=AsyncMock(side_effect=rpc_call),
                                       receipt=AsyncMock(return_value=None))
-                preparer = SimpleNamespace(prepare=AsyncMock(return_value=SimpleNamespace(plan_id="plan")))
+                preparer = SimpleNamespace(prepare=AsyncMock(return_value=SimpleNamespace(plan_id="plan", preflight={})))
                 signer = SimpleNamespace(sign=AsyncMock(return_value=SimpleNamespace(
                     raw_transaction=b"synthetic-signed-bytes-never-log")))
                 reviewer = SimpleNamespace(review=AsyncMock())

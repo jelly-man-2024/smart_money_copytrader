@@ -6,7 +6,7 @@ from collections import Counter, defaultdict
 from eth_abi import decode
 from eth_utils import keccak
 
-from .models import Signal, Transaction, number
+from .models import Signal, Transaction, address, number
 from . import registry as R
 
 
@@ -15,6 +15,7 @@ def topic(signature: str) -> str:
 
 
 TRANSFER = topic("Transfer(address,address,uint256)")
+APPROVAL = topic("Approval(address,address,uint256)")
 PONS_V2_SWAP = "0x8113d738abdcb6b38357e9d53a54a7157861a09031b453651f0fe7fe151f59df"
 USEROP = topic("UserOperationEvent(bytes32,address,address,uint256,bool,uint256,uint256)")
 BEFORE = topic("BeforeExecution()")
@@ -28,6 +29,73 @@ SWAPS = {
 }
 DEPOSIT_RECORDED = "0x49fed1d0b752ce30eee63c7a81133f3363b532fec5d4d7dd1ccfd005de4555e1"
 TRADE_BEHAVIORS = {"BUY", "SELL", "TOKEN_SWAP"}
+
+
+def direct_token_transfer_evidence(tx: Transaction, receipt: dict, wallet: str) -> dict | None:
+    """Narrow lookup-filter policy, NOT proof that no economic purchase occurred.
+
+    Inspect only the existing calldata/receipt. Unknown or malformed logs retain
+    Relay lookup, including non-standard token behavior. Never apply to subcalls.
+    """
+    def word(value: str) -> bytes:
+        if not isinstance(value, str) or len(value) != 66 or not value.startswith("0x"):
+            raise ValueError("invalid word")
+        decoded = bytes.fromhex(value[2:])
+        if len(decoded) != 32:
+            raise ValueError("invalid word")
+        return decoded
+
+    def word_address(value: bytes) -> str:
+        if len(value) != 32 or any(value[:12]):
+            raise ValueError("noncanonical address")
+        return address("0x" + value[12:].hex())
+
+    try:
+        if receipt.get("transactionHash", "").lower() != tx.hash or number(receipt.get("status", 0)) != 1:
+            return None
+        token, wallet = address(tx.to), address(wallet)
+        if tx.value != 0 or token == R.NATIVE:
+            return None
+        selector = tx.data[:4].hex()
+        if selector == "a9059cbb" and len(tx.data) == 68:
+            sender = address(tx.sender)
+            recipient = word_address(tx.data[4:36])
+            amount = int.from_bytes(tx.data[36:68], "big")
+        elif selector == "23b872dd" and len(tx.data) == 100:
+            sender = word_address(tx.data[4:36])
+            recipient = word_address(tx.data[36:68])
+            amount = int.from_bytes(tx.data[68:100], "big")
+        else:
+            return None
+        if (recipient != wallet or sender == recipient or amount <= 0
+                or sender == R.NATIVE or recipient == R.NATIVE):
+            return None
+        matched = 0
+        logs = receipt.get("logs")
+        if not isinstance(logs, list) or not logs:
+            return None
+        for log in logs:
+            if log.get("removed", False) or address(log["address"]) != token:
+                return None
+            topics = log["topics"]
+            if not isinstance(topics, list) or len(topics) != 3:
+                return None
+            event = "0x" + word(topics[0]).hex()
+            first, second = word_address(word(topics[1])), word_address(word(topics[2]))
+            value = int.from_bytes(word(log["data"]), "big")
+            if event == TRANSFER:
+                if (first, second, value) != (sender, recipient, amount):
+                    return None
+                matched += 1
+            elif event != APPROVAL:
+                return None
+        if matched != 1:
+            return None
+        return {"rule": "direct-token-transfer-v1", "selector": "0x" + selector,
+                "token": token, "sender": sender, "recipient": recipient,
+                "amount_raw": str(amount), "provenance": "transaction_calldata_and_receipt"}
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 def transfers(logs: list[dict]) -> list[tuple[str, str, str, int]]:

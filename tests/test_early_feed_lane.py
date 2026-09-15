@@ -64,13 +64,13 @@ class LaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.lane.submit(self.tx))
         self.resolver.assert_not_called()
 
-    async def test_six_second_window_checks_source_and_received_clocks(self):
+    async def test_seven_second_window_checks_source_and_received_clocks(self):
         from smart_money.feed import FeedHealth
         self.assertFalse(FeedHealth().observe(1, 100, 104))
-        self.assertTrue(FeedHealth(max_age_seconds=6).observe(1, 100, 106))
+        self.assertTrue(FeedHealth(max_age_seconds=7).observe(1, 100, 107))
         tx = replace(self.tx, timestamp=100, received_at=101., fresh=True)
-        self.assertTrue(fresh_feed(tx, 106.))
-        self.assertFalse(fresh_feed(tx, 106.001))
+        self.assertTrue(fresh_feed(tx, 107.))
+        self.assertFalse(fresh_feed(tx, 107.001))
         self.assertFalse(fresh_feed(replace(tx, received_at=107.), 106.))
         self.assertFalse(fresh_feed(replace(tx, timestamp=102), 106.))
 
@@ -82,7 +82,7 @@ class LaneTests(unittest.IsolatedAsyncioTestCase):
         with patch("smart_money.early_feed_lane.time.time", return_value=float(at)):
             result = await EarlyEvidenceResolver(MagicMock(), relay, [self.wallet])(tx)
         self.assertTrue(result["candidates"][0]["recognized_intent"])
-        self.assertEqual(result["feed_max_age_seconds"], 6)
+        self.assertEqual(result["feed_max_age_seconds"], 7)
 
     async def test_health_rechecked_after_queue_wait(self):
         self.store.put_candidate(self.tx)
@@ -227,7 +227,7 @@ class MonitorLaneTests(unittest.IsolatedAsyncioTestCase):
             health.return_value.healthy.return_value = True
             health.return_value.gap = False
             await asyncio.wait_for(cli.monitor(args), 2)
-            health.assert_called_once_with(max_age_seconds=6.0)
+            health.assert_called_once_with(max_age_seconds=7.0)
             self.assertTrue(completed.is_set())
             self.assertEqual(connect.call_count, 1)
             runtime.assert_called_once()

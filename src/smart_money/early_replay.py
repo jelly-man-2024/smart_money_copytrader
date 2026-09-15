@@ -120,7 +120,7 @@ def evaluate_candidate(c: Candidate, at: float, snapshots: dict, enabled=False,
     function. Missing historical context is not replaced by today's state.
     """
     at = timestamp(at)
-    if type(feed_max_age_seconds) not in (int, float) or not 0 < feed_max_age_seconds <= 6:
+    if type(feed_max_age_seconds) not in (int, float) or not 0 < feed_max_age_seconds <= 7:
         raise ValueError("invalid_feed_max_age_seconds")
     checks, details = {}, {}
 

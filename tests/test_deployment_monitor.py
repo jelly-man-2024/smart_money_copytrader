@@ -117,9 +117,9 @@ class DeploymentMonitorTests(unittest.IsolatedAsyncioTestCase):
                 result = await resolver(self.tx)
                 self.assertTrue(result["candidates"][0]["recognized_intent"])
         intent = self.intent(result["candidates"][0]["snapshots"])
-        intent.revalidate(106.)
+        intent.revalidate(107.)
         with self.assertRaisesRegex(ValueError, "feed_intent_expired"):
-            intent.revalidate(106.001)
+            intent.revalidate(107.001)
         self.rpc.call.assert_not_called()
         self.assertEqual(intent.deployment_evidence()["runtime_code_hash"], RACE_CODE_HASH)
         self.assertEqual(intent.deployment_evidence()["observed_at"], 90.)

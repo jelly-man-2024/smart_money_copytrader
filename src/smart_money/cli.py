@@ -45,7 +45,7 @@ from .paper import (
 from .paper_config import load_paper_config
 from .pools import discover_v3_execution_route, verify_signal_pools
 from .quotes import LiveQuoter
-from .receipts import enrich
+from .receipts import direct_token_transfer_evidence, enrich
 from .registry import (
     CHAIN_ID, ENTRYPOINT, NATIVE, USDG, V2_ROUTER, V3_ROUTER, delegation,
     load_watchlist, snapshot_delegations,
@@ -492,7 +492,7 @@ async def monitor(args):
         "live_prepared", "live_signed", "live_broadcast", "live_pending",
         "live_confirmed", "live_reverted", "live_orphaned", "live_errors",
         "live_settled", "live_approval_broadcast", "live_approval_confirmed",
-        "relay_lookup_pending", "relay_lookup_errors", "relay_buy_associated",
+        "relay_lookup_pending", "relay_lookup_errors", "relay_lookup_skipped", "relay_buy_associated",
         "relay_sell_confirmed",
         "local_v3_routes_verified",
     ):
@@ -671,7 +671,8 @@ async def monitor(args):
         try:
             prepared = await preparer.prepare(quote_signal, proposal_id, **early_options)
             stats["live_prepared"] += 1
-            report("live_execution_prepared", proposal_id=proposal_id)
+            report("live_execution_prepared", proposal_id=proposal_id,
+                   gas_retry=prepared.preflight.get("gas_retry"))
             stage = "sign"
             signed = await signer.sign(quote_signal, proposal_id, **early_options)
             stats["live_signed"] += 1
@@ -877,7 +878,8 @@ async def monitor(args):
                        route_requests=context["route_requests"],
                        build_requests=context["build_requests"],
                        quote_reuses=context["quote_reuses"],
-                       refreshes=context["refreshes"])
+                       refreshes=context["refreshes"],
+                       route_retry=context.get("route_retry"))
 
     async def safe_paper_observe(signal):
         if not paper_config or signal.wallet not in paper_config.wallets:
@@ -979,12 +981,31 @@ async def monitor(args):
                                 report("local_execution_route_rejected",
                                        source_event_id=signal.event_id,
                                        error_type=type(exc).__name__, live_trading=False)
-                        emit(store, signal)
-                        observed = signal
-                        if (relay_client is not None
+                        passive_lookup = (relay_client is not None
                                 and signal.behavior in {
                                     "EXTERNAL_DELIVERY_CANDIDATE", "INCOMING_TRANSFER"}
-                                and signal.stage == "needs_review"):
+                                and signal.stage == "needs_review")
+                        # Compute from this receipt, never trust a persisted skip flag.
+                        if passive_lookup:
+                            for key in ("relay_lookup_skipped", "relay_lookup_skip_reason",
+                                        "relay_lookup_skip_evidence"):
+                                signal.evidence.pop(key, None)
+                        skip_evidence = (direct_token_transfer_evidence(tx, receipt, signal.wallet)
+                                         if passive_lookup else None)
+                        if skip_evidence is not None:
+                            signal.evidence.update({
+                                "relay_lookup_skipped": True,
+                                "relay_lookup_skip_reason": "direct_token_transfer",
+                                "relay_lookup_skip_evidence": skip_evidence,
+                            })
+                        emit(store, signal)
+                        observed = signal
+                        if skip_evidence is not None:
+                            stats["relay_lookup_skipped"] += 1
+                            report("relay_lookup_skipped", source_event_id=signal.event_id,
+                                   tx_hash=tx.hash, reason="direct_token_transfer",
+                                   evidence=skip_evidence, live_trading=False)
+                        if passive_lookup and skip_evidence is None:
                             try:
                                 document = await relay_client.lookup_by_destination_hash(
                                     signal.tx_hash)

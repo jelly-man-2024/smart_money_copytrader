@@ -170,6 +170,6 @@ class EarlyRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(prepared.nonce, 0)
             self.assertFalse(review.evidence["broadcast_performed"])
             with self.assertRaises(ValueError):
-                await reviewer.review(signal, pid, signed.raw_transaction, now=106.001, early_intent=intent)
+                await reviewer.review(signal, pid, signed.raw_transaction, now=107.001, early_intent=intent)
         with self.assertRaises(ValueError):
             check_early_execution_source(self.store, None, signal, self.store.paper_proposal(pid), 100.1)

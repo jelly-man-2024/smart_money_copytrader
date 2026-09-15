@@ -145,4 +145,5 @@ class EarlyRuntime:
                     if isinstance(context, dict):
                         self.report("early_quote_requests", proposal_id=proposal_id,
                             relationship_id=policy.relationship_id,
+                            route_retry=context.get("route_retry"),
                             **{k: context.get(k, 0) for k in ("route_requests", "build_requests", "quote_reuses", "refreshes")})

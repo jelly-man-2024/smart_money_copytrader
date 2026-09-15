@@ -23,6 +23,7 @@ from .execution_controls import (
 from .paper import AGGREGATOR_PROVIDERS
 from .quotes import assess_quote
 from .verified_feed_intent import VerifiedFeedIntent
+from .simulation_diagnostics import AggregatorSimulationError
 
 
 def check_early_execution_source(store, intent, signal, proposal, now=None):
@@ -153,8 +154,75 @@ class ExecutionPreparer:
                                  int(row["transaction"]["nonce"]),
                                  row["transaction"], row["preflight"], existing)
 
+    async def _simulate_with_gas_retry(self, plan, validate, *, allow_retry=True):
+        """One unsigned retry, changing only gas. A wrapped revert may hide OOG."""
+        try:
+            return plan, await simulate_aggregator_execution(self.rpc, plan)
+        except AggregatorSimulationError as original:
+            category = (original.diagnostic.get("rpc_error") or {}).get("message_category")
+            if (not allow_retry or plan.execution_provider != "kyber"
+                    or original.diagnostic.get("failure_kind") != "rpc_failure"
+                    or category not in {"execution_reverted", "out_of_gas"}):
+                raise
+            max_fee = int(plan.max_fee_per_gas)
+            gas_limit = min((plan.gas_limit * 3 + 1) // 2, 2_000_000)
+            if max_fee > 0:
+                gas_limit = min(gas_limit, int(self.quote_policy.max_gas_cost_wei) // max_fee)
+            if gas_limit <= plan.gas_limit:
+                raise
+            retry_plan = replace(plan, gas_limit=gas_limit)
+            evidence = {"status": "started", "original_gas_limit": plan.gas_limit,
+                        "retry_gas_limit": gas_limit,
+                        "original_simulation_failure": original.diagnostic}
+            started = time.monotonic()
+            try:
+                validate()
+                # Check funds/allowance/fee budget before the extra simulation.
+                # This read-only preflight does not reserve a nonce.
+                await ReadOnlyExecutionPreflight(
+                    self.rpc, EXECUTION_TARGETS,
+                    self.quote_policy.max_gas_cost_wei).check(retry_plan)
+                validate()
+                result = await simulate_aggregator_execution(self.rpc, retry_plan)
+                validate()
+                evidence["status"] = "simulation_passed"
+                return retry_plan, {**result, "gas_retry": evidence}
+            except AggregatorSimulationError as failed:
+                evidence["status"] = "failed"
+                failed.diagnostic = {**failed.diagnostic, "gas_retry": evidence}
+                raise
+            finally:
+                evidence["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
+
     async def prepare(self, signal, proposal_id: str,
                       now: float | None = None, *, early_intent=None) -> PreparedExecution:
+        try:
+            return await self._prepare(signal, proposal_id, now, early_intent=early_intent)
+        except AggregatorSimulationError as exc:
+            retry = getattr(self.quoter, "begin_simulation_route_retry", None)
+            proposal = self.store.paper_proposal(proposal_id)
+            if retry is None or proposal is None or self.store.execution_plan(proposal_id):
+                raise
+            evidence = retry(signal, proposal["amount_in_raw"], exc.diagnostic)
+            if evidence is None:
+                raise
+            started = time.monotonic()
+            try:
+                result = await self._prepare(
+                    signal, proposal_id, now, early_intent=early_intent,
+                    retry_evidence=evidence,
+                    minimum_floor=exc.diagnostic["minimum_amount_out_raw"],
+                    original_deadline=exc.diagnostic["deadline"])
+                evidence["status"] = "prepared"
+                return result
+            except BaseException:
+                evidence["status"] = "failed"
+                raise
+            finally:
+                evidence["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
+
+    async def _prepare(self, signal, proposal_id, now=None, *, early_intent=None,
+                       retry_evidence=None, minimum_floor=None, original_deadline=None):
         fixed_now = now
         existing = self.store.execution_plan(proposal_id)
         if existing:
@@ -183,7 +251,10 @@ class ExecutionPreparer:
         if signal.protocol in AGGREGATOR_PROVIDERS:
             swap = await self.quoter.build_aggregator_transaction(
                 signal, proposal["amount_in_raw"], follower,
-                self.quote_policy.max_slippage_bps, int(now) + self.deadline_seconds)
+                self.quote_policy.max_slippage_bps,
+                original_deadline if original_deadline is not None else int(now) + self.deadline_seconds)
+            if minimum_floor is not None and int(swap.minimum_amount_out_raw) < int(minimum_floor):
+                raise ValueError("alternative route minimum below original protected minimum")
             # The built transaction's own output is the figure its on-chain minimum
             # protects, so risk is assessed on that fresher figure; the route quote
             # keeps supplying the small reference quote for price-impact estimation.
@@ -210,7 +281,16 @@ class ExecutionPreparer:
                     signal, follower, relationship, proposal_id, quote,
                     risk["minimum_amount_out_raw"], swap, gas_limit, str(max_fee), "0",
                     self.allowed_protocols, self.allowed_assets, self.allowed_routes)
-            simulation = await simulate_aggregator_execution(self.rpc, plan)
+            def validate_retry():
+                checked_at = time.time() if fixed_now is None else fixed_now
+                check_early_execution_source(self.store, early_intent, signal, proposal, checked_at)
+                ok, why, _ = assess_quote(
+                    signal, quote, reference, self.quote_policy, gas_price_raw, checked_at)
+                if not ok:
+                    raise ValueError(f"execution quote invalid during gas retry: {why}")
+
+            plan, simulation = await self._simulate_with_gas_retry(
+                plan, validate_retry, allow_retry=retry_evidence is None)
             simulation["aggregator"] = swap.public_evidence()
         else:
             plan = build_execution_plan(
@@ -223,6 +303,8 @@ class ExecutionPreparer:
             self.rpc, EXECUTION_TARGETS,
             self.quote_policy.max_gas_cost_wei).check(plan, now)
         preflight.update(simulation)
+        if retry_evidence is not None:
+            preflight["route_retry"] = {**retry_evidence, "status": "simulation_passed"}
         completed_at = time.time() if fixed_now is None else fixed_now
         check_early_execution_source(self.store, early_intent, signal, proposal, completed_at)
         accepted, reason, _ = assess_quote(

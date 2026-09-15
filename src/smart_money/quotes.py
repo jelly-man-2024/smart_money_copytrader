@@ -190,6 +190,7 @@ class LiveQuoter:
         context = {"binding": (operation, follower, snapshot), "max_age": max_age_seconds,
                    "bundle": None, "routes": {}, "route_requests": 0,
                    "build_requests": 0, "quote_reuses": 0, "refreshes": 0}
+        context.update(excluded_sources=(), route_retry=None)
         token = self._context.set(context)
         try:
             yield context
@@ -210,6 +211,36 @@ class LiveQuoter:
         if client is None:
             raise ValueError(f"aggregator provider is not configured: {protocol}")
         return client
+
+    def begin_simulation_route_retry(self, signal, amount_in_raw, diagnostic):
+        """One operation-local alternative, not a diagnosis or a token blacklist."""
+        context = self._context.get()
+        error = diagnostic.get("rpc_error") or {}
+        if (signal.protocol != "kyber" or context is None or context["route_retry"] is not None
+                or diagnostic.get("failure_kind") != "rpc_failure"
+                or error.get("message_category") != "execution_reverted"):
+            return None
+        route = context["routes"].get(self._quote_key(signal, amount_in_raw))
+        if route is None or "uniswap-v4" not in route.sources():
+            return None
+        evidence = {"status": "started", "excluded_sources": ["uniswap-v4"],
+                    "reason": "simulation_revert_with_v4_route_not_proven_v4_cause",
+                    "original_route_response_hash": route.response_hash,
+                    "original_simulation_failure": diagnostic}
+        context["route_retry"] = evidence
+        context["excluded_sources"] = ("uniswap-v4",)
+        context["bundle"] = None
+        context["routes"].clear()
+        context["refreshes"] += 1
+        return evidence
+
+    async def _request_route(self, signal, amount_in_raw):
+        context = self._context.get()
+        kwargs = {}
+        if signal.protocol == "kyber" and context and context["excluded_sources"]:
+            kwargs["excluded_sources"] = context["excluded_sources"]
+        return await self._aggregator(signal.protocol).route(
+            signal.token_in, signal.token_out, amount_in_raw, **kwargs)
 
     async def build_aggregator_transaction(self, signal: Signal, amount_in_raw: str,
                                            follower_wallet: str, slippage_bps: int,
@@ -234,7 +265,7 @@ class LiveQuoter:
         if route is None:
             if context:
                 context["route_requests"] += 1
-            route = await client.route(signal.token_in, signal.token_out, amount_in_raw)
+            route = await self._request_route(signal, amount_in_raw)
         if context:
             context["build_requests"] += 1
         swap = await client.build(route, follower_wallet, slippage_bps, deadline)
@@ -397,8 +428,7 @@ class LiveQuoter:
             context = self._context.get()
             if context:
                 context["route_requests"] += 1
-            route = await self._aggregator(signal.protocol).route(
-                signal.token_in, signal.token_out, amount_in_raw)
+            route = await self._request_route(signal, amount_in_raw)
             if context:
                 context["routes"][self._quote_key(signal, amount_in_raw)] = route
             return Quote(signal.protocol, route.router, block_number,

@@ -13,6 +13,7 @@ import asyncio
 from dataclasses import dataclass
 import hashlib
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -56,6 +57,22 @@ class KyberRoute:
     route_summary: dict
     observed_at: float
     response_hash: str
+
+    def sources(self) -> frozenset[str]:
+        """Only trust complete, bounded hop metadata; unknown layout stays unknown."""
+        routes = self.route_summary.get("route")
+        if not isinstance(routes, list) or not 1 <= len(routes) <= 64:
+            return frozenset()
+        sources = set()
+        for branch in routes:
+            if not isinstance(branch, list) or not 1 <= len(branch) <= 64:
+                return frozenset()
+            for hop in branch:
+                source = hop.get("exchange") if isinstance(hop, dict) else None
+                if not isinstance(source, str) or not re.fullmatch(r"[a-z0-9_-]{1,64}", source):
+                    return frozenset()
+                sources.add(source)
+        return frozenset(sources)
 
 
 @dataclass(frozen=True)
@@ -205,18 +222,27 @@ class KyberAggregatorClient:
                           router, summary, observed_at, self._hash(document))
 
     async def route(self, input_asset: str, output_asset: str,
-                    amount_in_raw: str) -> KyberRoute:
+                    amount_in_raw: str, *, excluded_sources: tuple[str, ...] = ()) -> KyberRoute:
         input_asset, output_asset = address(input_asset), address(output_asset)
         if NATIVE in {input_asset, output_asset}:
             raise ValueError("Kyber execution currently supports ERC-20 pairs only")
         if input_asset == output_asset:
             raise ValueError("Kyber route assets must differ")
         _raw_uint(amount_in_raw, "requested amount", positive=True)
-        document = await asyncio.to_thread(self._request, "routes", {
+        if (not isinstance(excluded_sources, tuple) or len(excluded_sources) > 16
+                or any(not isinstance(s, str) or not re.fullmatch(r"[a-z0-9_-]{1,64}", s)
+                       for s in excluded_sources)):
+            raise ValueError("invalid Kyber source exclusions")
+        query = {
             "tokenIn": input_asset, "tokenOut": output_asset, "amountIn": amount_in_raw,
-        })
-        return self._parse_route(document, input_asset, output_asset, amount_in_raw,
-                                 time.time())
+        }
+        if excluded_sources:
+            query["excludedSources"] = ",".join(excluded_sources)
+        document = await asyncio.to_thread(self._request, "routes", query)
+        route = self._parse_route(document, input_asset, output_asset, amount_in_raw, time.time())
+        if excluded_sources and (not route.sources() or route.sources().intersection(excluded_sources)):
+            raise KyberApiError("Kyber route did not satisfy source exclusions")
+        return route
 
     def _parse_build(self, document: dict, route: KyberRoute, follower_wallet: str,
                      deadline: int, observed_at: float) -> KyberSwapTransaction:
