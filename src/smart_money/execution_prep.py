@@ -384,13 +384,18 @@ class UnsignedExecutionPlan:
 
 
 class ReadOnlyExecutionPreflight:
-    def __init__(self, rpc, allowed_targets: frozenset[str], max_gas_cost_wei: str):
+    def __init__(self, rpc, allowed_targets: frozenset[str], max_gas_cost_wei: str,
+                 *, max_quote_age_seconds: float = 2.0):
+        if (type(max_quote_age_seconds) not in (int, float)
+                or not 0 < max_quote_age_seconds <= 60):
+            raise ValueError("invalid execution quote age limit")
         self.rpc = rpc
         self.allowed_targets = allowed_targets
         self.max_gas_cost = _uint(max_gas_cost_wei, "gas cost limit")
+        self.max_quote_age_seconds = max_quote_age_seconds
 
     async def check(self, plan: UnsignedExecutionPlan, now: float | None = None) -> dict:
-        plan.validate(self.allowed_targets, now)
+        plan.validate(self.allowed_targets, now, self.max_quote_age_seconds)
         pending_nonce = number(await self.rpc.call(
             "eth_getTransactionCount", [plan.follower_wallet, "pending"]))
         native_balance = number(await self.rpc.call(
@@ -431,6 +436,7 @@ class ReadOnlyExecutionPreflight:
             "token_allowance_raw": str(token_allowance) if token_allowance is not None else None,
             "network_gas_price_wei": str(network_gas_price),
             "maximum_gas_cost_wei": str(gas_cost),
+            "quote_max_age_seconds": self.max_quote_age_seconds,
             "checked_at": time.time() if now is None else now,
             "read_only": True,
         }

@@ -181,7 +181,8 @@ class ExecutionPreparer:
                 # This read-only preflight does not reserve a nonce.
                 await ReadOnlyExecutionPreflight(
                     self.rpc, EXECUTION_TARGETS,
-                    self.quote_policy.max_gas_cost_wei).check(retry_plan)
+                    self.quote_policy.max_gas_cost_wei,
+                    max_quote_age_seconds=self.quote_policy.max_age_seconds).check(retry_plan)
                 validate()
                 result = await simulate_aggregator_execution(self.rpc, retry_plan)
                 validate()
@@ -301,7 +302,8 @@ class ExecutionPreparer:
             )
         preflight = await ReadOnlyExecutionPreflight(
             self.rpc, EXECUTION_TARGETS,
-            self.quote_policy.max_gas_cost_wei).check(plan, now)
+            self.quote_policy.max_gas_cost_wei,
+            max_quote_age_seconds=self.quote_policy.max_age_seconds).check(plan, now)
         preflight.update(simulation)
         if retry_evidence is not None:
             preflight["route_retry"] = {**retry_evidence, "status": "simulation_passed"}
@@ -411,7 +413,8 @@ class OfflineExecutionSigner:
             quote_block_number=quote.block_number, quote_block_hash=quote.block_hash)
         preflight = await ReadOnlyExecutionPreflight(
             self.rpc, frozenset({original.to}),
-            self.quote_policy.max_gas_cost_wei).check(refreshed, now)
+            self.quote_policy.max_gas_cost_wei,
+            max_quote_age_seconds=self.quote_policy.max_age_seconds).check(refreshed, now)
         if preflight["pending_nonce"] > reservation["nonce"]:
             raise ValueError("reserved nonce is behind current pending nonce")
         if original.execution_provider in AGGREGATOR_PROVIDERS:
@@ -538,7 +541,8 @@ class ReadOnlyPreBroadcastReviewer:
             quote_block_number=quote.block_number, quote_block_hash=quote.block_hash)
         preflight = await ReadOnlyExecutionPreflight(
             self.rpc, frozenset({original.to}),
-            self.quote_policy.max_gas_cost_wei).check(refreshed, now)
+            self.quote_policy.max_gas_cost_wei,
+            max_quote_age_seconds=self.quote_policy.max_age_seconds).check(refreshed, now)
         if preflight["pending_nonce"] != signable["nonce"]:
             raise ValueError("network pending nonce does not exactly match signed transaction")
         if original.execution_provider in AGGREGATOR_PROVIDERS:
