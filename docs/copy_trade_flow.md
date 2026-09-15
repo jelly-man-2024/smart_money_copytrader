@@ -197,6 +197,36 @@ claim与swap保留为独立子动作：不跟claim，但不丢弃后续能闭合
 仅当enrich没有主动signals且外层成功时，才额外分析被动收款。已有主动signals的混合交易，其他收款人不一定
 另产信号，这是覆盖边界。无Swap记INCOMING_TRANSFER，有Swap记EXTERNAL_DELIVERY_CANDIDATE。
 
+**2026-09-15 追加：直接转账跳过入账补证（代码已实现，需重启加载）。**
+开启 Relay 自动关联时，在原始入账信号入库及查询订单前，使用已有 calldata/receipt 作本地判断，
+不增加 RPC。`receipts.direct_token_transfer_evidence()` 只有以下条件全部满足才返回跳过依据：
+
+- 顶层直接调用收到的代币合约，value=0，标准 `transfer(address,uint256)`（`0xa9059cbb`）
+  或 `transferFrom(address,address,uint256)`（`0x23b872dd`），参数严格为 68/100 bytes，地址编码合法。
+- 同一交易的成功回执恰好一条标准 ERC20 Transfer，token、from、to、正数 amount 逐项匹配，
+  to 为当前信号钱包；transfer 的 from 取 tx.sender，transferFrom 的 from 取参数 owner，
+  不是 operator。排除零地址转出/转入、自转账、removed 日志。
+- 其他日志只允许同一代币的标准 Approval。多个 Transfer、金额不符、未知/畸形日志、Swap、
+  Relay 交付事件、包装/批量/未知调用均保留原查询行为；不按 selector 单独过滤。
+
+匹配时保持 `INCOMING_TRANSFER/needs_review` 和 `copy_eligible=false`，在现有 signals.evidence 中保存：
+`relay_lookup_skipped=true`、`relay_lookup_skip_reason=direct_token_transfer`、
+`relay_lookup_skip_evidence={rule,selector,token,sender,recipient,amount_raw,provenance}`。
+rule 为 `direct-token-transfer-v1`，amount_raw 为十进制字符串，provenance 为
+`transaction_calldata_and_receipt`。不删除 candidates/signals，不新增完整原始回执归档或数据库表。
+
+跳过的信号不产生 Relay 查询/重试；整笔交易没有其他待补证信号时按原流程 complete 并保存 inclusion。
+任务 complete 表示处理完成，不代表收币已证明为买入。旧 pending/retry 自然调度时适用新规则，
+不批量重写历史、不重置 attempts、不重新激活 failed。离线 `relay-associate` 仍可用保存的订单文件
+作严格人工补证。日志事件及 health counter 均为 `relay_lookup_skipped`；counter 是进程内跳过处理
+次数，同一交易因其他信号重试可重复计数，不能当去重交易数。数据库统计应按 tx_hash/event_id 去重。
+
+这是用户接受的查询过滤策略，不是“绝无购买”的证明：没有任何可识别标记的跨链直接转币履约也可能
+被跳过。Feed 提前 BUY/SELL 本来就要求受支持买卖意向及归属，普通转账不满足；这次不改变该入口，
+也不改变 receipt SELL 补证或交易执行门槛。主要减少补证负担，现场提速需上线后独立测量。
+
+未命中上述过滤时继续查询订单，以下严格关联条件保持不变。
+
 `relay_passive_buy()` 必须全部通过：
 
 1. 本地候选成功，钱包净变化中只有一种正向Token credit。

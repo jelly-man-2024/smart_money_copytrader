@@ -2,6 +2,477 @@
 
 历史交接记录起始于 2026-09-12，后续进展按日期追加。
 
+## 2026-09-15 Kyber 原调用有界增 Gas 恢复（已实现，未重启）
+
+用户批准修改；本次不修改数据库、运行配置或进程，不签名、不广播、不重发旧提案。
+`ExecutionPreparer` 在准备阶段首次 Kyber RPC 模拟回滚（execution_reverted/out_of_gas）后，
+保持 calldata、输入量、minOut、收款人、Gas 单价和 deadline 不变，仅提高 gas_limit，
+进行一次有界模拟。新上限为原值的 1.5 倍向上取整，最多 2,000,000，并受现有
+`max_gas_cost_wei / maxFeePerGas` 约束；没有提升空间则不试。不把通过重试等同于已证实 OOG。
+
+额外模拟前验证余额、allowance、当前费率与费用预算，并在异步检查前后复核原 Feed 意向和报价。
+通过后照常执行完整 preflight、时效复核，再预留 nonce、持久化新上限；后续签名/广播沿用该
+不可变计划。不对已准备/签名计划补改 Gas。传输错误、余额错误、无输出、低于 minOut 等不触发此恢复。
+原路线增 Gas 后仍 RPC 回滚，才由既有换路条件判断是否排除 `uniswap-v4` 再试；替代路线不再增 Gas。
+成功路径不加请求；增 Gas 恢复不调用聚合器。成功记录 `preflight.gas_retry` 和
+`live_execution_prepared.gas_retry`；二次模拟失败时 `simulation_failure.gas_retry` 保留首轮诊断。
+
+依据为本项目日志 `var/log/sm-copy-early-20260915.log` 中两笔保存的未签名失败调用：
+
+| proposal | 固定重放块 | 原 gas_limit | 1,600,000 / 2,000,000 重放 |
+| --- | --- | --- | --- |
+| `46b0062011b1b7fb189a14350e6c3989a8058a14c2a3329a2ad546393bd34524` | 63417728 | 1218885 | 均成功，实际使用 1116707 |
+| `f63d5b0b966082c9b96cd91e71becd96a2306cf678023ac5df70caacd82384d1` | 63418032 | 1218885 | 均成功，实际使用 1117778 |
+
+两笔均买入 `0x648cf99e79a8e799cdd096364985e7e20d261e18`，0.1 USDG。
+原上限重放在 Hook `0x4e3468951d49f2eea976ed0d6e75ffcb44a9a544` 深层结算 OOG，
+外层包装为 `Call failed`；USDG transferFrom 成功。重放固定块 hash 分别为
+`0x9010c61267af24523dbc1dabcad28fe1e7682c0bc70ae6c2810d53eea0a24212`、
+`0x865b7bf21e25a582023e89a563794f6be8fd3b852f7bff3ef98234d12dedd7de`。
+这不是原 pending 状态的精确还原，更不是历史实盘成交证明；不推断其他回滚都是 Gas 不足。
+
+测试包含不改 calldata/保护条件、金额费用上限、过期拒绝、失败有界、增 Gas→换路顺序、
+一次 nonce/计划持久化与无额外聚合器请求。完整离线回归命令：
+`PYTHONPATH=/private/tmp/smart-money-race-evm.eYVxKo .venv/bin/python -m unittest discover -s tests -q`。
+本次 447/447 通过（含可选 EVM 测试），`git diff --check` 通过。
+
+## 2026-09-15 用户指定 0x 授权总额度 10 USDG
+
+此前操作员已完成 0.1 USDG 授权（回执 hash
+`0x9071715767d4237017064464272c4a49f0b3f469b08d3a18b7c4715279393cd1`）。
+按用户最新要求，独立脚本固定 AMOUNT 改为 10000000 raw，确认参数改为
+`--execute --confirm-approve-10-usdg`，设置总额度 10 USDG，不是增加 10 USDG。
+允许当前 allowance 为 0 或已确认的旧额度 100000；其他非零不足额仍需复核，足额不重复发送。
+使用新 journal `var/zeroex-usdg-approval-10000000.jsonl`，保留旧 0.1 USDG 成功及中止记录。
+其余钱包、spender、锁、Gas、历史状态与密钥门禁不变；未代用户签名/广播、未重启 monitor。
+新增升级金额回归，435 项全量测试通过（含可选 EVM）。下方历史命令仅代表当时版本。
+
+
+## 2026-09-15 授权 Gas 波动误拦修正
+
+第二个根因：签名前后重新计算 gasPrice×1.2，再以整笔 transaction 相等作复核；正常 Gas 波动
+也导致拒绝。inspect 新增 fixed_transaction，只使用原 maxFeePerGas 复核当前 gasPrice、原 Gas
+最大成本、余额及策略上限，其他字段必须完全一致。签名前后均走该检查，不改已签名费用或 payload。
+新增 4 项回归：正常涨跌、费用不足/余额/策略、nonce/payload 变化和带波动的模拟签名执行流程。
+完整 434 项测试（含可选 EVM）通过。
+
+本次只读复核旧 journal：仅 signing_started / signed_not_yet_submitted，无 broadcast_attempt；
+hash `0x7e673a0c9314b47368d79eaf2231fdd8829896975cb57a53a48731d5875de53c`
+的交易和回执均查询不到，nonce=201、allowance=0、未决历史计划=0。
+保持原交易费用的公开预检实际通过。未读取真实密钥、重新签名或广播，未移动/删除旧 journal。
+该记录继续阻止普通重跑。操作员可在确认无其他发单后将这一份已核验的中止记录改名归档，
+再手动执行一次；不得把此步骤当成广播超时后的通用清记录重试方案。
+
+
+## 2026-09-15 0x 授权脚本历史状态误拦修正
+
+操作员停止 monitor 后仍遇到 ValueError；未创建授权 journal，未进入密钥访问。
+根因：execution_plans 终态仍是 signed，规范回执结果在 execution_attempts；旧判断把
+158 条 signed 计划误当未决，实际尝试表是 156 confirmed / 2 reverted。
+改为按 plan_id 关联尝试：signed 必须恰好一个 confirmed/reverted，且其余只能是 replaced；
+prepared、无尝试、仅 replaced、pending/signed/orphaned、未知/NULL、多个终态继续阻断。
+cancelled 只有无尝试才通过，矛盾状态拒绝。只查询固定 follower，不改账本。
+新增 3 项回归，真实业务库仅运行 check_execution_history 得到 unresolved_execution_plans=0。
+全量 430 项测试通过（含可选 EVM）。本次未读取真实私钥、签名、广播或启动 monitor。
+
+
+## 2026-09-15 独立 0x USDG 小额授权脚本（未执行）
+
+用户要求准备连接现有私钥库的签名脚本。新增 `smart_money.zeroex_approval`，仅供操作员执行，
+未改 monitor 或全局 APPROVAL_SPENDERS。固定 chain 4663、follower
+`0x3004ab92565deeea0a2eaa27e40e297bb457e1a6`、USDG、spender
+`0x0000000000001ff3684f28c67538d4d072c22734`、授权量 `100000` raw（0.1 USDG）。
+地址来源为此前 0x 真实报价的 issues.allowance.spender，并核对
+[官方合约说明](https://docs.0x.org/docs/core-concepts/contracts)。不是给 Settler 授权。
+
+默认检查：`.venv/bin/python -m smart_money.zeroex_approval --relationship 1`。
+默认不连接 key DB；读取启用关系与公开 RPC，检查固定钱包/资产/链、合约代码存在、USDG 6 位精度、
+allowance、pending/latest nonce、Gas/ETH 余额、approve eth_call。非零但不足的 allowance 拒绝修改。
+足额返回 already_sufficient，不广播；不将既有更高授权擅自调低。
+
+操作员需要先停止 monitor，确保没有其他机器/钱包客户端使用同一钱包发交易，再显式执行：
+
+```bash
+.venv/bin/python -m smart_money.zeroex_approval --relationship 1 --execute --confirm-approve-0.1-usdg
+```
+
+执行模式复用 runtime_instance_lock（不覆盖 monitor PID），检查该 follower 无未决 execution plan，
+使用原 LiveDatabaseSigner/数据库 enabled/live 接受时间与 snapshot/急停门禁。
+固定 gas 100000，最大 Gas 费用受关系策略与 10^15 wei 较小值约束。签名前后重检状态，独立恢复
+签名 sender 并逐字段比对交易，然后通过原 MainnetBroadcaster 只发送一次，检查规范 receipt 与 allowance。
+本地锁不保护其他机器或独立钱包，因此仍要求操作员停止外部发单。
+
+`var/zeroex-usdg-approval-100000.jsonl` 在访问密钥前独占创建；只保存公开交易、nonce、hash、状态，
+不保存密钥或 raw signed bytes。超时/中断后不自动重发，也不自动清理记录；先按 hash 查链与 nonce。
+授权是独立操作，不生成跟单 lot，不占 early 交易广播名额，也不自动启用 0x 跟单 provider。
+测试仅使用假 RPC、假数据库门禁与内存一次性无资金账户；未读取真实密钥、签名或广播授权，未停后台。
+验证：427 项全量测试（含可选 EVM）通过，compileall/diff check 通过。实际仅运行默认只读检查，
+返回 ready、allowance=0、nonce=201、最大 Gas 费用 `9095280000000` wei，private_key_read=false、
+broadcast_performed=false；这些是当次快照，执行时必须重检。
+
+
+## 2026-09-15 时效再调整：Feed 7 秒、报价 6 秒
+
+按用户最新明确要求，运行时 `EARLY_FEED_MAX_AGE_SECONDS` 从 6 改为 7；纯回放的可配置上限
+同步为 7，默认历史回放仍为 3 秒。Feed timestamp 和 received_at 两个时钟均受 7 秒门槛约束，
+报价刷新不重置 Feed 时钟。同步更新运行、执行边界及部署检查相关测试的边界断言。
+业务 MySQL 已事务更新 follower `0x3004ab92565deeea0a2eaa27e40e297bb457e1a6` 的
+enabled mainnet_live 关系 1/2/3/4/5/9：quote_policy.max_age_seconds 5→6，刷新
+updated_at/live_risk_accepted_at。锁行核对身份及旧值，逐列确认其他策略字段不变，并通过
+实际配置解析。全局 QuotePolicy 默认值未改；未重启、推送、改变额度或访问密钥库。
+旧进程不会热加载，新配置与旧 snapshot 不一致会阻止执行；需用户重启后生效。
+验证：含既有可选 EVM 依赖的 421 项测试全部通过，compileall 与 diff check 通过。
+
+
+## 2026-09-15 Kyber 未签名前一次换来源恢复；其他聚合器调研
+
+用户授权先优化 Kyber，再比较其他聚合器；明确没有 0x API Key，本轮先完成优化与调研。
+未重启/部署、修改实盘配置、增加授权、读取密钥或广播。以下代码尚未提交推送。
+
+实现入口 `ExecutionPreparer.prepare`、`LiveQuoter.begin_simulation_route_retry`：
+
+- 正常路径不增加请求。仅当前 operation 的 Kyber route 元数据完整且包含 `uniswap-v4`、
+  未持久化 execution plan、准备模拟 RPC 明确分类为 `execution_reverted`，才尝试一次替代。
+- 只在已有 task-local execution_context 生效（当前 Kyber-only 实盘/early 路径）；无上下文不重试。
+  不把普通 `Call failed` 断言为 V4 根因；日志 reason 明确是试探替代而非已确诊。
+- 清除该 operation 的 full/reference/route 缓存，给新 full/reference routes 都传
+  `excludedSources=uniswap-v4`；新响应任何分支仍有 V4 或元数据缺失均拒绝。构建保留原始
+  routeSummary，重新执行完整价格、Gas、模拟、余额/allowance/nonce 与原 Feed 时效检查。
+- 最多增加两次 routes（全量与小额参考）、一次 build，以及相应只读 RPC。备选交易的链上 minOut
+  不得低于第一次失败交易的 minOut，deadline 不延长；不重置 Feed 接收时间或放宽 quote TTL。
+- 仅准备阶段能重试。签名/广播前再次模拟失败仍停止，不改已持久化交易或重试广播。
+  两次准备都失败不预留 nonce；既有外层取消逻辑释放 proposal 额度。
+- 超时、余额/Gas 错误、缺失/畸形输出、低于 minimum、非 V4 或未知来源不触发此恢复。
+  未做全局 V4 禁用、STANDARD 专用限制、跨交易黑名单，也未宣称解决全部代币/全部模拟失败。
+  `enableGasEstimation` 保持 false：先前实验证明 true 能拒绝坏路线但不能自动修好它。
+- `execution_quote_requests` / `early_quote_requests` 增加 `route_retry`：首轮诊断、原 route hash、
+  排除来源、最终 prepared/failed、额外耗时。成功准备的 plan.preflight 同时保存原失败与替代模拟
+  通过证据。prepared 不是广播成功；后续签名/回执结果仍看原 execution 账本。
+
+候选调研（2026-09-15 查阅官方资料，不代表本项目已实测）：
+
+| 候选 | 已确认 | 当前结论 |
+|---|---|---|
+| 0x Swap v2 | 官方支持 Robinhood 4663；quote 返回 calldata，issues 包含 allowance/balance/simulationIncomplete；所有 API 请求需要 Key | 优先对照，缺 Key，未测试或接入 |
+| 1inch Classic Swap | 官方支持 Robinhood 4663，可取得 quote/calldata，使用 API Key | 第二候选，未测试或接入 |
+| OKX | 仓库有独立客户端，但未接生产 execution provider | 本轮未取得明确的 Robinhood 聚合执行支持证据，不默认可用 |
+
+官方来源：
+[0x 链支持](https://docs.0x.org/docs/introduction/supported-chains)、
+[0x API 认证](https://docs.0x.org/api-reference/api-overview)、
+[0x v2 校验与 issues](https://docs.0x.org/docs/upgrading/upgrading-to-swap-v2)、
+[1inch Robinhood 发布说明](https://business.1inch.com/whats-new/robinhood-chain-support)、
+[1inch Classic Swap](https://business.1inch.com/portal/documentation/apis/swap/classic-swap/introduction)。
+
+后续比较必须使用同钱包、同 token/方向/输入量/滑点，近同时取各家报价，再以同一编号区块模拟
+精确 calldata，记录区块哈希；模拟时状态变化及余额/新 spender allowance 不足分别标记，不能把
+缺授权算坏路线，也不能为比较自动 approve 或用状态覆盖冒充实盘成功。覆盖 STANDARD 及其他代币、
+BUY/SELL、多种金额和不同时段；记录报价覆盖率、完整校验比例、模拟通过率、含所有请求的 p50/p95
+耗时、minOut、Gas、费用与限流。只测 STANDARD 或只有报价价格不构成更换首选的证据。
+若候选确实提高可执行覆盖/成功率且延时和成本可接受，再实现其独立的 calldata/recipient/spender
+验证适配及主备失败矩阵。新 spender 授权与实盘启用需要操作员确认，签名后不跨聚合器换单。
+
+离线回归：新增 `tests/test_kyber_retry.py` 8 项，覆盖来源过滤及响应违约、未知来源/错误类别拒绝、
+operation 缓存隔离、一次上限、已有 plan 不改、原 minimum/deadline 保留和实用准备链路模拟。
+完整 421 项通过（默认环境跳过 12 项可选 EVM）；compileall、pip check、diff check 通过。
+使用既有隔离可选依赖 `/private/tmp/smart-money-race-evm.eYVxKo` 再跑，421 项全部通过，无跳过。
+
+
+## 2026-09-15 Kyber 来源过滤与 gas 估算开关只读验证
+
+用户要求先验证参数，不授权上线。本轮未修改生产代码、数据库配置、交易预算或后台进程；
+未签名、广播或申请新 API key。沿用 careful 安全约束。仅调用官方 routes/route/build 和
+现有 ReadOnlyRpc allowlist 的公开查询/eth_call，所有构建结果只在诊断内存中使用。
+
+条件：chain=4663，follower=`0x3004ab92565deeea0a2eaa27e40e297bb457e1a6`，
+USDG `0x5fc5360d0400a0fd4f2af552add042d716f1d168` → STANDARD
+`0x88ad8ddf1e3898412146a534538d418c6f8a9062`，amountIn=`100000` raw（0.1 USDG），
+slippageTolerance=300，deadline 为每次构建时刻+120 秒，模拟 gas=600000，value=0。
+预检块 63332143：USDG balance=`11729877`、Router allowance=`1988500000`，输入充足。
+每次模拟使用显式历史块号。默认/仅 V2 组模拟后另复查块 hash；V4/排除 V4 组记录模拟前
+块 hash，未另做模拟后 canonical 复核。不是 Feed 触发，也没有完整策略/参考报价风控决策。
+
+验证时间：2026-09-15 11:16:42–11:18:06 SGT（route_at 1789442202.231058–1789442285.354462）。
+初始简化请求头曾 HTTP 403；使用项目原客户端完整请求头后成功，无需改 endpoint 或凭据。
+
+| GET /routes 参数 | POST /route/build enableGasEstimation | 构建结果 | 自己的 eth_call |
+| --- | --- | --- | --- |
+| 默认 | false | 成功，V2 | 成功 |
+| 默认（复用同一 routeSummary） | true | 成功，V2 | 成功 |
+| includedSources=uniswap | false | 成功，V2 | 成功 |
+| includedSources=uniswap（复用同一 routeSummary） | true | 成功，V2 | 成功 |
+| includedSources=uniswap-v4 | false | 成功，无 Hook V4 | 回滚：Error(string) `Call failed` |
+| includedSources=uniswap-v4（复用同一 routeSummary） | true | HTTP 422，API code 4227 | 没有返回可模拟交易 |
+| excludedSources=uniswap-v4 | false | 成功，V2 | 成功 |
+| excludedSources=uniswap-v4（复用同一 routeSummary） | true | 成功，V2 | 成功 |
+
+共 4 次正式 routes、8 次 build、7 次交易 eth_call：6 模拟成功、1 模拟回滚、1 在 build 阶段
+被拒绝。另有 1 次先行成功默认报价探测，不计入该矩阵。所有返回 V2 的池为
+`0x90738366a044c13ea0a1393d1761d7625ed3f0a9`，exchange=`uniswap`，poolType=`uniswap-v2`。
+V4 对照返回 exchange/poolType=`uniswap-v4`、fee=3015、tickSpacing=30、hookAddress=零地址，
+PoolId=`0x15a07a23921a44c99964558bd9c10d9c1807994ec9f9c80645697cbc781c070c`。
+此池不同于原始历史失败池；本轮仅确认新的同类无 Hook 路线外层回滚，没有新增 callTracer
+核验其内部错误 selector，不将外层 `Call failed` 单独当成内部根因证明。
+
+关键原始值与 provenance（金额均为十进制 raw）：
+
+- 默认及仅 V2 组 route amountOut=`327507242747179264`，build amountOut=
+  `327507242747179263`，minimum=`317682025464763885`，四次模拟 output 均为
+  `327507242747179264`。默认 route hash
+  `9c0187acc48315bf6d8102bb4a1569e7188889de551e261b4a7aad779f853b23`；仅 V2 route hash
+  `eeeb80e257e210332d972f26b068806ee301436baed4ebfffcdbeaf50cf09cc8`。
+- 默认 false/true 模拟块：63332164 / 63332171；仅 V2 false/true：63332186 / 63332194。
+  仅 V2 false 的 calldata SHA-256
+  `7c7214af258b96bc933234cfc7661a8e4c439948122f941abd5fae5897b16021`，块 hash
+  `0x48c77d14bd86e16fcc7f87c10e145049e9ec847c7e253a30a5348f47530a3f3b`。
+- V4 route hash=`86d8219cd910fe828a76c1663da4a4546335ecc3a2ce09eb482cfce532bf15d1`；
+  false 构建 calldata SHA-256=`d7ebffd03056120047eef04f79bdeeb2f78958a02ad59e6b12051a3d258382f4`；
+  模拟块 63332962/hash `0xf66703a263318e87af8cb5b3bd5dfb3ca3116fc2d5e8a366a687a99a25270aef`；
+  RPC code=3，Error(string) `Call failed`。true 构建 HTTP 422/API code 4227，错误正文
+  包含 revert/estimation，正文 SHA-256=`a4d7619891987b72ea637ee9f25e593e86055890e977f0d9b434ff435cf167c6`。
+  该次没有自动换路成功，没有可供签名的结果。
+- 排除 V4 route hash=`d283a9077a56bbc813e71248c3abd01a0ebd35e306085cf97ce22f7cfbbc283b`，
+  route amountOut=`342094156359443072`，build amountOut=`342094156359443071`，
+  minimum=`331831331668659778`，false/true 模拟 output 均为 `342090420469464742`。
+  模拟块分别 63332973 / 63332977；false calldata SHA-256
+  `69b0c500dcc436daacc4b59e94807952f3c6b855554ccb6070aef409cafd8174`，true 为
+  `d8d68148b76a0a80952f5b02a6b00daefee63a615f1cbda96dfbe34b55819d6e`。
+
+耗时只作为少量串行样本，不是性能基准：默认 routes=700.48ms，build false/true=
+953.08/453.54ms；仅 V2 routes=656.53ms，build=525.40/340.34ms；仅 V4 routes=679.34ms，
+false build=523.06ms、true 错误返回=411.60ms；排除 V4 routes=205.62ms，build=
+299.59/390.00ms，eth_call=65.99/56.69ms。缓存、请求顺序、链状态均不同，不能据此认定
+开启 gas 估算更快。第二次 build 复用同一 routeSummary，不把包含第一轮测试的累计耗时当成
+独立交易延时。排除 V4 的第一轮 routes+build+eth_call 三项之和约 571.20ms，未计入额外
+块查询、Feed、决策、签名或广播，更不是上链时间。
+
+结论与边界：
+
+1. `includedSources=uniswap`、`excludedSources=uniswap-v4` 均已实测返回当前可执行 V2
+   路线；可以作为本 Token 的绕行候选。前者只留一个来源，后者排除整个 DEX ID，都不是
+   精确单池过滤；后者也可能排除可用的带 Hook V4 池，不能无条件全局应用。
+2. `enableGasEstimation=true` 已实测在本次坏 V4 routeSummary 的 build 阶段报错，而非
+   自动修好/换路；它能提前发现问题，但不是恢复策略，也不能保证将来上链成功。
+3. 当前默认报价已经选择同一 V2 池，故默认与仅 V2 成功组不是“旧坏路线被修复”的证明。
+   通过 V4-only 反例和 excludedSources 对照确认来源参数确实影响选路。
+4. 仅验证 BUY、0.1 USDG、当前状态；未验证 SELL、其他 Token/金额或完整实盘风控。
+   不推断限制来源后价格始终最优或所有交易均可执行。尚未实施生产修复。
+
+参数依据：[Kyber API](https://docs.kyberswap.com/developer-guide/aggregator-api/aggregator-api-specification/evm-swaps)、
+[DEX 映射](https://github.com/KyberNetwork/kyberswap-documentation/blob/main/developer-guide/aggregator-api/dex-ids.md)、
+[V4 DexType 常量](https://github.com/KyberNetwork/kyberswap-dex-lib/blob/main/pkg/liquidity-source/uniswap/v4/constant.go)。
+原始证据为本次官方 HTTPS 响应及只读 RPC 输出；这里只留显式摘要/哈希，未声称保存完整
+route/build 响应或可独立重放的全部 calldata。
+
+## 2026-09-15 STANDARD 模拟回滚根因确认：无 Hook V4 路由不满足 Token 转账额度规则
+
+本节更新下一节尚不明确的根因。用户授权继续只读调查；未修改交易代码、白名单、策略、
+数据库或后台进程，未签名、广播。诊断通过固定源交易的独立 callTracer（5 秒、reexec=0、
+无日志）与已有保存调用 trace 入口完成，不把 callTracer 开放给生产通用 RPC 客户端。
+
+**结论仅针对 proposal `3b53a3713f7f0b7feaf32bf45e50abe599df763155e12c197f9334d8d3128aee`：**
+Kyber 构建的 USDG → STANDARD 调用选择无 Hook 的 V4 池；STANDARD 的 PoolManager 转账门控
+当时开启，需要注册 TAX_HOOK 在同一交易内先增加对应方向的临时额度。该路由没有调用 Hook，
+额度保持 0，因此 PoolManager.take 最终执行 Token.transfer 时触发 `0x206e5f37`。
+不再只是“可能存在临时权限机制”的猜测。错误和函数的 Solidity 源码名称仍未知，但调用、
+权限、存储读取/写入、额度不足分支及成功路径对照已闭环。
+
+身份与证据来源：
+
+- Token：`0x88ad8ddf1e3898412146a534538d418c6f8a9062`；历史 name()/symbol() 均为 STANDARD。
+- PoolManager：`0x8366a39cc670b4001a1121b8f6a443a643e40951`。
+- Registry：`0x855c294dd019e9e0d84c058cff7404f5f2ddca4b`；selector `0x8eaa6ac0` 参数为
+  bytes32 ASCII `TAX_HOOK`，历史返回 `0xf1ee073811b14359d850825e48d200483200edcd`。
+- 成功源交易：`0xde76423d927eb1d10a67668d8b62f1fc9bb5ce210b8ff211ce56af2a56370f27`，
+  block 63285068，status=1。失败调用来自现有 JSONL simulation_failure，重放块 63285080，
+  calldata hash、块 hash 见下一节。两个历史块的 Token 门控 getter `0x52451a9c` 都为 true，
+  TAX_HOOK 登记地址一致。
+
+追踪直接解码 PoolManager.swap 的 PoolKey（不是用 PoolManager 地址代替池身份）：
+
+| 字段 | 我们失败的保存调用 | 源交易最终成功分支 |
+| --- | --- | --- |
+| currency0 | USDG `0x5fc5360d0400a0fd4f2af552add042d716f1d168` | native ETH，零地址 |
+| currency1 | STANDARD | STANDARD |
+| fee（原始值） | 330000 | 10000 |
+| tickSpacing | 3300 | 200 |
+| hooks | 零地址 | `0xf1ee073811b14359d850825e48d200483200edcd` |
+| PoolId | `0x53699ebf1f9175df123d440875a107431ee8533cb1c14166c051f0bedd3ad565` | `0xc73f3cd3fb68288e63f008e08ef69caa0437224e420963c6aeb4526178e87ad9` |
+
+失败调用 trace 共 25 帧，swap 路径 `0.2.0.2.0.0.0.0.3`，Token.transfer 失败路径
+`0.2.0.2.0.0.0.0.4.0`。需要转出 `243475500362163640` raw，临时额度 `0`，
+原错误参数为 `(false, 243475500362163640, 0)`，无额度写入调用。
+
+成功源交易 trace 共 345 帧，必须排除祖先已经回滚的路线试探。最终生效的分支为：
+
+1. `0.1.1.5.2.0.10.0.0.0`：ETH/STANDARD PoolManager.swap。
+2. `.1`：PoolManager 调用注册 Hook 的 `0xb47b2fb1`（afterSwap）。
+3. `.1.0`：Hook → Token，selector `0xd738ee8c`，参数
+   `(false, 1087441258958955336433)`；Token 内部查询 Registry 的 TAX_HOOK 以验证调用人。
+4. `0.1.1.5.2.0.10.0.0.3.0`：PoolManager → Token.transfer，向
+   `0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef` 转出相同 raw 数量，返回 true。
+5. Token 经 wrapper/Relay 最终转给源钱包；这些节点均无回滚祖先，与成功 receipt 相符。
+
+补充交叉证据：源交易的 Kyber 试探中也出现无 Hook USDG/STANDARD 池，fee=10000、
+tickSpacing=100，Token.transfer 同样报 `0x206e5f37`；不能将它误作成功源交易的成交池。
+同一源交易也出现 Kyber 执行器通过带 TAX_HOOK 池完成额度设置及 Token 转出的局部成功，
+虽然该试探整体被 wrapper 回滚。这进一步说明不是 Kyber 执行器地址一概被禁止。
+
+历史 Token runtime 的控制流核对（代码元数据指纹见下一节）：
+
+- `0x1055` 为转账更新前检查。门控打开且 from=PoolManager 时，调用额度消费函数，方向 false；
+  to=PoolManager 时对应 true。随后才进入普通余额更新，不是把 ERC20 balance 当成临时额度。
+- `0x121b` 按方向取临时存储 key，`0x1229` TLOAD；amount > credit 时构造 `0x206e5f37`，
+  否则扣减额度。false 对应 key
+  `0x3a9c1f4b7e2d5c8a1f6b9e0d2c4a7f8b3e6d1c9a5f2b8e4d7c0a3f6b9e1d4c2a`。
+- selector `0xd738ee8c` 跳至 `0x0c4b`：查询 Registry TAX_HOOK，与 CALLER 比较；
+  不匹配回滚 `0x67373552`。通过后读取旧额度、加上入参，并通过 `0x0f7c` TSTORE 写回同一 key。
+- 在块 63285080 的只读 eth_call 中，以已登记 Hook 为 from 调用该函数成功；以 Kyber
+  executor 为 from 调用相同参数返回 `0x67373552`。这只是虚拟执行权限验证，不是发送交易，
+  也不会将额度保留给后续 eth_call 或实盘交易。
+
+项目责任边界：`kyber.py:_parse_build` 读取 API data，仅规范化十六进制大小写；
+`execution_prep.py` 同样原样采用 swap.data，没有将带 Hook PoolKey 改成无 Hook。
+内部 executor payload 当前不解码，且 build 请求 `enableGasEstimation=false`，项目依靠自己的
+签名前 eth_call 检查可执行性。本样本说明收到可报价/可 build 路线，不等于可成功执行；
+我们的模拟正确阻止了广播。未知的是 Kyber 上游为何纳入/选中这条不兼容池，而不是本次
+EVM 回滚的原因。这里不声称已取得当时上游报价服务内部状态。
+
+处理方向（尚未实施）：对这种门控 Token 排除不满足 Hook 额度规则的具体路由，改取经过
+所需 Hook 的路线，或经模拟验证可用的 V2/V3 等替代路线；换路后重做价格/时效/风控检查。
+不能只替换 hooks 字段，因为 PoolKey 改变就是另一个池，必须重新报价构建。
+不要把所有 V4 池禁用，也不要跳过模拟、放宽滑点或让 follower 直接伪造额度。
+此前新 V2 路线模拟成功是另一个时点的证据，不保证原时点可用；未新增实盘修复或自动重试。
+
+## 2026-09-15 独立历史 callTracer 诊断与 V4 Token 转出回滚定位
+
+用户另行同意只读调用追踪后，新增 `smart_money.call_trace` 独立入口，不被交易运行时导入。
+生产 `ReadOnlyRpc.call` 白名单不变，仍拒绝通用 debug_traceCall；仅诊断方法允许固定 callTracer。
+要求完整已保存的 Kyber unsigned simulation_failure、calldata SHA-256/钱包/Router/金额匹配、
+chain 4663、显式历史块号及 `--allow-rpc`。不支持 pending/latest、状态覆盖、任意 JS tracer；
+只允许可选 gas 调整至 21000–2000000，串行请求，服务端 5 秒/HTTP 10 秒超时。
+追踪前后复核块 hash、根调用绑定，输出有界调用树路径、selector、gas、失败摘要，不输出完整
+calldata、任意提供方消息或未知错误参数。失败子调用可能被捕获，不能一律视为整笔失败原因。
+无签名、广播、交易重试、配置/预算/账本写入。本轮未重启或推送。
+
+在项目虚拟环境安装完成后，按需执行一次（需要提供方支持该历史状态及 callTracer）：
+
+```sh
+.venv/bin/python -m smart_money.call_trace \
+  --log var/log/sm-copy-early-20260915.log \
+  --proposal-id 3b53a3713f7f0b7feaf32bf45e50abe599df763155e12c197f9334d8d3128aee \
+  --block 63285080 --allow-rpc
+```
+
+接口依据：[Geth debug_traceCall](https://geth.ethereum.org/docs/interacting-with-geth/rpc/ns-debug)、
+[callTracer](https://geth.ethereum.org/docs/developers/evm-tracing/built-in-tracers)。
+历史重放不是原始未固定 pending 状态的完整还原，结果显式标记这一限制。
+
+实际 RPC 追踪上述日志样本，在原报价块 63285080/hash
+`0x2fcb8db2d13507bee71b79a9fd1b93d33330b50a925d701ed9769e0443c4bc52`、
+原 gas 600000 下复现失败，根 gasUsed=213252。失败传播链为：
+
+1. Kyber Router → executor `0x8f10b468b06c6fd214b65f87778827f7d113f996`。
+2. 经 delegate adapter 调用 V4 PoolManager `0x8366a39cc670b4001a1121b8f6a443a643e40951`。
+   USDG transferFrom、转入/settle、PoolManager swap 子调用均成功。
+3. PoolManager 的 take（`0x0b0d9c09`）调用目标 Token
+   `0x88ad8ddf1e3898412146a534538d418c6f8a9062` 的 transfer（`0xa9059cbb`），
+   收款人为 executor，金额 `243475500362163640` raw。
+4. Token transfer 是该失败传播链最深的失败帧，无下层调用；剩余传入 gas=336891、
+   gasUsed=7875，返回 100 bytes 自定义错误 `0x206e5f37`，随后被外层包装为 `Call failed`。
+   原错误 SHA-256：`fabc21645030bee24cc6eaf9066020d783de0c4eb85b14268c43e7779feb911a`。
+
+补充只读验证：该块 PoolManager 实际 Token balanceOf 为 `24335925685086405201034910` raw，
+显著大于转出量；直接以 PoolManager 为 from 模拟同一 token.transfer，也得到相同错误摘要。
+字节码在 selector 常量偏移 4662 附近读取 `TLOAD` 值，与转出量比较，不足则回滚；
+错误三词为 `0 / 243475500362163640 / 0`，第一词构造使用双 ISZERO（布尔规范化）。
+因此可定位为 Token 自身的交易内临时额度/权限检查拒绝，而非普通 ERC20 余额不足；
+具体字段名、额度产生条件和为什么该 Kyber 路径未满足条件尚未取得验证源码，不能声称已确定。
+这也不是放宽报价有效期、增加 gas 或降低外层 minimum 可直接解决的问题。
+
+同一源交易 `0xde76423d927eb1d10a67668d8b62f1fc9bb5ce210b8ff211ce56af2a56370f27`
+的成功回执中，该 Token 从同一 V4 PoolManager 转给
+`0x0005ea38eb0a69d1253508ebdbdb9ea8cb26b5ef`，经包装器/Relay 转至聪明钱钱包。
+不能将本样本推广为所有 V4 路径、所有买入均失败，也不能认定该币无法卖出或存在黑名单。
+后续新 Kyber V2 报价模拟成功的对照见下一节；其状态和路由均不同，不证明当时切路必然成功。
+
+源码来源核查：该历史 Token runtime 长 6434 bytes，元数据指向 IPFS
+`QmVusfrwD8mkNRqmNKr4ZoNGv9TXw1iW8AKfFxB2u37Jmn`，metadata SHA-256
+`7084a16cd82023b4e13a21a09b571bce247bc8f46c7d2904bc0e7a05a004ef59`。
+本次 Blockscout API 返回 403、Sourcify full_match 返回 404、多处 IPFS 网关访问失败；
+未拿到可验证 ABI，故不猜测 `0x206e5f37` 的 Solidity 错误名称。
+旧摘要字段 target_data_selector=0x4f1423cc 实际来自 packed target_data 开头地址
+`0x4f1423cce26c09fb31d96eafe702fc5e22421f6a`，不能将它当作实际被调用函数；
+追踪中的 executor/delegate 函数 selector 是 `0xd9c45357`。
+
+新增 6 项离线测试：CLI 先 opt-in、生产白名单保持拒绝、链/块/原调用校验、固定 tracer
+无覆盖、重组检测、有界树及敏感原因脱敏。报价 5 秒配置仍需操作员重启后加载；
+诊断成功不表示已发生实盘成交，也不自动启用换路或重报价策略。
+验证结果：413 项全量离线测试通过（含临时可选 EVM 依赖）；普通虚拟环境同为 413 项、
+跳过 12 项。compileall、pip check、git diff --check 均通过。
+
+## 2026-09-15 报价有效期改为 5 秒；模拟回滚只读对照
+
+用户明确要求先将报价有效期改为 5 秒。已在业务 MySQL 单事务更新 follower
+`0x3004ab92565deeea0a2eaa27e40e297bb457e1a6` 的 enabled mainnet_live 关系 1/2/3/4/5/9：
+只将 quote_policy.max_age_seconds 从 2.0 改为 5.0，并同步 live_risk_accepted_at/updated_at
+记录本次配置确认。逐列校验其他字段完全相同，未操作预算、trial、额度或密钥库。
+实际 load_mysql_paper_config 复核六条均为 5.0；代码默认 QuotePolicy 仍为 2.0，不扩大到其他配置。
+Feed 仍 6 秒，滑点 300 bps、价格冲击/偏离 500 bps、Gas 上限不变。
+未重启 PID 48838；旧进程不热加载，配置复核会因 snapshot 不一致拒绝执行，需操作员重启后生效。
+重启同样会加载上一节（下方）的入账补证过滤；不要误称配置已在旧进程中生效。
+修改前 execution-audit healthy，prepared=0、signed/pending/orphaned attempt=0，历史 156 confirmed/2 reverted。
+
+针对 proposal `3b53a3713f7f0b7feaf32bf45e50abe599df763155e12c197f9334d8d3128aee` 的
+simulation_failure（来源 `var/log/sm-copy-early-20260915.log`，原模拟 1789437428.336926），
+本轮仅使用现有 ReadOnlyRpc allowlist 和 Kyber 官方 API 做只读对照，没有生成提案、签名或广播：
+
+- 原输入 USDG `100000` raw，目标 `0x88ad8ddf1e3898412146a534538d418c6f8a9062`，
+  Router `0x6131b5fae19ea4f9d964eac0408e4408b66337b5`，内部 call target
+  `0x8f10b468b06c6fd214b65f87778827f7d113f996`。原 calldata 3588 bytes，
+  SHA-256 `a57acd0a9ccd0fa221b9e8b9123ba903309b20250da0110d4a944e51223c2b1e`。
+- 源 receipt status=1，块 63285068，hash `0xba6690bab0a515c519aee204f10904b2d1b496c18f2a65bce2f61972d77f547f`；
+  报价块 63285080，hash `0x2fcb8db2d13507bee71b79a9fd1b93d33330b50a925d701ed9769e0443c4bc52`。
+  两块余额均 `11729877` raw USDG，Router allowance 均 `1988500000`，均覆盖输入。
+- 原调用分别在两个历史块以 600000、2000000 Gas 模拟，四次均 code 3 / Error(string) `Call failed`。
+  另确认顶层 ABI roundtrip 完全一致后，只在内存中将外层 minimum 从 `236174385809595060`
+  改为 `1`，在报价块/2000000 Gas 下仍同样回滚；未更改生产滑点，也不排除内层价格/限制。
+- 新 routes/build 同钱包/币对/金额、300 bps，route_at=1789439169.609123，返回单跳 V2 池
+  `0x90738366a044c13ea0a1393d1761d7625ed3f0a9`，新最低输出 `249523491810035478`。
+  route response hash `c211c6c25f95d941eeeddcef6cbcd92cc64caaf1b8be5dc33d00be18b12398b7`，
+  build response hash `7be7a089b9a67a429941d9286824e26c4e937b332cab844f23fa25de91387d39`。
+  在块 0x3c5ea67/hash `0x330e0b08595c7fd846eed38f4a4bc2a82da248545ebfe9979c949b61d1614685`
+  以 600000、2000000 Gas 均 eth_call 成功。新池地址字节未出现于旧 calldata，仅为路线差异线索，
+  未完成旧内部压缩调用解码，不将字节搜索当成池子归属证明。
+
+结论边界：历史对照复现原失败，且在这些历史状态下不是账户 USDG/Router allowance 不足，
+增加外层 Gas 或降低外层 minimum 不能解决。新构建可模拟成功，但状态/路线不同，不能倒推原
+pending 时点成功，也不能确定具体哪一跳失败。原交易没有广播 hash，debug_traceTransaction
+不能追踪它；现有白名单不允许 debug_traceCall/callTracer，本轮没有绕过或修改白名单。
+精确定位内部回滚仍需单独授权的只读调用追踪能力，或取得可验证的内部执行器解码/本地重放。
+
+## 2026-09-15 普通直接转账跳过 Relay 入账补证（未重启）
+
+新增 `receipts.direct_token_transfer_evidence()`，使用已取得的公开交易参数与成功回执，严格匹配
+顶层标准 transfer/transferFrom、收到的 token、资金转出方、当前钱包和正数金额。恰好一个 Transfer，
+其他日志只允许同 token 标准 Approval；未知/畸形日志、多个 Transfer、Swap、Relay 交付、包装调用、
+零地址/自转账等均不跳过。规则不增加 RPC，也不改变原始 receipt 分类或 Feed 提前买卖规则。
+
+monitor 在入账信号首次 emit 前写入 `relay_lookup_skipped`、`relay_lookup_skip_reason` 和完整匹配
+依据 `relay_lookup_skip_evidence`，然后跳过 destination-hash 订单查询；每次使用当前回执重算，
+不信任旧 skip 标记。保留 INCOMING_TRANSFER/needs_review，不升级 BUY，不生成跟单许可。
+没有其他待补证信号时候选正常完成并保存 inclusion；否则整笔交易仍走既有重试。
+日志和 health 的 `relay_lookup_skipped` 是本进程处理次数，不是去重交易数。无需数据库迁移，
+不删除旧记录、不复活 failed、不重置 attempts；旧 pending/retry 在自然处理时适用规则。
+
+已明确接受的风险：无额外标记的跨链直接 Token 交付也可能被过滤，匹配不是无购买的证明；
+离线 relay-associate 仍保留严格订单补证能力。详见 copy_trade_flow.md 3.4。
+新增 13 项离线测试覆盖参数/事件匹配、各类反例、真实 monitor 接线的零 Relay 请求、信号持久化、
+complete/inclusion、其他信号重试不被吞掉、旧标记不可信及关闭自动关联时不虚报跳过。
+本轮未操作生产数据库、预算、配置或后台进程，未提交推送、重启或广播；运行进程尚未加载本改动。
+验证：407 项全量测试通过（使用既有临时可选 EVM 依赖）；普通虚拟环境同为 407 项、跳过 12 项。
+pip check、compileall、git diff --check 通过。测试全部使用离线数据与模拟提供方，不代表现场延时已改善。
+
 ## 2026-09-15 部署代码后台检查（已实现，未重启）
 
 按用户明确选择，把部署代码检查与交易时效解耦，不引入缓存最长有效期。新增
