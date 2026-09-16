@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 import websockets
 
 from . import registry as R
+from .account_state import prestate_implementations
 from .decode import Decoder
 from .models import Signal, Transaction, address, number
 from .native_flows import verify_native_flows
@@ -148,6 +149,29 @@ class ArcObserver:
         if len(self._processed_order) > MAX_SEEN_TRANSACTIONS:
             self._processed.remove(self._processed_order.popleft())
 
+    async def _decode(self, tx: Transaction) -> list[Signal]:
+        """Decode self-calls only from transaction-prestate delegation proof."""
+        self.decoder.delegations.pop(tx.sender, None)
+        account_state_source = "sender_direct_call_not_delegation_dependent"
+        if tx.to == tx.sender:
+            account_state_source = "transaction_prestate_trace_unavailable"
+            try:
+                implementations, _ = await prestate_implementations(
+                    self.rpc, tx.hash, [tx.sender])
+            except (RpcError, TypeError, ValueError):
+                implementations = {}
+            else:
+                account_state_source = "transaction_prestate_unsupported_or_absent"
+            implementation = implementations.get(tx.sender)
+            if implementation is not None:
+                self.decoder.delegations[tx.sender] = implementation
+                account_state_source = "transaction_prestate_trace"
+        signals = self.decoder.decode(tx)
+        for signal in signals:
+            signal.evidence["account_state_source"] = account_state_source
+            signal.evidence["observation_source"] = tx.observation_source
+        return signals
+
     async def _transaction_from_block(self, hint: dict) -> dict:
         height = number(hint["blockNumber"])
         hinted_hash = hint["blockHash"].lower()
@@ -226,7 +250,6 @@ class ArcObserver:
 
             self.store.put_candidate(tx)
             try:
-                signals = self.decoder.decode(tx)
                 receipt = await self.rpc.receipt(tx.hash)
                 if receipt is None:
                     raise RpcError("Arc receipt is not available yet")
@@ -234,6 +257,7 @@ class ArcObserver:
                         or not self._receipt_contains_hint(receipt, hint)):
                     raise ArcCandidateRejected(
                         "Arc subscription log not confirmed by receipt")
+                signals = await self._decode(tx)
                 pool_checks = await verify_signal_pools(self.rpc, signals, receipt)
                 try:
                     native_checks = await verify_native_flows(

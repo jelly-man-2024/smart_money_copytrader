@@ -14,7 +14,7 @@ from smart_money.arc_observer import (
     ARC_CURSOR, ARC_SWAP_TOPIC, ArcCanonicalMismatch, ArcObserver,
     ArcSwapSubscriber, arc_backfill_once, validate_arc_swap_log,
 )
-from smart_money.decode import POOL_KEY, Decoder
+from smart_money.decode import CALLS, POOL_KEY, Decoder
 from smart_money.models import Transaction
 from smart_money.receipts import TRANSFER
 from smart_money.store import Store
@@ -77,6 +77,8 @@ class FakeRpc:
         }
         self.transactions = [self.transaction]
         self.block_calls = 0
+        self.trace_calls = 0
+        self.prestate = {}
         swap = hint()
         self.transaction_receipt = {
             "transactionHash": TX_HASH, "blockHash": BLOCK_HASH,
@@ -100,6 +102,9 @@ class FakeRpc:
         if method == "eth_getCode":
             self.last_code_params = params
             return "0x01"
+        if method == "debug_traceTransaction":
+            self.trace_calls += 1
+            return self.prestate
         raise AssertionError(f"unexpected RPC method {method}")
 
     async def receipt(self, tx_hash):
@@ -190,6 +195,67 @@ class ArcObserverTests(unittest.IsolatedAsyncioTestCase):
                 await observer.observe(hint())
                 self.assertEqual(await observer.observe(other_hint), [])
                 self.assertEqual(rpc.block_calls, 1)
+            finally:
+                store.close()
+
+    async def test_simple7702_self_batch_requires_transaction_prestate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "arc.sqlite3")
+            rpc = FakeRpc()
+            rpc.transaction = {
+                **rpc.transaction,
+                "to": WALLET,
+                "input": "0x34fcd5be" + encode(
+                    [CALLS], [[(R.ARC.universal_router, 0, arc_swap_calldata())]]
+                ).hex(),
+            }
+            rpc.transactions = [rpc.transaction]
+            rpc.prestate = {
+                WALLET: {"code": "0xef0100" + R.ARC.simple_account[2:]},
+            }
+            try:
+                signals = await ArcObserver(
+                    rpc, store, {WALLET: {}}).observe(hint())
+                self.assertEqual(len(signals), 1)
+                self.assertEqual(
+                    (signals[0].mode, signals[0].behavior),
+                    ("self_account", "BUY"),
+                )
+                self.assertTrue(signals[0].path.startswith("call/0/"))
+                self.assertEqual(
+                    signals[0].evidence["account_state_source"],
+                    "transaction_prestate_trace",
+                )
+                self.assertEqual(rpc.trace_calls, 1)
+            finally:
+                store.close()
+
+    async def test_unknown_self_account_implementation_remains_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "arc.sqlite3")
+            rpc = FakeRpc()
+            rpc.transaction = {
+                **rpc.transaction,
+                "to": WALLET,
+                "input": "0x34fcd5be" + encode(
+                    [CALLS], [[(R.ARC.universal_router, 0, arc_swap_calldata())]]
+                ).hex(),
+            }
+            rpc.transactions = [rpc.transaction]
+            rpc.prestate = {
+                WALLET: {"code": "0xef0100" + "99" * 20},
+            }
+            try:
+                signals = await ArcObserver(
+                    rpc, store, {WALLET: {}}).observe(hint())
+                self.assertEqual(len(signals), 1)
+                self.assertEqual(signals[0].behavior, "UNKNOWN")
+                self.assertNotEqual(signals[0].stage, "swap_evidenced")
+                self.assertEqual(
+                    signals[0].evidence["account_state_source"],
+                    "transaction_prestate_unsupported_or_absent",
+                )
+                self.assertEqual(rpc.trace_calls, 1)
             finally:
                 store.close()
 

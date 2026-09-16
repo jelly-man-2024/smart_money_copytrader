@@ -124,9 +124,12 @@ ARC = ChainRegistry(
     usdg=None,
     usdc_erc20="0x3600000000000000000000000000000000000000",
     quote_assets=frozenset({NATIVE, "0x3600000000000000000000000000000000000000"}),
-    # No Relay/EntryPoint account-abstraction world on Arc.
+    # Arc watchlist audit at block 0x143122e found 18 EIP-7702 delegations,
+    # all pointing at the canonical ERC-4337 Simple7702Account deployment;
+    # its 3,639-byte runtime exactly matched Ethereum at the same address.
+    # There is no observed Arc EntryPoint/Relay ingestion path in this phase.
     entrypoint=None,
-    simple_account=None,
+    simple_account="0xe6cae83bde06e4c305530e199d7217f42808555b",
     metamask_account=None,
     # Uniswap v4 dominates Arc volume; v2/v3 addresses are added if a decoded
     # smart-money swap needs them. All values below were confirmed on-chain via

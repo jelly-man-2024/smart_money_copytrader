@@ -91,6 +91,8 @@ Arc 主网使用独立的只读观察入口和账本，不会启动纸面或实�
 补洞；补洞按含 Swap 的区块批量读取完整交易，不逐日志重复请求。启动时扫描当前确定区块以闭合
 订阅竞态，游标哈希若与 HTTPS RPC 不一致则停止等待人工复核。可用
 `--backfill-interval` 和 `--backfill-batch` 调整有界扫描，但不能关闭规范哈希检查。
+发送者自调用时，只有交易 prestate trace 证明当时委托给已核验的 Simple7702Account，才展开其
+单调用/批调用；未知委托、缺失 trace 或新实现一律保留为 `UNKNOWN`，不会按 selector 猜测。
 
 Arc 的 native USDC（18 位）和 `0x3600…0000` ERC-20 接口（6 位）共用余额，但 raw amount
 与日志流不能混算：前者只通过有界状态差分核验，后者只读取 ERC-20 emitter 的 Transfer。

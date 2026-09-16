@@ -1744,7 +1744,7 @@ Phase 1 新增独立 `.venv/bin/sm-copy arc-monitor --seconds N`。它仅使用 
 默认账本为独立 `var/arc-observer.sqlite3`，进程锁也是独立的
 `var/sm-copy-arc.instance.lock`，所以不会改写当前业务 MySQL 或阻塞 Robinhood 进程。
 15 秒真实只读冒烟测试已成功连接 chain 5042 与 QuickNode WSS，期间未出现 watchlist 候选；
-528 项 unittest 通过，12 项可选 py-evm 测试跳过。
+当前全量 533 项 unittest 通过，12 项可选 py-evm 测试跳过。
 
 迁移 `012_arc_chain_keys.sql` 已准备，但**尚未在线执行**。它把 `chain_cursors`、
 `canonical_blocks` 主键改成 chain-scoped，现有库执行时会重建主键，必须先停写、备份并安排维护窗口。
@@ -1764,5 +1764,12 @@ Arc v4 当前每块可有数十条 Swap。首版逐日志 `eth_getTransactionByH
 WSS/RPC 重连；仍未发现 67 地址 watchlist 候选。回补后的候选 inclusion 由重新核对的区块哈希升级为
 `safe_head_confirmed`，文字明确不是 L1 finality 或盈利证明。
 
-尚未完成的 Phase 1B 项目是 Arc 专属 EIP-7702/智能账户实现识别及真实 watchlist 样本覆盖；在取得
-Arc 上实际 implementation 代码和 calldata 样本前不复用 Robinhood 的账户实现地址或猜测 ABI。
+同一区块 `0x143122e` 的只读 `eth_getCode` 盘点显示：67 个 watchlist 地址中 49 个为空代码，18 个
+是 EIP-7702 委托，并且全部指向 `0xe6ca…555b`。该实现的 Arc 运行时代码为 3,639 字节，和 Ethereum
+同地址公开部署逐字节一致（SHA-256 `e5cafd6d…8b32e74`）；ABI 继续依据 eth-infinitism 官方
+Simple7702Account/BaseAccount。Arc 自调用现在只在该交易 `prestateTracer` 证明委托时展开
+`execute`/`executeBatch`，未知实现或 trace 缺失保持 `UNKNOWN`，不会借用 latest 状态猜测。
+
+真实 Arc Swap 冒烟窗口仍未捕获 watchlist 候选，因此当前覆盖是链上账户形态盘点、跨链运行时代码
+比对与合成的正/负解码测试，不宣称已有真实 watchlist Swap calldata 样本。后续应持续只读观察并在
+首次命中后保存脱敏公开链证据夹具，再补回放测试。

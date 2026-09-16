@@ -113,8 +113,18 @@ tuple 布局。
 - `ARC_WS_URL` 的 QuickNode/Blockdaemon 90 秒延迟对比仅用于 provider 选择，未写入交易数据、
   凭据或付费采购承诺。后续有界 `arc-monitor` 冒烟测试只订阅/补抓公开 Swap 日志，未观察到
   watchlist 候选，未签名或广播；临时 SQLite 位于 `/private/tmp`，不作为交易样本或收益证据。
+- 2026-09-16 在 Arc 区块 `0x143122e` 对 67 个 watchlist 地址执行只读 `eth_getCode`：49 个为空代码，
+  18 个是 `0xef0100` EIP-7702 标记，委托目标均为
+  `0xe6cae83bde06e4c305530e199d7217f42808555b`。随后把该目标的 Arc 运行时代码与公开 Ethereum RPC
+  同地址代码逐字节比对：两者均为 3,639 字节且完全相同，SHA-256 为
+  `e5cafd6d044419dd87f11e2797e1ef8c62d838ee13b3ebbb2499745998b32e74`。只保留此聚合结果，未保存
+  endpoint、逐地址响应或凭据。解码 ABI 依据 eth-infinitism 官方 `Simple7702Account.sol` 和
+  `BaseAccount.sol`；跨链相同运行时代码不等于每笔交易都经过其批调用路径，仍须逐交易 prestate 证明。
 - 官方依据：
   https://docs.arc.io/arc/references/connect-to-arc 、
   https://docs.arc.io/arc/references/contract-addresses 、
   https://docs.arc.io/arc/references/evm-differences 、
   https://docs.arc.io/arc/references/usdc-system-events 。
+- Simple7702Account 依据：
+  https://github.com/eth-infinitism/account-abstraction/blob/develop/contracts/accounts/Simple7702Account.sol 、
+  https://github.com/eth-infinitism/account-abstraction/blob/develop/contracts/core/BaseAccount.sol 。

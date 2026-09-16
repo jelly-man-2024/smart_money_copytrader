@@ -220,6 +220,8 @@ native USDC 18 位 raw amount 与 ERC-20 USDC 6 位 raw amount 永不混算。
 
 当前观察器和 M2 纸面链路使用有界 RPC 调用，不声称
 低延迟最优；实时钱包委托按候选读取 latest，存在历史位置差异，结果写明状态来源。
+Arc 自调用路径不使用 latest：只接受该交易的 prestate trace 对已核验 Simple7702Account 的证明；
+trace 缺失或实现未知时保持 unknown。
 外部候选只靠 calldata 出现目标地址扩大集合，无法覆盖收款地址完全隐藏在链上状态
 或其他链的订单。M2 已增加按 safe head 的 Transfer 日志/完整区块补洞，但隐藏在非日志状态
 或其他链的数据仍不保证覆盖。
