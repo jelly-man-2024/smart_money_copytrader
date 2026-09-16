@@ -150,7 +150,7 @@ def assess_market_quote(quote: Quote, reference: Quote, policy: QuotePolicy,
         return False, "price_impact_exceeded", evidence
     if not isinstance(gas_price_wei, str) or not gas_price_wei.isdecimal():
         return False, "gas_price_missing", evidence
-    floor = {"v2": 200_000, "v3": 300_000, "v4": 400_000, "kyber": 350_000}[quote.protocol]
+    floor = {"v2": 200_000, "v3": 300_000, "v4": 400_000, "kyber": 350_000, "zeroex": 350_000}[quote.protocol]
     quoted_gas = int(quote.gas_estimate_raw or "0")
     gas_units = max(floor, quoted_gas + 100_000 if quoted_gas else 0)
     gas_cost = gas_units * int(gas_price_wei)
@@ -167,7 +167,7 @@ def assess_market_quote(quote: Quote, reference: Quote, policy: QuotePolicy,
     return True, None, evidence
 
 
-AGGREGATOR_PROTOCOLS = frozenset({"kyber"})
+AGGREGATOR_PROTOCOLS = frozenset({"kyber", "zeroex"})
 
 
 class LiveQuoter:
@@ -183,7 +183,7 @@ class LiveQuoter:
 
     @contextmanager
     def execution_context(self, operation: str, follower: str, snapshot: str,
-                          max_age_seconds: float):
+                          max_age_seconds: float, slippage_bps: int = 300):
         """Per-operation, per-task cache; never persists or resets quote timestamps.
 
         All balance/allowance/nonce/config checks remain outside this cache.
@@ -194,7 +194,7 @@ class LiveQuoter:
         context = {"binding": (operation, follower, snapshot), "max_age": max_age_seconds,
                    "bundle": None, "routes": {}, "route_requests": 0,
                    "build_requests": 0, "quote_reuses": 0, "refreshes": 0}
-        context.update(excluded_sources=(), route_retry=None)
+        context.update(excluded_sources=(), route_retry=None, swaps={}, slippage_bps=slippage_bps)
         token = self._context.set(context)
         try:
             yield context
@@ -303,6 +303,14 @@ class LiveQuoter:
         client = self._aggregator(signal.protocol)
         context = self._context.get()
         key = self._quote_key(signal, amount_in_raw)
+        if signal.protocol == "zeroex":
+            swap = context["swaps"].get(key) if context else None
+            if (swap is None or context["binding"][1] != follower_wallet
+                    or context["slippage_bps"] != slippage_bps
+                    or not 0 <= time.time()-swap.observed_at <= context["max_age"]
+                    or swap.deadline <= time.time() or swap.deadline > deadline):
+                raise ValueError("0x executable quote missing, expired or mismatched")
+            return swap
         route = context["routes"].get(key) if context else None
         if context and follower_wallet != context["binding"][1]:
             raise ValueError("aggregator context follower mismatch")
@@ -350,12 +358,25 @@ class LiveQuoter:
                 return bundle
             context["bundle"] = None
             context["routes"].clear()
+            context["swaps"].clear()
             context["refreshes"] += 1
         header = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
         if not isinstance(header, dict) or not isinstance(header.get("hash"), str):
             raise ValueError("quote block header missing")
+        async def full_quote():
+            if signal.protocol != "zeroex":
+                return await self._quote_at(signal, amount_in_raw, header)
+            if context is None:
+                raise ValueError("0x executable quote requires a bound operation context")
+            context["route_requests"] += 1
+            swap = await self._aggregator("zeroex").quote(signal.token_in, signal.token_out,
+                amount_in_raw, context["binding"][1], context["slippage_bps"], int(time.time())+120)
+            context["swaps"][self._quote_key(signal, amount_in_raw)] = swap
+            return Quote("zeroex", swap.to, number(header["number"]), header["hash"].lower(),
+                swap.observed_at, signal.token_in, signal.token_out, amount_in_raw,
+                swap.amount_out_raw, str(swap.gas_estimate))
         results = await asyncio.gather(
-            self._quote_at(signal, amount_in_raw, header),
+            full_quote(),
             self._quote_at(signal, str(reference_amount), header),
             self.rpc.call("eth_gasPrice"), return_exceptions=True)
         for result in results:

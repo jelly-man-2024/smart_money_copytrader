@@ -44,11 +44,11 @@ class PreflightQuoteAgeTests(IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 ReadOnlyExecutionPreflight(self.rpc, frozenset(), '1', max_quote_age_seconds=age)
 
-    async def test_all_four_pipeline_preflights_use_policy_not_literal(self):
+    async def test_all_pipeline_preflights_use_policy_not_literal(self):
         tree = ast.parse(inspect.getsource(execution_pipeline))
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name) and node.func.id == 'ReadOnlyExecutionPreflight']
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 6)
         for call in calls:
             args = {kw.arg: kw.value for kw in call.keywords}
             self.assertIn('max_quote_age_seconds', args)

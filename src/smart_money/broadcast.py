@@ -8,16 +8,18 @@ import os
 import math
 import time
 import urllib.parse
-import urllib.request
+from .http_pool import JsonConnectionPool
 
 from eth_account import Account
 from eth_account.typed_transactions import TypedTransaction
 from eth_utils import keccak
 from hexbytes import HexBytes
 
-from .execution_controls import require_mainnet_broadcast_enabled
+from .execution_controls import require_mainnet_broadcast_enabled, _stop_controls
 from .models import address
 from .registry import CHAIN_ID
+from .preflight_ticket import fingerprint
+from eth_utils import to_checksum_address
 
 
 @dataclass(frozen=True)
@@ -38,23 +40,21 @@ class MainnetBroadcaster:
         if not isinstance(timeout, (int, float)) or not 1 <= timeout <= 30:
             raise ValueError("invalid broadcast timeout")
         self.timeout = float(timeout)
+        self.transport = JsonConnectionPool(self.endpoint, capacity=1, timeout=self.timeout,
+                                            max_bytes=1024*1024)
 
-    def _request(self, raw_hex: str) -> str:
+    def close(self):
+        self.transport.close()
+
+    def _request(self, raw_hex: str, before_send=None) -> str:
         body = json.dumps({
             "jsonrpc": "2.0", "id": 1, "method": "eth_sendRawTransaction",
             "params": [raw_hex],
         }, separators=(",", ":")).encode()
-        request = urllib.request.Request(
-            self.endpoint, data=body,
-            headers={"Content-Type": "application/json",
-                     "User-Agent": "smart-money-copytrader/0.1"},
-            method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read(1024 * 1024 + 1)
-            if len(raw) > 1024 * 1024:
-                raise ValueError("broadcast RPC response limit")
-            document = json.loads(raw)
+            document = self.transport.request("POST", body=body, before_send=before_send,
+                headers={"Content-Type": "application/json",
+                         "User-Agent": "smart-money-copytrader/0.1"})
         except ValueError:
             raise
         except Exception as exc:
@@ -109,8 +109,30 @@ class MainnetBroadcaster:
                 if (isinstance(observed, bool) or not isinstance(observed, (int, float))
                         or not math.isfinite(observed) or not 0 <= now - observed <= max_age):
                     raise ValueError("market quote expired before broadcast")
-        returned_hash = await asyncio.to_thread(
-            self._request, "0x" + raw_transaction.hex())
+        ticket = getattr(review, "ticket", None)
+        if ticket is not None:
+            signable = {k: decoded[k] for k in ("chainId", "nonce", "value", "gas",
+                        "maxFeePerGas", "maxPriorityFeePerGas", "type")}
+            signable.update(to=to_checksum_address(bytes(decoded["to"])),
+                            data="0x" + bytes(decoded["data"]).hex())
+            if (fingerprint(signable) != ticket.transaction_hash or ticket.follower != recovered
+                    or ticket.relationship != relationship_id or ticket.snapshot != config_snapshot_hash
+                    or ticket.proposal_id != review.proposal_id):
+                raise ValueError("broadcast preflight ticket binding mismatch")
+            def before_send():
+                _stop_controls()
+                ticket.assert_fresh()
+                now = time.time()
+                for q in (ticket.quote, ticket.reference):
+                    if not 0 <= now-q.observed_at <= review.evidence["quote_max_age_seconds"]:
+                        raise ValueError("quote expired while waiting for broadcast connection")
+                for key in ("early_feed_expires_at", "early_trial_expires_at"):
+                    if key in review.evidence and now >= review.evidence[key]:
+                        raise ValueError("early execution expired while waiting to send")
+                ticket.claim_send()
+            returned_hash = await asyncio.to_thread(self._request, "0x"+raw_transaction.hex(), before_send)
+        else:
+            returned_hash = await asyncio.to_thread(self._request, "0x" + raw_transaction.hex())
         if returned_hash != local_hash:
             raise RuntimeError("broadcast RPC returned a different transaction hash")
         return BroadcastResult(review.proposal_id, local_hash, True)

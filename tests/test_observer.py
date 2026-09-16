@@ -4163,7 +4163,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_rpc_errors_do_not_leak_endpoint(self):
         rpc = ReadOnlyRpc('https://example.com/secret-token')
-        with patch('urllib.request.urlopen', side_effect=OSError('secret-token')):
+        with patch.object(rpc.transport, 'request', side_effect=OSError('secret-token')):
             with self.assertRaisesRegex(Exception, '^RPC transport failure: OSError$'):
                 rpc._request('eth_chainId', [], 1)
 

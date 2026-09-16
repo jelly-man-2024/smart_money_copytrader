@@ -9,6 +9,7 @@ Robinhood Chain 聪明钱跟单工程，独立于同级 `fomo_sniper`。
 - [当前跟单流程、行为矩阵与延时分析](docs/copy_trade_flow.md)
 - [Feed 提前资格规则与接口（离线）](docs/EARLY_FEED_REFERENCE.md)
 - [Feed 提前执行接线与操作员切换交接](docs/EARLY_FEED_LIVE_HANDOFF.md)
+- [执行延时优化：0x、单轮预检与连接池](docs/EXECUTION_LATENCY_2026-09-16.md)
 - [09-15 停机准备结果（已准备，未启动实盘）](docs/EARLY_FEED_PRELAUNCH_2026-09-15.md)
 - [历史 Feed 覆盖回放操作](docs/HOWTO_REPLAY_EARLY_FEED.md)
 - [观察名单历史交易路径分析](docs/WATCHLIST_ROUTE_ANALYSIS_2026-09-12.md)
@@ -58,7 +59,7 @@ v2 增加固定 race 字节码适配和独立部署快照门禁；历史 BUY 语
 `--reconstruct-context --mysql --log ...` 可进一步恢复已有历史报价并审计订单、决策及预检来源；
 避免把旧导入器的空 snapshots 误解为数据库无数据。解析加新鲜度覆盖为 133/145，完整提前资格另计。
 SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信号。
-当前测试共 464 项，包括 12 项需 `requirements-race-tests.txt` 的可选 EVM 测试；未安装可选依赖时会跳过。
+当前版本测试共 484 项，包括 12 项需 `requirements-race-tests.txt` 的可选 EVM 测试；未安装可选依赖时会跳过。
 服务器首次验证顺序为安装、单元测试、离线回放，
 再执行下面的 60 秒实时只读监听；完整历史验证记录见 [VALIDATION](docs/VALIDATION.md)。
 
@@ -71,7 +72,7 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 
 `--seconds 0` 持续运行直到 Ctrl-C。默认仅监听 60 秒，另有启动 RPC 和最多 15 秒排空时间。
 支持环境变量 `ROBINHOOD_RPC_URL`、`ROBINHOOD_FEED_URL`，也会从当前目录 `.env` 加载且
-只接受这两个键；钱包和私钥变量会被忽略。
+仅接受这两个端点键及可选 `0X_API_KEY`（0x 聚合器凭据）；钱包和私钥变量会被忽略。
 不要把含 API key 的完整 URL 提交 Git 或贴到日志中。公开端点可能限流。
 
 只读纸面模式使用独立、严格校验且不接受私钥字段的 JSON 配置。示例中的钱包和额度必须先

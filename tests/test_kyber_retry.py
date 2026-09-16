@@ -132,7 +132,11 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_gas_recovery_persists_exact_plan_without_requoting(self):
         await self.check_unsigned_pipeline(gas_recovers=True)
 
-    async def check_unsigned_pipeline(self, gas_recovers):
+    async def test_single_preflight_revalidates_changed_gas_and_route(self):
+        await self.check_unsigned_pipeline(gas_recovers=True, single_preflight=True)
+        await self.check_unsigned_pipeline(gas_recovers=False, single_preflight=True)
+
+    async def check_unsigned_pipeline(self, gas_recovers, single_preflight=False):
         follower = '0x3004ab92565deeea0a2eaa27e40e297bb457e1a6'
         output = int(SAMPLE['build']['data']['amountOut'])
         signal = replace(self.signal, evidence={'actual_input_debit_raw': self.amount,
@@ -178,7 +182,9 @@ class RetryTests(unittest.IsolatedAsyncioTestCase):
         with patch('time.time', return_value=100), patch.object(self.client, '_request', side_effect=request):
             with quoter.execution_context(H, follower, 's', 5) as ctx:
                 result = await ExecutionPreparer(store, quoter, rpc, QuotePolicy(),
-                    frozenset({'kyber', 'relay_solver'}), frozenset({R.USDG}), (), 's').prepare(signal, 'p')
+                    frozenset({'kyber', 'relay_solver'}), frozenset({R.USDG}), (), 's',
+                    single_preflight=single_preflight).prepare(signal, 'p')
+                self.assertEqual(result.ticket is not None, single_preflight)
                 self.assertEqual(result.nonce, 7)
                 self.assertEqual(len(simulations), 2 if gas_recovers else 3)
                 self.assertEqual((ctx['route_requests'], ctx['build_requests']),

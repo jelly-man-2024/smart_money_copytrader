@@ -14,9 +14,10 @@ from .quotes import QuotePolicy, assess_market_quote, assess_quote
 from .rpc import RpcError
 
 RATIO_SCALE = 1_000_000
-AGGREGATOR_PROVIDERS = frozenset({"kyber"})
+AGGREGATOR_PROVIDERS = frozenset({"kyber", "zeroex"})
 SUPPORTED_EXECUTION_PROVIDERS = frozenset({"local", *AGGREGATOR_PROVIDERS})
-AGGREGATOR_ROUTERS = {"kyber": R.KYBER_META_AGGREGATION_ROUTER_V2}
+AGGREGATOR_ROUTERS = {"kyber": R.KYBER_META_AGGREGATION_ROUTER_V2,
+                      "zeroex": R.ZERO_X_ALLOWANCE_HOLDER}
 TRIGGER_MODES = frozenset({
     "feed_intent", "receipt_success", "swap_evidenced",
     "relay_sell_evidenced", "relay_buy_evidenced", "evidenced",
@@ -113,7 +114,7 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
     if (source.protocol in {"v2", "v3", "v4"} and output_asset == source.token_out
             and not selected_aggregator):
         return source
-    if source.protocol not in {"v2", "v3", "v4", "0x", "kyber", "relay_solver"}:
+    if source.protocol not in {"v2", "v3", "v4", "0x", "kyber", "zeroex", "relay_solver"}:
         raise ValueError("source protocol has no paper execution route")
     matches = []
     definitions = list(routes or ())
@@ -268,7 +269,9 @@ def scope_reason(signal: Signal, allowed_protocols: frozenset[str] | None,
                  allowed_assets: frozenset[str] | None,
                  allowed_routes: frozenset[str] | None = None) -> str | None:
     """Validate trusted funding/intermediate assets and evidenced dynamic targets."""
-    if allowed_protocols is not None and signal.protocol not in allowed_protocols:
+    source_protocol = (signal.evidence.get("paper_execution_source_protocol", "0x")
+                       if signal.protocol == "zeroex" else signal.protocol)
+    if allowed_protocols is not None and source_protocol not in allowed_protocols:
         return "protocol_not_allowed"
     evidenced_stages = {
         "swap_evidenced", "relay_buy_evidenced", "relay_sell_evidenced",
@@ -295,7 +298,7 @@ def scope_reason(signal: Signal, allowed_protocols: frozenset[str] | None,
             route_assets.discard(dynamic_target)
         if None in route_assets or not route_assets <= allowed_assets:
             return "asset_not_allowed"
-    if allowed_routes is not None and signal.protocol not in {"0x", "kyber", "relay_solver"}:
+    if allowed_routes is not None and signal.protocol not in {"0x", "kyber", "zeroex", "relay_solver"}:
         key = signal_route_key(signal)
         if key is None or (key not in allowed_routes and dynamic_target is None):
             return "route_not_allowed"
@@ -390,6 +393,21 @@ class PaperEngine:
             value += f":snapshot:{self.config_snapshot_hash}"
         return hashlib.sha256(value.encode()).hexdigest()
 
+    async def _quote_with_provider_fallback(self, signal, quote_signal, amount):
+        from .zeroex import ZeroExApiError
+        try:
+            bundle = await self.quoter.quote_with_reference(quote_signal, amount)
+        except ZeroExApiError:
+            if (quote_signal.protocol != "zeroex" or "kyber" not in self.execution_providers
+                    or self.execution_providers.index("kyber") < self.execution_providers.index("zeroex")):
+                raise
+            signal.evidence["local_execution_route"] = aggregator_route_definition(
+                quote_signal.token_in, quote_signal.token_out, "kyber")
+            self.store.put(signal)
+            quote_signal = execution_quote_signal(signal, self.execution_routes, quote_signal.token_out)
+            bundle = await self.quoter.quote_with_reference(quote_signal, amount)
+        return quote_signal, bundle
+
     def _attribution(self, signal: Signal) -> dict:
         context = self.wallet_contexts.get(signal.wallet, {})
         source_input = signal.evidence.get(
@@ -467,8 +485,8 @@ class PaperEngine:
                 signal, False, bucket_or_reason, {"source_signal": signal.to_dict()})
         try:
             quote_signal = await self._select_buy_execution_signal(signal, amount)
-            quote, reference, gas_price = await self.quoter.quote_with_reference(
-                quote_signal, amount)
+            quote_signal, (quote, reference, gas_price) = await self._quote_with_provider_fallback(
+                signal, quote_signal, amount)
         except (RpcError, ValueError) as exc:
             return self._decision(signal, False, "quote_unavailable", {
                 "source_signal": signal.to_dict(), "quote_error_type": type(exc).__name__,
@@ -580,8 +598,8 @@ class PaperEngine:
                 signal.evidence["local_execution_route"] = route
                 quote_signal = execution_quote_signal(
                     signal, self.execution_routes, principal_asset)
-            quote, reference, gas_price = await self.quoter.quote_with_reference(
-                quote_signal, amount)
+            quote_signal, (quote, reference, gas_price) = await self._quote_with_provider_fallback(
+                signal, quote_signal, amount)
         except (RpcError, ValueError) as exc:
             return self._decision(signal, False, "quote_unavailable", {
                 "source_signal": signal.to_dict(), "quote_error_type": type(exc).__name__,

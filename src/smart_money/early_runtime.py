@@ -126,10 +126,11 @@ class EarlyRuntime:
                         raise ValueError("early trial inactive")
                     with self.quoter.execution_context(intent.candidate.operation_key,
                             policy.follower_wallet, policy.snapshot_hash,
-                            policy.quote_policy.max_age_seconds) as context:
+                            policy.quote_policy.max_age_seconds,
+                            policy.quote_policy.max_slippage_bps) as context:
                         config, portfolio = self.snapshots(intent, policy)
                         decision = await EarlyDecisionEngine(self.quoter).evaluate(intent, config, portfolio)
-                        signal = intent.quote_signal(time.time())
+                        signal = intent.quote_signal(time.time(), provider=decision["quote"]["protocol"])
                         proposal_id = hashlib.sha256((self.trial_id + ":" +
                             decision["relationship_key"]).encode()).hexdigest()
                         attr = dict(follower_wallet=policy.follower_wallet,

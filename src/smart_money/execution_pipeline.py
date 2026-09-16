@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 import hashlib
+import json
+import os
 import time
 
 from eth_account import Account
@@ -24,6 +26,7 @@ from .paper import AGGREGATOR_PROVIDERS
 from .quotes import assess_quote
 from .verified_feed_intent import VerifiedFeedIntent
 from .simulation_diagnostics import AggregatorSimulationError
+from .preflight_ticket import PreflightTicket, fingerprint
 
 
 def check_early_execution_source(store, intent, signal, proposal, now=None):
@@ -33,7 +36,7 @@ def check_early_execution_source(store, intent, signal, proposal, now=None):
         return
     if not enrolled or not isinstance(intent, VerifiedFeedIntent):
         raise ValueError("early execution requires original verified intent and trial")
-    expected = intent.quote_signal(time.time() if now is None else now)
+    expected = intent.quote_signal(time.time() if now is None else now, provider=signal.protocol)
     if signal.to_dict() != expected.to_dict():
         raise ValueError("early execution signal differs from verified intent")
     attr = proposal["attribution"]
@@ -91,21 +94,23 @@ class PreparedExecution:
     transaction: dict
     preflight: dict
     existing: bool = False
+    ticket: PreflightTicket | None = None
 
 
 class OfflineSignedExecution:
     """Signed bytes container that fails closed under generic object serialization."""
 
     __slots__ = ("plan_id", "proposal_id", "signed_tx_hash", "_raw_transaction",
-                 "preflight")
+                 "preflight", "ticket")
 
     def __init__(self, plan_id: str, proposal_id: str, signed_tx_hash: str,
-                 raw_transaction: bytes, preflight: dict):
+                 raw_transaction: bytes, preflight: dict, ticket=None):
         self.plan_id = plan_id
         self.proposal_id = proposal_id
         self.signed_tx_hash = signed_tx_hash
         self._raw_transaction = raw_transaction
         self.preflight = preflight
+        self.ticket = ticket
 
     @property
     def raw_transaction(self) -> bytes:
@@ -124,6 +129,7 @@ class ReadOnlyBroadcastReview:
     signed_tx_hash: str
     checked_at: float
     evidence: dict
+    ticket: PreflightTicket | None = None
 
 
 class ExecutionPreparer:
@@ -132,7 +138,8 @@ class ExecutionPreparer:
     def __init__(self, store, quoter, rpc, quote_policy,
                  allowed_protocols, allowed_assets, allowed_routes,
                  config_snapshot_hash: str, gas_limit_by_protocol: dict | None = None,
-                 deadline_seconds: int = 120, fee_headroom_bps: int = 2000):
+                 deadline_seconds: int = 120, fee_headroom_bps: int = 2000,
+                 single_preflight: bool = False):
         self.store, self.quoter, self.rpc = store, quoter, rpc
         self.quote_policy = quote_policy
         self.allowed_protocols = allowed_protocols
@@ -147,6 +154,7 @@ class ExecutionPreparer:
             raise ValueError("invalid execution preparation limits")
         self.deadline_seconds = deadline_seconds
         self.fee_headroom_bps = fee_headroom_bps
+        self.single_preflight = single_preflight
 
     @staticmethod
     def _result(row: dict, existing: bool) -> PreparedExecution:
@@ -179,7 +187,7 @@ class ExecutionPreparer:
                 validate()
                 # Check funds/allowance/fee budget before the extra simulation.
                 # This read-only preflight does not reserve a nonce.
-                await ReadOnlyExecutionPreflight(
+                retry_preflight = await ReadOnlyExecutionPreflight(
                     self.rpc, EXECUTION_TARGETS,
                     self.quote_policy.max_gas_cost_wei,
                     max_quote_age_seconds=self.quote_policy.max_age_seconds).check(retry_plan)
@@ -187,7 +195,8 @@ class ExecutionPreparer:
                 result = await simulate_aggregator_execution(self.rpc, retry_plan)
                 validate()
                 evidence["status"] = "simulation_passed"
-                return retry_plan, {**result, "gas_retry": evidence}
+                return retry_plan, {**result, "gas_retry": evidence,
+                                    "_validated_preflight": retry_preflight}
             except AggregatorSimulationError as failed:
                 evidence["status"] = "failed"
                 failed.diagnostic = {**failed.diagnostic, "gas_retry": evidence}
@@ -196,9 +205,11 @@ class ExecutionPreparer:
                 evidence["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
 
     async def prepare(self, signal, proposal_id: str,
-                      now: float | None = None, *, early_intent=None) -> PreparedExecution:
+                      now: float | None = None, *, early_intent=None,
+                      minimum_floor=None, original_deadline=None) -> PreparedExecution:
         try:
-            return await self._prepare(signal, proposal_id, now, early_intent=early_intent)
+            return await self._prepare(signal, proposal_id, now, early_intent=early_intent,
+                                       minimum_floor=minimum_floor, original_deadline=original_deadline)
         except AggregatorSimulationError as exc:
             retry = getattr(self.quoter, "begin_simulation_route_retry", None)
             proposal = self.store.paper_proposal(proposal_id)
@@ -212,8 +223,8 @@ class ExecutionPreparer:
                 result = await self._prepare(
                     signal, proposal_id, now, early_intent=early_intent,
                     retry_evidence=evidence,
-                    minimum_floor=exc.diagnostic["minimum_amount_out_raw"],
-                    original_deadline=exc.diagnostic["deadline"])
+                    minimum_floor=str(max(int(minimum_floor or "0"), int(exc.diagnostic["minimum_amount_out_raw"]))),
+                    original_deadline=min(original_deadline or exc.diagnostic["deadline"], exc.diagnostic["deadline"]))
                 evidence["status"] = "prepared"
                 return result
             except BaseException:
@@ -269,6 +280,7 @@ class ExecutionPreparer:
         gas_price = int(gas_price_raw)
         max_fee = (gas_price * (10000 + self.fee_headroom_bps) + 9999) // 10000
         simulation = {}
+        preflight = None
         if swap is not None:
             gas_limit = max(self.gas_limits.get(signal.protocol, 0),
                             swap.gas_estimate * 13 // 10 + 50_000)
@@ -290,8 +302,15 @@ class ExecutionPreparer:
                 if not ok:
                     raise ValueError(f"execution quote invalid during gas retry: {why}")
 
+            if self.single_preflight:
+                preflight = await ReadOnlyExecutionPreflight(
+                    self.rpc, EXECUTION_TARGETS, self.quote_policy.max_gas_cost_wei,
+                    max_quote_age_seconds=self.quote_policy.max_age_seconds).check(plan)
             plan, simulation = await self._simulate_with_gas_retry(
                 plan, validate_retry, allow_retry=retry_evidence is None)
+            retry_preflight = simulation.pop("_validated_preflight", None)
+            if self.single_preflight and retry_preflight is not None:
+                preflight = retry_preflight
             simulation["aggregator"] = swap.public_evidence()
         else:
             plan = build_execution_plan(
@@ -300,10 +319,11 @@ class ExecutionPreparer:
                 self.gas_limits.get(signal.protocol, 0), str(max_fee), "0",
                 self.allowed_protocols, self.allowed_assets, self.allowed_routes,
             )
-        preflight = await ReadOnlyExecutionPreflight(
-            self.rpc, EXECUTION_TARGETS,
-            self.quote_policy.max_gas_cost_wei,
-            max_quote_age_seconds=self.quote_policy.max_age_seconds).check(plan, now)
+        if preflight is None:
+            preflight = await ReadOnlyExecutionPreflight(
+                self.rpc, EXECUTION_TARGETS,
+                self.quote_policy.max_gas_cost_wei,
+                max_quote_age_seconds=self.quote_policy.max_age_seconds).check(plan, now)
         preflight.update(simulation)
         if retry_evidence is not None:
             preflight["route_retry"] = {**retry_evidence, "status": "simulation_passed"}
@@ -340,7 +360,16 @@ class ExecutionPreparer:
             **preflight, "requote": quote.to_dict(), "risk": risk,
         })
         persisted = self.store.execution_plan(proposal_id)
-        return self._result(persisted, not inserted)
+        result = self._result(persisted, not inserted)
+        if self.single_preflight and inserted:
+            if nonce != preflight["pending_nonce"]:
+                raise ValueError("network pending nonce does not match reserved transaction")
+            ticket = PreflightTicket(proposal_id, follower, relationship, snapshot,
+                fingerprint(transaction), fingerprint(asdict(plan)), fingerprint(signal.to_dict()),
+                quote, reference, gas_price_raw, fingerprint(asdict(self.quote_policy)),
+                json.dumps(preflight), preflight["started_monotonic"], os.getpid(), plan.deadline)
+            result = replace(result, ticket=ticket)
+        return result
 
 
 class OfflineExecutionSigner:
@@ -355,8 +384,9 @@ class OfflineExecutionSigner:
         self.relationship_gate = relationship_gate
 
     async def sign(self, signal, proposal_id: str,
-                   now: float | None = None, *, early_intent=None) -> OfflineSignedExecution:
-        return await self._sign(signal, proposal_id, now, recovering=False, early_intent=early_intent)
+                   now: float | None = None, *, early_intent=None, ticket=None) -> OfflineSignedExecution:
+        return await self._sign(signal, proposal_id, now, recovering=False,
+                                early_intent=early_intent, ticket=ticket)
 
     async def recover_signed(self, signal, proposal_id: str,
                              now: float | None = None) -> OfflineSignedExecution:
@@ -364,7 +394,7 @@ class OfflineExecutionSigner:
         return await self._sign(signal, proposal_id, now, recovering=True)
 
     async def _sign(self, signal, proposal_id: str, now: float | None,
-                    recovering: bool, early_intent=None) -> OfflineSignedExecution:
+                    recovering: bool, early_intent=None, ticket=None) -> OfflineSignedExecution:
         fixed_now = now
         row = self.store.execution_plan(proposal_id)
         expected_status = "signed" if recovering else "prepared"
@@ -399,8 +429,26 @@ class OfflineExecutionSigner:
             if (len(attempts) != 1 or attempts[0]["tx_hash"] != row["signed_tx_hash"]
                     or attempts[0]["status"] != "signed"):
                 raise ValueError("signed transaction is already observed or not recoverable")
-        quote, reference, gas_price = await self.quoter.quote_with_reference(
-            signal, proposal["amount_in_raw"])
+        if ticket is not None:
+            if recovering:
+                raise ValueError("recovery cannot reuse a preflight ticket")
+            preflight = ticket.validate(row, signal, self.quote_policy, allow_expired=True)
+            try:
+                ticket.assert_fresh()
+            except ValueError:
+                original_plan = UnsignedExecutionPlan(**row["unsigned_plan"])
+                preflight = await ReadOnlyExecutionPreflight(self.rpc, EXECUTION_TARGETS,
+                    self.quote_policy.max_gas_cost_wei,
+                    max_quote_age_seconds=self.quote_policy.max_age_seconds).check(original_plan)
+                if original_plan.execution_provider in AGGREGATOR_PROVIDERS:
+                    preflight.update(await simulate_aggregator_execution(self.rpc, original_plan))
+                ticket = replace(ticket, evidence_json=json.dumps(preflight),
+                                 started_monotonic=preflight["started_monotonic"])
+                ticket.validate(row, signal, self.quote_policy)
+            quote, reference, gas_price = ticket.quote, ticket.reference, ticket.gas_price
+        else:
+            quote, reference, gas_price = await self.quoter.quote_with_reference(
+                signal, proposal["amount_in_raw"])
         now = time.time() if now is None else now
         accepted, reason, risk = assess_quote(
             signal, quote, reference, self.quote_policy, gas_price, now)
@@ -411,13 +459,16 @@ class OfflineExecutionSigner:
         refreshed = replace(
             original, quote_observed_at=quote.observed_at,
             quote_block_number=quote.block_number, quote_block_hash=quote.block_hash)
-        preflight = await ReadOnlyExecutionPreflight(
-            self.rpc, frozenset({original.to}),
-            self.quote_policy.max_gas_cost_wei,
-            max_quote_age_seconds=self.quote_policy.max_age_seconds).check(refreshed, now)
+        if ticket is None:
+            preflight = await ReadOnlyExecutionPreflight(
+                self.rpc, frozenset({original.to}),
+                self.quote_policy.max_gas_cost_wei,
+                max_quote_age_seconds=self.quote_policy.max_age_seconds).check(refreshed, now)
         if preflight["pending_nonce"] > reservation["nonce"]:
             raise ValueError("reserved nonce is behind current pending nonce")
-        if original.execution_provider in AGGREGATOR_PROVIDERS:
+        if ticket is not None and preflight["pending_nonce"] != reservation["nonce"]:
+            raise ValueError("ticket nonce does not match reserved nonce")
+        if ticket is None and original.execution_provider in AGGREGATOR_PROVIDERS:
             preflight.update(await simulate_aggregator_execution(self.rpc, original))
         now = time.time() if fixed_now is None else fixed_now
         accepted, reason, risk = assess_quote(
@@ -428,7 +479,12 @@ class OfflineExecutionSigner:
         check_early_execution_source(self.store, early_intent, signal, proposal, now)
         if "early_trial_id" in proposal["attribution"]:
             self.store.check_early_trial_proposal(proposal_id)
+        if ticket is not None:
+            ticket.validate(row, signal, self.quote_policy)
+        signing_started = time.monotonic()
         raw = signer.sign_transaction(row["transaction"])
+        # Includes signer controls/key loading, not just cryptographic CPU time.
+        preflight["signing_ms"] = round((time.monotonic()-signing_started)*1000, 3)
         if Account.recover_transaction(raw).lower() != row["follower_wallet"]:
             raise ValueError("offline signature sender mismatch")
         tx_hash = "0x" + keccak(raw).hex()
@@ -450,7 +506,7 @@ class OfflineExecutionSigner:
             raise ValueError("execution plan signing state changed concurrently")
         return OfflineSignedExecution(
             row["plan_id"], proposal_id, tx_hash, raw,
-            {**preflight, "requote": quote.to_dict(), "risk": risk})
+            {**preflight, "requote": quote.to_dict(), "risk": risk}, ticket)
 
     def _authorize(self, row: dict) -> None:
         require_offline_signing_enabled()
@@ -489,7 +545,7 @@ class ReadOnlyPreBroadcastReviewer:
         self.relationship_gate = relationship_gate
 
     async def review(self, signal, proposal_id: str, raw_transaction: bytes,
-                     now: float | None = None, *, early_intent=None) -> ReadOnlyBroadcastReview:
+                     now: float | None = None, *, early_intent=None, ticket=None) -> ReadOnlyBroadcastReview:
         fixed_now = now
         if (not isinstance(raw_transaction, bytes) or not raw_transaction
                 or len(raw_transaction) > 1024 * 1024):
@@ -529,8 +585,17 @@ class ReadOnlyPreBroadcastReviewer:
         if (budget.get("follower_wallet") != row["follower_wallet"]
                 or budget.get("relationship_id") != row["relationship_id"]):
             raise ValueError("execution budget attribution does not match plan")
-        quote, reference, gas_price = await self.quoter.quote_with_reference(
-            signal, proposal["amount_in_raw"])
+        if ticket is not None:
+            preflight = ticket.validate(row, signal, self.quote_policy)
+            if fingerprint(signable) != ticket.transaction_hash:
+                # Normalize the checksum-only address difference in decoded bytes.
+                signable["to"] = to_checksum_address(signable["to"])
+                if fingerprint(signable) != ticket.transaction_hash:
+                    raise ValueError("signed bytes differ from preflight ticket")
+            quote, reference, gas_price = ticket.quote, ticket.reference, ticket.gas_price
+        else:
+            quote, reference, gas_price = await self.quoter.quote_with_reference(
+                signal, proposal["amount_in_raw"])
         now = time.time() if now is None else now
         accepted, reason, risk = assess_quote(
             signal, quote, reference, self.quote_policy, gas_price, now)
@@ -539,13 +604,14 @@ class ReadOnlyPreBroadcastReviewer:
         refreshed = replace(
             original, quote_observed_at=quote.observed_at,
             quote_block_number=quote.block_number, quote_block_hash=quote.block_hash)
-        preflight = await ReadOnlyExecutionPreflight(
-            self.rpc, frozenset({original.to}),
-            self.quote_policy.max_gas_cost_wei,
-            max_quote_age_seconds=self.quote_policy.max_age_seconds).check(refreshed, now)
+        if ticket is None:
+            preflight = await ReadOnlyExecutionPreflight(
+                self.rpc, frozenset({original.to}),
+                self.quote_policy.max_gas_cost_wei,
+                max_quote_age_seconds=self.quote_policy.max_age_seconds).check(refreshed, now)
         if preflight["pending_nonce"] != signable["nonce"]:
             raise ValueError("network pending nonce does not exactly match signed transaction")
-        if original.execution_provider in AGGREGATOR_PROVIDERS:
+        if ticket is None and original.execution_provider in AGGREGATOR_PROVIDERS:
             preflight.update(await simulate_aggregator_execution(self.rpc, original))
         evidence = {
             "read_only": True, "broadcast_performed": False,
@@ -566,7 +632,12 @@ class ReadOnlyPreBroadcastReviewer:
             trial = self.store.check_early_trial_proposal(proposal_id)
             evidence["early_trial_id"] = trial["trial_id"]
             evidence["early_trial_expires_at"] = trial["expires_at"]
-        return ReadOnlyBroadcastReview(proposal_id, tx_hash, now, evidence)
+            candidate = early_intent.candidate
+            from .early_timing import EARLY_FEED_MAX_AGE_SECONDS
+            evidence["early_feed_expires_at"] = min(candidate.received_at, candidate.feed_timestamp) + EARLY_FEED_MAX_AGE_SECONDS
+        if ticket is not None:
+            ticket.validate(row, signal, self.quote_policy)
+        return ReadOnlyBroadcastReview(proposal_id, tx_hash, now, evidence, ticket)
 
     def _authorize(self, row: dict) -> None:
         require_offline_signing_enabled()

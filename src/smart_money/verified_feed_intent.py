@@ -66,7 +66,9 @@ class VerifiedFeedIntent:
                     validation_mode=("periodic_monitor" if self._deployment_monitor is not None
                                      else "per_candidate_snapshot"))
 
-    def quote_signal(self, at):
+    def quote_signal(self, at, *, provider="kyber"):
+        if provider not in {"kyber", "zeroex"}:
+            raise ValueError("unsupported early execution provider")
         attribution = self.revalidate(at)
         c = self.candidate
         # Payment is a verified order amount, not a destination-chain debit.
@@ -75,7 +77,7 @@ class VerifiedFeedIntent:
                       c.side, c.path, None, "", stage="intent", execution_status="pending",
                       token_in=c.token_in, token_out=c.token_out,
                       amount_in_raw=attribution["source_amount_raw"], amount_limit_raw=minimum,
-                      exact_in=True, protocol="kyber", fresh=True,
+                      exact_in=True, protocol=provider, fresh=True,
                       evidence={"verified_feed_intent": True,
                                 "feed_max_age_seconds": EARLY_FEED_MAX_AGE_SECONDS,
                                 "copy_operation_order_id": c.order_id,

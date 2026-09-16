@@ -13,6 +13,25 @@ from smart_money.quotes import Quote, QuotePolicy
 
 
 class EarlyDecisionTests(IsolatedAsyncioTestCase):
+    async def test_zeroex_first_and_route_error_falls_back_but_rpc_failure_does_not(self):
+        from smart_money.zeroex import ZeroExApiError
+        from smart_money.rpc import RpcError
+        self.policy["execution_providers"] = ["zeroex", "kyber"]
+        self.quoter.quote_with_reference.return_value = (
+            replace(self.quote, protocol="zeroex"), replace(self.reference, protocol="zeroex"), "1")
+        self.assertEqual((await self.evaluate())["source_signal"]["protocol"], "zeroex")
+        self.quoter.quote_with_reference.reset_mock()
+        self.quoter.quote_with_reference.side_effect = [ZeroExApiError("unavailable"),
+                                                       (self.quote, self.reference, "1")]
+        result = await self.evaluate()
+        self.assertEqual(result["source_signal"]["protocol"], "kyber")
+        self.assertEqual([c.args[0].protocol for c in self.quoter.quote_with_reference.call_args_list],
+                         ["zeroex", "kyber"])
+        self.quoter.quote_with_reference.reset_mock()
+        self.quoter.quote_with_reference.side_effect = RpcError("public RPC unavailable")
+        with self.assertRaises(RpcError): await self.evaluate()
+        self.assertEqual(self.quoter.quote_with_reference.call_count, 1)
+
     def setUp(self):
         case = next(c for c in samples() if c["expected_side"] == "BUY")
         self.tx = replace(transaction_from_record(case["transaction"]),

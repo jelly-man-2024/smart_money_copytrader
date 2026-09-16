@@ -16,7 +16,7 @@ import json
 import re
 import time
 import urllib.parse
-import urllib.request
+from .http_pool import JsonConnectionPool
 
 from eth_abi import decode
 from eth_abi.exceptions import DecodingError
@@ -158,6 +158,11 @@ class KyberAggregatorClient:
         self.client_id = client_id
         self.timeout = float(timeout)
         self.allowed_routers = frozenset(address(item) for item in allowed_routers)
+        self.transport = JsonConnectionPool(self.endpoint, timeout=self.timeout,
+                                            max_bytes=MAX_RESPONSE_BYTES)
+
+    def close(self):
+        self.transport.close()
 
     @property
     def router(self) -> str:
@@ -173,16 +178,11 @@ class KyberAggregatorClient:
         if body is not None:
             payload = json.dumps(body, separators=(",", ":")).encode()
             headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(
-            url, data=payload, headers=headers, method="POST" if payload else "GET")
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                if urllib.parse.urlsplit(response.geturl()).hostname != KYBER_API_HOST:
-                    raise KyberApiError("Kyber response redirected outside official origin")
-                raw = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise KyberApiError("Kyber response exceeds size limit")
-            document = json.loads(raw)
+            parsed = urllib.parse.urlsplit(url)
+            document = self.transport.request("POST" if payload else "GET",
+                path=parsed.path + ("?" + parsed.query if parsed.query else ""),
+                body=payload, headers=headers)
         except KyberApiError:
             raise
         except Exception as exc:

@@ -18,6 +18,7 @@ from .approval import (
 )
 from .backfill import MAX_RANGE_BLOCKS, BlockScanner, ReorgDetected, relevant
 from .broadcast import MainnetBroadcaster
+from .zeroex import ZeroExAggregatorClient, ZeroExApiError
 from .config import load_endpoint_env
 from .decode import Decoder
 from .feed import DEFAULT_FEED_MAX_AGE_SECONDS, DecodeError, FeedHealth, decode_raw, envelopes
@@ -377,9 +378,10 @@ async def monitor(args):
                                if p.relationship_id in trial["relationships"])
         if (len(early_policies) != len(trial["relationships"])
                 or any(p.follower_wallet != trial["follower_wallet"]
-                       or p.run_mode != "mainnet_live" or p.execution_providers != ("kyber",)
+                       or p.run_mode != "mainnet_live" or p.execution_providers not in
+                       (("kyber",), ("zeroex",), ("zeroex", "kyber"))
                        or p.trigger_mode != "evidenced" for p in early_policies)):
-            raise ValueError("early trial scope must match enabled Kyber-only live relationships")
+            raise ValueError("early trial scope must match enabled aggregator-only live relationships")
         for table in ("copy_operation_claims", "early_trial_operations", "early_feed_jobs"):
             store.connection.execute(f"SELECT * FROM {table} LIMIT 0")
         audit = store.execution_audit()
@@ -430,6 +432,8 @@ async def monitor(args):
             for provider in policy.execution_providers:
                 if provider == "kyber" and provider not in aggregators:
                     aggregators[provider] = KyberAggregatorClient()
+                elif provider == "zeroex" and provider not in aggregators:
+                    aggregators[provider] = ZeroExAggregatorClient(os.environ.get("0X_API_KEY"))
         quoter = LiveQuoter(rpc, aggregators)
         if aggregators:
             report("execution_providers_ready", providers=sorted(aggregators),
@@ -448,7 +452,8 @@ async def monitor(args):
                 preparer = ExecutionPreparer(
                     store, quoter, rpc, policy.quote_policy,
                     policy.allowed_protocols, policy.allowed_assets,
-                    policy.allowed_routes, policy.snapshot_hash)
+                    policy.allowed_routes, policy.snapshot_hash,
+                    single_preflight=not getattr(args, "legacy_preflight", False))
                 signer = LiveExecutionSigner(
                     store, quoter, rpc, policy.quote_policy, policy.snapshot_hash,
                     relationship_gate=relationship_gate)
@@ -616,27 +621,12 @@ async def monitor(args):
             raise ValueError("live execution route is not a verified V2/V3/V4 path")
         preparer, signer, reviewer, broadcaster, _ = live_pipelines[policy.ledger_scope]
         early_options = {"early_intent": early_intent} if early_intent is not None else {}
-        if quote_signal.token_in != NATIVE:
+        if quote_signal.token_in != NATIVE and early_intent is None and quote_signal.protocol != "zeroex":
             spender = {"v2": V2_ROUTER, "v3": V3_ROUTER, **AGGREGATOR_ROUTERS}.get(
                 quote_signal.protocol)
             if spender is None:
                 raise ValueError("live token input route has no verified approval spender")
-            if early_intent is not None:
-                # No new approval transaction is sent on an expiring early intent.
-                # Existing bounded allowance must suffice; otherwise strict fallback.
-                from eth_abi import encode, decode
-                from eth_utils import keccak
-                data = keccak(text="allowance(address,address)")[:4] + encode(
-                    ["address", "address"], [policy.follower_wallet, spender])
-                raw = await rpc.call("eth_call", [{"to": quote_signal.token_in,
-                                                     "data": "0x" + data.hex()}, "pending"])
-                allowance = decode(["uint256"], bytes.fromhex(raw[2:]))[0]
-                if allowance < int(proposal["amount_in_raw"]):
-                    raise ValueError("early_allowance_insufficient_strict_fallback")
-                check_early_execution_source(store, early_intent, signal, proposal)
-            if early_intent is not None:
-                approval = None
-            elif proposal["attribution"].get("source_behavior") == "SELL":
+            if proposal["attribution"].get("source_behavior") == "SELL":
                 approval_amount = store.paper_open_position_amount(
                     policy.ledger_scope, quote_signal.token_in)
                 if int(approval_amount) < int(proposal["amount_in_raw"]):
@@ -669,17 +659,48 @@ async def monitor(args):
                        live_trading=True, **confirmation)
         stage = "prepare"
         try:
-            prepared = await preparer.prepare(quote_signal, proposal_id, **early_options)
+            try:
+                prepared = await preparer.prepare(quote_signal, proposal_id, **early_options)
+            except (ValueError, RpcError) as exc:
+                route_failure = isinstance(exc, ZeroExApiError) or (
+                    isinstance(exc, AggregatorSimulationError)
+                    and (exc.diagnostic.get("rpc_error") or {}).get("message_category")
+                    in {"execution_reverted", "out_of_gas"}) or str(exc) == "insufficient token allowance"
+                if (quote_signal.protocol != "zeroex" or policy.execution_providers != ("zeroex", "kyber")
+                        or not route_failure or store.execution_plan(proposal_id) is not None):
+                    raise
+                context = quoter._context.get()
+                swap = context["swaps"].get(quoter._quote_key(quote_signal, proposal["amount_in_raw"])) if context else None
+                previous_quote = proposal["quote"].get("quote", proposal["quote"])
+                floor = swap.minimum_amount_out_raw if swap else str(
+                    int(previous_quote["amount_out_raw"])*(10000-policy.quote_policy.max_slippage_bps)//10000)
+                deadline = swap.deadline if swap else int(time.time())+120
+                if early_intent is not None:
+                    quote_signal = early_intent.quote_signal(time.time(), provider="kyber")
+                else:
+                    from .paper import aggregator_route_definition
+                    signal.evidence["local_execution_route"] = aggregator_route_definition(
+                        quote_signal.token_in, quote_signal.token_out, "kyber")
+                    store.put(signal)
+                    quote_signal = execution_quote_signal(signal, policy.route_definitions, proposal["output_asset"])
+                report("execution_provider_fallback", proposal_id=proposal_id, previous="zeroex",
+                       provider="kyber", failure_type=type(exc).__name__)
+                prepared = await preparer.prepare(quote_signal, proposal_id, **early_options,
+                                                  minimum_floor=floor, original_deadline=deadline)
             stats["live_prepared"] += 1
             report("live_execution_prepared", proposal_id=proposal_id,
-                   gas_retry=prepared.preflight.get("gas_retry"))
+                   gas_retry=prepared.preflight.get("gas_retry"),
+                   preflight_ms=prepared.preflight.get("preflight_ms"),
+                   preflight_rpc_timings=prepared.preflight.get("rpc_timings"),
+                   simulation_ms=prepared.preflight.get("simulation_ms"),
+                   single_preflight=prepared.ticket is not None)
             stage = "sign"
-            signed = await signer.sign(quote_signal, proposal_id, **early_options)
+            signed = await signer.sign(quote_signal, proposal_id, ticket=prepared.ticket, **early_options)
             stats["live_signed"] += 1
-            report("live_execution_signed", proposal_id=proposal_id)
+            report("live_execution_signed", proposal_id=proposal_id, signing_ms=signed.preflight.get("signing_ms"))
             stage = "review"
             reviewed = await reviewer.review(
-                quote_signal, proposal_id, signed.raw_transaction, **early_options)
+                quote_signal, proposal_id, signed.raw_transaction, ticket=signed.ticket, **early_options)
             report("live_execution_reviewed", proposal_id=proposal_id)
         except (ValueError, RpcError) as exc:
             # A rejected requote, gate or simulation before any broadcast must not
@@ -863,14 +884,18 @@ async def monitor(args):
             except PermissionError:
                 report("live_new_decision_stopped", relationship_id=policy.relationship_id)
                 return
-        # Only explicitly configured Kyber-only policies opt into reuse. Each
+        # Aggregator-only policies opt into operation-scoped quote reuse. Mixed
+        # policies containing 0x also need a bound context when local discovery
+        # falls through to its executable quote. Each
         # relationship owns a task-local cache, including while waiting on its
         # wallet lock. Expired quotes are refreshed without resetting their age.
-        if policy.run_mode != "mainnet_live" or policy.execution_providers != ("kyber",):
+        if ("zeroex" not in policy.execution_providers
+                and not set(policy.execution_providers) <= AGGREGATOR_PROVIDERS):
             return await paper_observe(signal, (policy,))
         with quoter.execution_context(signal.event_id, policy.follower_wallet,
                                       policy.snapshot_hash,
-                                      policy.quote_policy.max_age_seconds) as context:
+                                      policy.quote_policy.max_age_seconds,
+                                      policy.quote_policy.max_slippage_bps) as context:
             try:
                 return await paper_observe(signal, (policy,))
             finally:
@@ -1162,6 +1187,10 @@ async def monitor(args):
             stats["ledger_reconnections"] = getattr(store.connection, "reconnections", 0)
             report("health", healthy=health.healthy(), queued=queue.qsize(), counters=dict(stats),
                    relay_http_timings=list(getattr(relay_client, "timings", ()))[-8:],
+                   rpc_http_timings=list(getattr(getattr(rpc, "transport", None), "timings", ()))[-8:],
+                   rpc_call_timings=list(getattr(rpc, "timings", ()))[-8:],
+                   aggregator_http_timings={name: list(client.transport.timings)[-8:]
+                       for name, client in (quoter.aggregators.items() if paper_config else [])},
                    early_feed_counters=dict(early_lane.stats) if early_lane else {},
                    deployment_verification=deployment_monitor.status() if deployment_monitor else None,
                    candidate_states=store.candidate_counts(), chain_cursor=store.chain_cursor(),
@@ -1306,6 +1335,15 @@ async def monitor(args):
         chain_cursor = store.chain_cursor()
         if relay_client is not None:
             relay_client.close()
+        if hasattr(rpc, "close"):
+            rpc.close()
+        if paper_config:
+            for client in quoter.aggregators.values():
+                if hasattr(client, "close"):
+                    client.close()
+            if live_pipelines:
+                if hasattr(broadcaster, "close"):
+                    broadcaster.close()
         store.close()
         report("monitor_finished", counters=dict(stats), candidate_states=candidate_states,
                early_feed_counters=dict(early_lane.stats) if early_lane else {},
@@ -1452,6 +1490,8 @@ def parser():
         help="Enable in-process evidence lane only, not early execution")
     run_parser.add_argument("--early-trial-id",
         help="Select an explicitly operator-started bounded trial; never creates or renews one")
+    run_parser.add_argument("--legacy-preflight", action="store_true",
+        help="Disable process-local preflight reuse; retain independent sign/review RPC checks")
     run_parser.set_defaults(
         watchlist="data/fomo_watchlist.csv", db="var/observer.sqlite3",
         workers=2, queue_size=256, confirmations=2, backfill_batch=2000,
@@ -1577,9 +1617,10 @@ def main():
             config = load_mysql_paper_config()
             selected = [p for p in config.relationships if p.relationship_id in args.relationships]
             if (len(selected) != len(set(args.relationships)) or len(set(args.relationships)) != len(args.relationships)
-                    or any(p.follower_wallet != args.follower or p.execution_providers != ("kyber",)
+                    or any(p.follower_wallet != args.follower or p.execution_providers not in
+                           (("kyber",), ("zeroex",), ("zeroex", "kyber"))
                            or p.trigger_mode != "evidenced" or p.run_mode != "mainnet_live" for p in selected)):
-                raise ValueError("operator trial scope must match current enabled Kyber-only live policies")
+                raise ValueError("operator trial scope must match current enabled aggregator-only live policies")
             for p in selected:
                 _risk_acceptance(p.follower_wallet, p.relationship_id, p.snapshot_hash)
             store = runtime_store(args)

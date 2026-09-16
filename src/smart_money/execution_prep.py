@@ -1,5 +1,6 @@
 """Read-only checks for unsigned execution plans. No signing or broadcast surface."""
 from __future__ import annotations
+import asyncio
 
 from dataclasses import dataclass
 import time
@@ -11,6 +12,7 @@ from eth_abi import decode
 from eth_abi.exceptions import DecodingError
 
 from .kyber import KyberSwapTransaction, decode_kyber_swap
+from .zeroex import ZeroExTransaction, decode_zeroex_swap, verify_settler
 from .models import address, number
 from .paper import AGGREGATOR_PROVIDERS, AGGREGATOR_ROUTERS, scope_reason
 from .quotes import Quote
@@ -206,7 +208,7 @@ def build_early_aggregator_execution_plan(
     from .verified_feed_intent import VerifiedFeedIntent
     if not isinstance(intent, VerifiedFeedIntent):
         raise ValueError("verified Feed intent required for early construction")
-    signal = intent.quote_signal(time.time() if now is None else now)
+    signal = intent.quote_signal(time.time() if now is None else now, provider=quote.protocol)
     source_protocol = "relay_solver" if signal.behavior == "BUY" else "kyber"
     funding = signal.token_in if signal.behavior == "BUY" else signal.token_out
     if source_protocol not in allowed_protocols or funding not in allowed_assets:
@@ -224,8 +226,9 @@ def build_early_aggregator_execution_plan(
 def _validated_aggregator_plan(signal, follower, relationship_id, proposal_id, quote,
         minimum_amount_out_raw, swap, gas_limit, max_fee_per_gas, max_priority_fee_per_gas):
     """Common exact-calldata and router validation, independent of evidence stage."""
-    if not isinstance(swap, KyberSwapTransaction):
-        raise ValueError("aggregator transaction is not a verified Kyber swap")
+    expected_type = ZeroExTransaction if signal.protocol == "zeroex" else KyberSwapTransaction
+    if type(swap) is not expected_type:
+        raise ValueError("aggregator transaction provider/type mismatch")
     amount = _uint(quote.amount_in_raw, "quote amount in")
     floor = _uint(minimum_amount_out_raw, "minimum amount out")
     if (quote.protocol != signal.protocol or quote.input_asset != signal.token_in
@@ -238,7 +241,8 @@ def _validated_aggregator_plan(signal, follower, relationship_id, proposal_id, q
         raise ValueError("aggregator router is not allowlisted")
     if signal.token_in == NATIVE or signal.token_out == NATIVE:
         raise ValueError("aggregator execution supports ERC-20 pairs only")
-    decoded = decode_kyber_swap(swap.data)
+    decoded = (decode_zeroex_swap(swap.data) if signal.protocol == "zeroex"
+               else decode_kyber_swap(swap.data))
     on_chain_minimum = _uint(swap.minimum_amount_out_raw, "aggregator minimum out")
     if (swap.input_asset != signal.token_in or swap.output_asset != signal.token_out
             or swap.recipient != follower or _uint(swap.amount_in_raw, "swap amount") != amount
@@ -266,6 +270,7 @@ def _validated_aggregator_plan(signal, follower, relationship_id, proposal_id, q
         quote_observed_at=quote.observed_at, quote_block_number=quote.block_number,
         quote_block_hash=quote.block_hash, deadline=swap.deadline,
         execution_provider=signal.protocol,
+        allowance_spender=target,
     )
 
 
@@ -293,6 +298,16 @@ async def simulate_aggregator_execution(rpc, plan: "UnsignedExecutionPlan") -> d
         suffix = f"RPC eth_call error code {code}" if type(code) is int else "RPC eth_call failed"
         raise failure(f"aggregator execution simulation reverted: {suffix}",
                       "rpc_failure", detail) from None
+    if plan.execution_provider == "zeroex":
+        try:
+            result = decode(["bytes"], bytes.fromhex(raw[2:]))[0]
+            if result != encode(["bool"], [True]):
+                raise ValueError()
+        except Exception:
+            raise failure("0x simulation returned invalid success flag", "undecodable_output") from None
+        return {"simulated": True, "simulation_block": "pending",
+                "simulation_ms": round((time.monotonic()-started_clock)*1000, 3),
+                "minimum_enforced_by_verified_settler": plan.minimum_amount_out_raw}
     if not isinstance(raw, str) or not raw.startswith("0x") or len(raw) < 130:
         raise failure("aggregator execution simulation returned no output", "missing_output")
     try:
@@ -306,6 +321,7 @@ async def simulate_aggregator_execution(rpc, plan: "UnsignedExecutionPlan") -> d
                                        "gas_used_raw": str(int(gas_used))})
     return {
         "simulated": True, "simulated_return_amount_raw": str(int(return_amount)),
+        "simulation_ms": round((time.monotonic()-started_clock)*1000, 3),
         "simulated_gas_used": str(int(gas_used)), "simulation_block": "pending",
     }
 
@@ -330,6 +346,7 @@ class UnsignedExecutionPlan:
     deadline: int
     chain_id: int = CHAIN_ID
     execution_provider: str = "local"
+    allowance_spender: str | None = None
 
     def validate(self, allowed_targets: frozenset[str], now: float | None = None,
                  max_quote_age_seconds: float = 2.0) -> None:
@@ -344,6 +361,14 @@ class UnsignedExecutionPlan:
             raise ValueError("execution provider does not match the plan target")
         if self.execution_provider == "local" and target in AGGREGATOR_EXECUTION_TARGETS:
             raise ValueError("local execution plan targets an aggregator router")
+        if self.allowance_spender is not None and address(self.allowance_spender) != target:
+            raise ValueError("unverified allowance spender")
+        if self.execution_provider == "zeroex":
+            decoded = decode_zeroex_swap(self.data)
+            if (decoded["src_token"] != self.input_asset or decoded["amount_raw"] != self.amount_in_raw
+                    or decoded["dst_receiver"] != follower
+                    or decoded["minimum_amount_out_raw"] != self.minimum_amount_out_raw):
+                raise ValueError("0x plan/calldata mismatch")
         if (not self.relationship_id or not self.proposal_id
                 or not isinstance(self.gas_limit, int) or self.gas_limit <= 0
                 or not isinstance(self.quote_block_number, int) or self.quote_block_number < 0
@@ -396,11 +421,36 @@ class ReadOnlyExecutionPreflight:
 
     async def check(self, plan: UnsignedExecutionPlan, now: float | None = None) -> dict:
         plan.validate(self.allowed_targets, now, self.max_quote_age_seconds)
-        pending_nonce = number(await self.rpc.call(
-            "eth_getTransactionCount", [plan.follower_wallet, "pending"]))
-        native_balance = number(await self.rpc.call(
-            "eth_getBalance", [plan.follower_wallet, "pending"]))
-        network_gas_price = number(await self.rpc.call("eth_gasPrice"))
+        started = time.monotonic()
+        calls = [("pending_nonce", "eth_getTransactionCount", [plan.follower_wallet, "pending"]),
+                 ("native_balance", "eth_getBalance", [plan.follower_wallet, "pending"]),
+                 ("gas_price", "eth_gasPrice", [])]
+        if plan.input_asset != NATIVE:
+            owner = bytes(12) + bytes.fromhex(plan.follower_wallet[2:])
+            for name, signature, args in (
+                    ("token_balance", "balanceOf(address)", owner),
+                    ("token_allowance", "allowance(address,address)",
+                     owner + bytes(12) + bytes.fromhex((plan.allowance_spender or plan.to)[2:]))):
+                data = "0x" + (keccak(text=signature)[:4] + args).hex()
+                calls.append((name, "eth_call", [{"to": plan.input_asset, "data": data}, "pending"]))
+        timings = {}
+        async def read(name, method, params):
+            begin = time.monotonic()
+            try:
+                return number(await self.rpc.call(method, params))
+            finally:
+                timings[name + "_ms"] = round((time.monotonic() - begin)*1000, 3)
+        tasks = [read(*call) for call in calls]
+        if plan.execution_provider == "zeroex":
+            tasks.append(verify_settler(self.rpc, plan.data))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        values = dict(zip((c[0] for c in calls), results))
+        pending_nonce = values["pending_nonce"]
+        native_balance = values["native_balance"]
+        network_gas_price = values["gas_price"]
         max_fee = _uint(plan.max_fee_per_gas, "max fee per gas")
         if max_fee < network_gas_price:
             raise ValueError("max fee is below current gas price")
@@ -413,24 +463,18 @@ class ReadOnlyExecutionPreflight:
         token_balance = None
         token_allowance = None
         if plan.input_asset != NATIVE:
-            balance_selector = keccak(text="balanceOf(address)")[:4]
-            calldata = "0x" + (balance_selector + bytes(12) + bytes.fromhex(
-                plan.follower_wallet[2:])).hex()
-            token_balance = number(await self.rpc.call(
-                "eth_call", [{"to": plan.input_asset, "data": calldata}, "pending"]))
+            token_balance = values["token_balance"]
             if token_balance < _uint(plan.amount_in_raw, "amount in"):
                 raise ValueError("insufficient token balance")
-            allowance_selector = keccak(text="allowance(address,address)")[:4]
-            allowance_data = "0x" + (
-                allowance_selector + bytes(12) + bytes.fromhex(plan.follower_wallet[2:])
-                + bytes(12) + bytes.fromhex(plan.to[2:])
-            ).hex()
-            token_allowance = number(await self.rpc.call(
-                "eth_call", [{"to": plan.input_asset, "data": allowance_data}, "pending"]))
+            token_allowance = values["token_allowance"]
             if token_allowance < _uint(plan.amount_in_raw, "amount in"):
                 raise ValueError("insufficient token allowance")
         return {
             "pending_nonce": pending_nonce,
+            "provider_validation": results[-1] if plan.execution_provider == "zeroex" else None,
+            "started_monotonic": started,
+            "rpc_timings": timings,
+            "preflight_ms": round((time.monotonic()-started)*1000, 3),
             "native_balance_raw": str(native_balance),
             "token_balance_raw": str(token_balance) if token_balance is not None else None,
             "token_allowance_raw": str(token_allowance) if token_allowance is not None else None,

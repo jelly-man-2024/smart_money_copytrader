@@ -1,10 +1,10 @@
-"""Minimal endpoint-only dotenv loading; wallet secrets are deliberately ignored."""
+"""Allowlisted endpoints and 0x API credential; wallet secrets are ignored."""
 from __future__ import annotations
 
 import os
 from pathlib import Path
 
-ALLOWED_ENV_KEYS = frozenset({"ROBINHOOD_RPC_URL", "ROBINHOOD_FEED_URL"})
+ALLOWED_ENV_KEYS = frozenset({"ROBINHOOD_RPC_URL", "ROBINHOOD_FEED_URL", "0X_API_KEY"})
 MAX_ENV_BYTES = 64 * 1024
 
 

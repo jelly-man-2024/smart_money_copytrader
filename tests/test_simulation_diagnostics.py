@@ -49,11 +49,10 @@ class RpcDiagnosticTests(unittest.TestCase):
 
     def test_rpc_exception_keeps_legacy_safe_text_and_structured_details(self):
         rpc = ReadOnlyRpc("https://provider.invalid/secret-token")
-        response = MagicMock()
-        response.__enter__.return_value.read.return_value = json.dumps({"id": 1, "error": {
+        response = {"id": 1, "error": {
             "code": 3, "message": rpc.url,
-            "data": error_string("ERC20: insufficient allowance")}}).encode()
-        with patch("urllib.request.urlopen", return_value=response):
+            "data": error_string("ERC20: insufficient allowance")}}
+        with patch.object(rpc.transport, "request", return_value=response):
             with self.assertRaises(RpcError) as caught:
                 rpc._request("eth_call", [], 1)
         self.assertEqual(str(caught.exception), "RPC eth_call error code 3")
@@ -117,7 +116,7 @@ class RpcDiagnosticTests(unittest.TestCase):
 
     def test_transport_error_still_hides_endpoint_and_response(self):
         rpc = ReadOnlyRpc("https://provider.invalid/secret-token")
-        with patch("urllib.request.urlopen", side_effect=OSError(rpc.url)):
+        with patch.object(rpc.transport, "request", side_effect=OSError(rpc.url)):
             with self.assertRaises(RpcError) as caught:
                 rpc._request("eth_call", [], 1)
         self.assertEqual(str(caught.exception), "RPC transport failure: OSError")
@@ -127,7 +126,7 @@ class RpcDiagnosticTests(unittest.TestCase):
     def test_rpc_allowlist_still_forbids_mutations_and_other_tracers(self):
         self.assertNotIn("eth_sendRawTransaction", ALLOWED_METHODS)
         rpc = ReadOnlyRpc("https://provider.invalid")
-        with patch("urllib.request.urlopen") as request:
+        with patch.object(rpc.transport, "request") as request:
             with self.assertRaises(PermissionError):
                 asyncio.run(rpc.call("eth_sendRawTransaction", ["0x00"]))
             with self.assertRaises(PermissionError):
@@ -163,6 +162,7 @@ class SimulationDiagnosticTests(unittest.IsolatedAsyncioTestCase):
             result = await simulate_aggregator_execution(rpc, plan())
             diagnostic.assert_not_called()
         rpc.call.assert_awaited_once()
+        self.assertGreaterEqual(result.pop("simulation_ms"), 0)
         self.assertEqual(result, {"simulated": True, "simulated_return_amount_raw": "200",
             "simulated_gas_used": "300000", "simulation_block": "pending"})
 
@@ -242,9 +242,9 @@ class MonitorDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
                 rpc = SimpleNamespace(call=AsyncMock(side_effect=rpc_call),
                                       receipt=AsyncMock(return_value=None))
-                preparer = SimpleNamespace(prepare=AsyncMock(return_value=SimpleNamespace(plan_id="plan", preflight={})))
+                preparer = SimpleNamespace(prepare=AsyncMock(return_value=SimpleNamespace(plan_id="plan", preflight={}, ticket=None)))
                 signer = SimpleNamespace(sign=AsyncMock(return_value=SimpleNamespace(
-                    raw_transaction=b"synthetic-signed-bytes-never-log")))
+                    raw_transaction=b"synthetic-signed-bytes-never-log", preflight={}, ticket=None)))
                 reviewer = SimpleNamespace(review=AsyncMock())
                 broadcaster = SimpleNamespace(broadcast=AsyncMock())
 

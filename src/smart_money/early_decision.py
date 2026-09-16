@@ -15,6 +15,7 @@ from .early_replay import _bound, _planned_amount
 from .models import address
 from .quotes import QuotePolicy, assess_quote
 from .verified_feed_intent import VerifiedFeedIntent
+from .zeroex import ZeroExApiError
 
 
 class EarlyDecisionEngine:
@@ -45,8 +46,8 @@ class EarlyDecisionEngine:
             raise ValueError("source canonical status unavailable")
         source_protocol = "relay_solver" if c.side == "BUY" else "kyber"
         if (source_protocol not in policy["allowed_protocols"]
-                or policy["execution_providers"] != ["kyber"]):
-            raise ValueError("early source protocol or Kyber-only provider required")
+                or policy["execution_providers"] not in (["kyber"], ["zeroex"], ["zeroex", "kyber"])):
+            raise ValueError("early source protocol or aggregator-only provider required")
         trusted = {address(a) for a in policy["allowed_assets"]}
         if (c.token_in if c.side == "BUY" else c.token_out) not in trusted:
             raise ValueError("funding_asset_not_allowed")
@@ -59,14 +60,20 @@ class EarlyDecisionEngine:
             raise ValueError("early planned amount outside limits")
         if output != c.token_out:
             raise ValueError("cross_asset_source_price_basis_missing")
-        signal = intent.quote_signal(at)
-        quote, reference, gas_price = await self.quoter.quote_with_reference(signal, str(amount))
+        for provider in policy["execution_providers"]:
+            signal = intent.quote_signal(at, provider=provider)
+            try:
+                quote, reference, gas_price = await self.quoter.quote_with_reference(signal, str(amount))
+                break
+            except ZeroExApiError:
+                if provider != "zeroex" or policy["execution_providers"][-1] != "kyber":
+                    raise
         at = time.time() if now is None else now
         intent.revalidate(at)
         for snapshot in (policy, portfolio):
             if not 0 <= at - timestamp(snapshot["observed_at"]) <= 3:
                 raise ValueError("early decision snapshot expired after quote")
-        if quote.protocol != "kyber" or quote.amount_in_raw != str(amount):
+        if quote.protocol != signal.protocol or quote.amount_in_raw != str(amount):
             raise ValueError("early quote request mismatch")
         accepted, reason, risk = assess_quote(signal, quote, reference,
                                               QuotePolicy(**policy["quote_policy"]), gas_price, at)

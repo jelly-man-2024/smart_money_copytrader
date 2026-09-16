@@ -4,11 +4,13 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
-import urllib.error
-import urllib.request
+import time
+from contextvars import ContextVar
+from collections import deque
 from urllib.parse import urlsplit
 
 from .simulation_diagnostics import rpc_error_diagnostic
+from .http_pool import JsonConnectionPool
 
 
 ALLOWED_METHODS = frozenset({
@@ -33,16 +35,20 @@ class ReadOnlyRpc:
         self.url, self.timeout = url, timeout
         self.semaphore = asyncio.Semaphore(concurrency)
         self.ids = itertools.count(1)
+        self._deadline = ContextVar("rpc_request_deadline", default=None)
+        self.timings = deque(maxlen=128)
+        self.transport = JsonConnectionPool(url, capacity=concurrency, timeout=timeout,
+                                            max_bytes=16*1024*1024)
+
+    def close(self):
+        self.transport.close()
 
     def _request(self, method: str, params: list, request_id: int):
         body = json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}).encode()
-        request = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json", "User-Agent": "smart-money-observer/0.1"})
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = response.read(16 * 1024 * 1024 + 1)
-            if len(raw) > 16 * 1024 * 1024:
-                raise RpcError("RPC response limit")
-            result = json.loads(raw)
+            result = self.transport.request("POST", body=body, headers={
+                "Content-Type": "application/json", "User-Agent": "smart-money-observer/0.1"},
+                deadline=self._deadline.get())
             if result.get("id") != request_id:
                 raise RpcError("RPC response id mismatch")
             if "error" in result:
@@ -75,8 +81,26 @@ class ReadOnlyRpc:
                     or not isinstance(params[0], str) or len(params[0]) != 66
                     or params[1] not in allowed):
                 raise PermissionError("only bounded prestateTracer diffMode is allowed")
-        async with self.semaphore:
+        started = time.monotonic()
+        token = self._deadline.set(started + self.timeout)
+        acquired = None
+        try:
+            try:
+                await asyncio.wait_for(self.semaphore.acquire(), self.timeout)
+            except asyncio.TimeoutError:
+                raise RpcError("RPC concurrency wait timed out", diagnostic={
+                    "kind": "transport_or_response_error", "code": None,
+                    "exception_type": "TimeoutError",
+                }) from None
+            acquired = time.monotonic()
             return await asyncio.to_thread(self._request, method, params or [], next(self.ids))
+        finally:
+            if acquired is not None:
+                self.semaphore.release()
+            self._deadline.reset(token)
+            self.timings.append(dict(method=method,
+                queue_wait_ms=round(((acquired or time.monotonic())-started)*1000, 3),
+                total_ms=round((time.monotonic()-started)*1000, 3)))
 
     async def receipt(self, tx_hash: str, attempts: int = 8, interval: float = 0.25):
         for attempt in range(attempts):
