@@ -34,6 +34,59 @@ class Connection:
 
 
 class PoolTests(unittest.TestCase):
+    def test_failure_diagnostics_keep_phase_reuse_and_original_type_not_secrets(self):
+        for phase, error in [("connect", TimeoutError("secret-url")),
+                             ("response_headers", http.client.RemoteDisconnected("secret-url")),
+                             ("response_body", ConnectionResetError("secret-url"))]:
+            with self.subTest(phase=phase):
+                connection = Connection()
+                with patch('http.client.HTTPSConnection', return_value=connection):
+                    pool = JsonConnectionPool('https://example.invalid/secret-url', capacity=1)
+                    self.addCleanup(pool.close)
+                    if phase == "connect":
+                        connection.connect = Mock(side_effect=error)
+                    else:
+                        pool.request()
+                        if phase == "response_headers":
+                            connection.getresponse = Mock(side_effect=error)
+                        else:
+                            response = Response()
+                            response.read1 = Mock(side_effect=error)
+                            connection.responses = [response]
+                    with self.assertRaises(HttpPoolError) as caught:
+                        pool.request()
+                    diagnostic = caught.exception.diagnostic
+                    self.assertEqual(diagnostic["phase"], phase)
+                    self.assertEqual(diagnostic["exception_type"], type(error).__name__)
+                    self.assertEqual(diagnostic["reused"], phase != "connect")
+                    self.assertNotIn("secret", json.dumps(diagnostic))
+                    self.assertEqual(pool.timings[-1]["failure"], diagnostic)
+                    self.assertTrue(connection.closed)
+
+    def test_http_status_and_pool_wait_have_structured_diagnostics(self):
+        connection = Connection()
+        response = Response()
+        response.status = 429
+        connection.responses = [response]
+        with patch('http.client.HTTPSConnection', return_value=connection):
+            pool = JsonConnectionPool('https://example.invalid', capacity=1, timeout=.01)
+            self.addCleanup(pool.close)
+            with self.assertRaises(HttpPoolError) as caught:
+                pool.request()
+            self.assertEqual(caught.exception.diagnostic["reason"], "http_status")
+            self.assertEqual(caught.exception.diagnostic["status"], 429)
+            slot = pool._slots.get()
+            try:
+                with self.assertRaises(HttpPoolError) as caught:
+                    pool.request()
+                self.assertEqual(caught.exception.diagnostic["phase"], "pool_wait")
+                self.assertIsNone(caught.exception.diagnostic["reused"])
+                self.assertEqual(pool.timings[-1]["failure"], caught.exception.diagnostic)
+                self.assertFalse(pool.timings[-1]["success"])
+                self.assertGreaterEqual(pool.timings[-1]["pool_wait_ms"], 0)
+            finally:
+                pool._slots.put(slot)
+
     def test_real_httpresponse_content_length_is_released_before_reuse(self):
         class Socket:
             def settimeout(self, value): pass

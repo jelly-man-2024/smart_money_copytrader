@@ -2,6 +2,51 @@
 
 历史交接记录起始于 2026-09-12，后续进展按日期追加。
 
+## 2026-09-16 签名前 RPC 故障隔离与交易健康日志（已实现，未部署）
+
+用户批准本轮 5 个运行代码文件及测试、交接文档的修改；不修改在线配置、账本或额度，
+不解除急停、不停启进程、不访问真实密钥、不签名广播。提交范围仅为下述源码、离线测试和本节文档；
+部署状态以运行进程为准。
+
+现场依据为 `var/log/sm-copy-early-20260916.log` 的 12:41:06 新加坡时间事件及此前只读账本核对：
+proposal `6bc78c6680e64fe896f9ccae7aa2c73f91aee25771ba9843e9e1f1506616ec1f`
+在 prepare 阶段报 `RPC transport failure: HttpPoolError`，当时没有 execution plan，提案已取消、
+`100000` raw USDG 预留已释放。但 EarlyRuntime 将 RpcError 按 RuntimeError 一律急停，
+后续 Feed 正常仍无法交易。旧包装丢失底层类型和方法，**不能倒推那次一定是超时、429 或旧连接断开**。
+后续只读请求恢复正常也不构成原故障精确原因的证明。
+
+实现边界：
+
+- HTTP 池异常保留固定字段：exception_type、reason、phase、reused、status；RPC 层补 method，
+  并发等待超时单列 concurrency_wait。日志不保存 URL、请求参数、headers 或任意异常原文。
+  失败连接仍淘汰，不增加隐式重试；广播绝不自动重发。池失败细节同时进入原 timings；
+  订单的 `live_execution_abandoned.rpc_diagnostic` / `early_handoff_rejected.rpc_diagnostic`
+  持久记录该次故障，不依赖 health 最近 8 条时序恰好保留失败样本。
+- 只读决策尚未建立提案/调用执行器时的 RpcError，只拒绝本次候选。
+  已预留订单仅在 **prepare 阶段、没有计划或从未签名的 prepared 计划取消成功、提案取消成功**
+  后，才由执行器发出绑定 proposal ID 的 `CancelledBeforeSigningRpcError` 标记。
+  EarlyRuntime 复核提案确实 cancelled 后不新增急停；无标记的执行器 RpcError 仍急停。
+  不扩大到签名/复核阶段，不重试旧单，不自动清除已有急停或内存锁定。
+- 清理抛异常（包括账本 ValueError）、取消返回失败、未决签名及广播结果未知均不获豁免。
+  清理失败报告 `live_execution_cleanup_failed` 或 abandoned/operator_review_required，
+  提前试运行保持急停。原同进程 review 阶段的未广播签名清理保留，但不据此豁免 RpcError。
+- health 保留旧 `healthy` 字段的 Feed 语义，新增明确的 `feed_healthy` 和 `execution`：
+  configured、fault_latched、stop_file_active、state。state 为 disabled / stopped / not_stopped /
+  unknown；`not_stopped` **仅表示本地急停未阻断**，不表示 trial、预算、行情等门禁通过。
+
+验证仅使用离线假连接、假执行流水线、内存账本及临时停止文件：覆盖原故障的安全取消、
+只读决策失败后下一次候选、错误标记绑定/账本状态、prepared 清理、签名/复核/广播异常、
+清理异常/返回失败、传输类型/复用/阶段/HTTP 429 脱敏，以及 Feed 正常但交易 stopped 的日志接线。
+新测试先在旧行为下复现失败，修复后全量 518 项测试通过（12 项可选 EVM 跳过；含原有
+23 项未跟踪 Relay 采样测试，不纳入此次代码修改）。没有新增实盘成交或延时改善证据。
+操作员后续上线前仍须重新核对急停原因、在途状态及 trial 窗口；不能仅删除文件让旧进程恢复。
+
+提交前只读审计结果：执行账本一致性检查通过；活动 execution attempt 中 prepared、signed、
+observed_pending、orphaned 均为 0，历史状态为 164 confirmed、2 reverted。提前试运行仍 eligible，
+已使用 5/100，early trial 的 reserved proposal 为 0。另有 24 笔已知历史严格路径 reserved proposal
+（20 笔预算预留、4 笔持仓预留），本轮保持不动。旧进程仍运行旧代码，本地 `EXECUTION_STOP`
+仍有效；因此本次提交推送本身不会恢复交易，部署和解除急停须另行执行并再次审计。
+
 ## 2026-09-16 启动前阻塞已处理，等待操作员启动
 
 用户授权检查、处理启动前阻塞并提交推送 main。关系 1/2/3/4/5/9 已使用

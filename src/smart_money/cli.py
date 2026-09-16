@@ -51,7 +51,7 @@ from .registry import (
     CHAIN_ID, ENTRYPOINT, NATIVE, USDG, V2_ROUTER, V3_ROUTER, delegation,
     load_watchlist, snapshot_delegations,
 )
-from .rpc import ReadOnlyRpc, RpcError
+from .rpc import ReadOnlyRpc, RpcError, CancelledBeforeSigningRpcError
 from .relay_api import RelayApiError, RelayNotReady, RelayPublicClient
 from .solver import relay_confirmed_sell, relay_passive_buy
 from .store import Store
@@ -60,7 +60,7 @@ from .early_runtime import EarlyRuntime
 from .deployment_monitor import DeploymentMonitor
 from .early_timing import EARLY_FEED_MAX_AGE_SECONDS
 from .execution_pipeline import check_early_execution_source
-from .runtime_safety import runtime_instance_lock, trip_execution_stop
+from .runtime_safety import runtime_instance_lock, trip_execution_stop, execution_health
 from .simulation_diagnostics import AggregatorSimulationError
 
 
@@ -706,23 +706,36 @@ async def monitor(args):
             # A rejected requote, gate or simulation before any broadcast must not
             # leave a reserved nonce behind, or every later live plan for this
             # follower would be built one nonce ahead of the network and fail its
-            # pre-broadcast nonce check. Only never-signed plans are released here.
-            plan = store.execution_plan(proposal_id)
-            plan_released = False
-            if plan is not None and plan["status"] == "prepared":
-                plan_released = store.cancel_prepared_execution_plan(
-                    proposal_id, f"live_{stage}_rejected: {str(exc)[:200]}")
-            elif (plan is not None and plan["status"] == "signed"
-                    and stage == "review"):
-                # The reviewer rejected bytes that only ever existed in this
-                # process; the broadcaster was not called, so the signed hash can
-                # never reach the network and its nonce must return to the pool.
-                plan_released = store.cancel_unbroadcast_signed_execution_plan(
-                    proposal_id, f"live_{stage}_rejected: {str(exc)[:200]}")
-            proposal_released = False
-            if plan is None or plan_released:
-                proposal_released = store.cancel_paper_proposal(
-                    proposal_id, f"live_{stage}_rejected")
+            # pre-broadcast nonce check. Signed cleanup is limited to the existing
+            # same-process review rejection; it never grants the RPC exemption.
+            try:
+                plan = store.execution_plan(proposal_id)
+                plan_released = False
+                if plan is not None and plan["status"] == "prepared":
+                    plan_released = store.cancel_prepared_execution_plan(
+                        proposal_id, f"live_{stage}_rejected: {str(exc)[:200]}")
+                elif (plan is not None and plan["status"] == "signed"
+                        and stage == "review"):
+                    # Preserve existing same-process, never-broadcast cleanup.
+                    # It does NOT qualify for the pre-sign RPC exemption below.
+                    plan_released = store.cancel_unbroadcast_signed_execution_plan(
+                        proposal_id, f"live_{stage}_rejected: {str(exc)[:200]}")
+                proposal_released = False
+                if plan is None or plan_released:
+                    proposal_released = store.cancel_paper_proposal(
+                        proposal_id, f"live_{stage}_rejected")
+            except Exception as cleanup_error:
+                if early_trial_id:
+                    trip_execution_stop()
+                report("live_execution_cleanup_failed", proposal_id=proposal_id, stage=stage,
+                       error_type=type(cleanup_error).__name__, operator_review_required=True,
+                       rpc_diagnostic=exc.diagnostic if isinstance(exc, RpcError) else None)
+                # A ValueError from the ledger is NOT an ordinary trade rejection.
+                raise RuntimeError("execution cleanup failed; operator review required") from None
+            cleanup_complete = (plan is None or plan_released) and proposal_released
+            safely_cancelled = (isinstance(exc, RpcError) and stage == "prepare"
+                                and cleanup_complete
+                                and (plan is None or plan["status"] == "prepared"))
             simulation_details = {}
             if isinstance(exc, AggregatorSimulationError):
                 simulation_details = {
@@ -734,9 +747,17 @@ async def monitor(args):
             report("live_execution_abandoned", proposal_id=proposal_id, stage=stage,
                    error_type=type(exc).__name__, error=str(exc)[:300],
                    plan_released=plan_released, proposal_released=proposal_released,
-                   operator_review_required=not (plan is None or plan_released),
+                   operator_review_required=not cleanup_complete,
+                   safely_cancelled_before_signing=safely_cancelled,
+                   rpc_diagnostic=exc.diagnostic if isinstance(exc, RpcError) else None,
                    relationship_id=policy.relationship_id, live_trading=True,
                    **simulation_details)
+            if not cleanup_complete:
+                if early_trial_id:
+                    trip_execution_stop()
+                raise RuntimeError("execution cleanup incomplete; operator review required") from None
+            if safely_cancelled:
+                raise CancelledBeforeSigningRpcError(proposal_id, exc) from None
             raise
         if "copy_operation_order_id" in proposal["attribution"]:
             try:
@@ -1185,7 +1206,10 @@ async def monitor(args):
         while True:
             await asyncio.sleep(5)
             stats["ledger_reconnections"] = getattr(store.connection, "reconnections", 0)
-            report("health", healthy=health.healthy(), queued=queue.qsize(), counters=dict(stats),
+            feed_healthy = health.healthy()
+            report("health", healthy=feed_healthy, feed_healthy=feed_healthy,
+                   execution=execution_health(bool(live_pipelines)),
+                   queued=queue.qsize(), counters=dict(stats),
                    relay_http_timings=list(getattr(relay_client, "timings", ()))[-8:],
                    rpc_http_timings=list(getattr(getattr(rpc, "transport", None), "timings", ()))[-8:],
                    rpc_call_timings=list(getattr(rpc, "timings", ()))[-8:],

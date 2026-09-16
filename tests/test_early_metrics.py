@@ -31,6 +31,31 @@ class EarlyMetricsTests(unittest.TestCase):
 
 
 class RuntimeSafetyTests(unittest.TestCase):
+    def test_execution_health_reports_stop_separately_and_never_claims_eligibility(self):
+        from smart_money.runtime_safety import execution_health
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "STOP"
+            with patch.dict(os.environ, {"SMART_MONEY_EMERGENCY_STOP_FILE": str(path)}), \
+                 patch("smart_money.runtime_safety._fault_latched", False):
+                self.assertEqual(execution_health(False)["state"], "disabled")
+                self.assertEqual(execution_health(True)["state"], "not_stopped")
+                path.touch()
+                status = execution_health(True)
+                self.assertEqual(status["state"], "stopped")
+                self.assertTrue(status["stop_file_active"])
+                self.assertNotIn("eligible", status)
+            with patch.dict(os.environ, {"SMART_MONEY_EMERGENCY_STOP_FILE": str(Path(folder) / "absent")}), \
+                 patch("smart_money.runtime_safety._fault_latched", True):
+                self.assertEqual(execution_health(True)["state"], "stopped")
+                self.assertTrue(execution_health(True)["fault_latched"])
+
+    def test_health_status_unreadable_is_unknown_not_ready(self):
+        from smart_money.runtime_safety import execution_health
+        with patch("smart_money.runtime_safety.Path.exists", side_effect=PermissionError("secret")):
+            status = execution_health(True)
+        self.assertEqual(status["state"], "unknown")
+        self.assertNotIn("secret", str(status))
+
     def test_fault_remains_latched_if_stop_file_cannot_be_written(self):
         from smart_money.execution_controls import _stop_controls
         with patch("smart_money.runtime_safety._fault_latched", False), \

@@ -15,7 +15,20 @@ from urllib.parse import urlsplit
 
 
 class HttpPoolError(ValueError):
-    pass
+    def __init__(self, message, *, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+def safe_exception_type(exc):
+    # Never expose arbitrary exception messages (which may contain credentials).
+    known = {"TimeoutError", "OSError", "ConnectionError", "ConnectionResetError",
+             "ConnectionRefusedError", "BrokenPipeError", "RemoteDisconnected",
+             "ResponseNotReady", "CannotSendRequest", "BadStatusLine", "IncompleteRead",
+             "SSLError", "SSLCertVerificationError", "JSONDecodeError", "UnicodeDecodeError",
+             "ValueError", "PermissionError", "HttpPoolError"}
+    name = type(exc).__name__
+    return name if name in known else "Exception"
 
 
 class JsonConnectionPool:
@@ -53,28 +66,43 @@ class JsonConnectionPool:
                 before_send=None, deadline=None):
         start = time.monotonic()
         end = min(start + self.timeout, deadline) if deadline is not None else start + self.timeout
+        phase, reused, status = "pool_wait", None, None
+        failure = None
+        def diagnostic(reason, exception_type="HttpPoolError"):
+            return dict(reason=reason, exception_type=exception_type, phase=phase,
+                        reused=reused, status=status)
+        def fail(message, reason):
+            return HttpPoolError(message, diagnostic=diagnostic(reason))
         def remaining():
             left = end - time.monotonic()
             if left <= 0:
-                raise HttpPoolError("HTTP request deadline exceeded")
+                raise fail("HTTP request deadline exceeded", "deadline_exceeded")
             return left
         if self._closed:
-            raise HttpPoolError("HTTP pool closed")
+            raise fail("HTTP pool closed", "pool_closed")
         target = path if path is not None else (self.url.path or "/") + (
             "?" + self.url.query if self.url.query else "")
         if not target.startswith("/") or target.startswith("//") or "\r" in target or "\n" in target:
-            raise HttpPoolError("invalid HTTP request path")
+            raise fail("invalid HTTP request path", "invalid_path")
         try:
             connection = self._slots.get(timeout=remaining())
         except queue.Empty:
-            raise HttpPoolError("HTTP connection pool busy") from None
+            exc = fail("HTTP connection pool busy", "pool_busy")
+            finished = time.monotonic()
+            self.timings.append(dict(reused=None, success=False, status=None,
+                failure=exc.diagnostic,
+                pool_wait_ms=round((finished-start)*1000, 3),
+                connect_ms=0.0, response_ms=0.0, body_parse_ms=0.0,
+                total_ms=round((finished-start)*1000, 3)))
+            raise exc from None
         acquired = time.monotonic()
         reused = connection is not None and connection.sock is not None
         status, connected, received = None, acquired, acquired
         ok = False
         try:
+            phase = "connect"
             if self._closed:
-                raise HttpPoolError("HTTP pool closed")
+                raise fail("HTTP pool closed", "pool_closed")
             if connection is None:
                 cls = http.client.HTTPSConnection if self.url.scheme == "https" else http.client.HTTPConnection
                 kwargs = {"context": self._tls} if self.url.scheme == "https" else {}
@@ -83,15 +111,19 @@ class JsonConnectionPool:
                 connection.connect()
             connected = time.monotonic()
             connection.sock.settimeout(remaining())
+            phase = "before_send"
             if before_send is not None:
                 before_send()
             remaining()
+            phase = "request"
             connection.request(method, target, body=body, headers=headers or {})
             connection.sock.settimeout(remaining())
+            phase = "response_headers"
             response = connection.getresponse()
             received, status = time.monotonic(), response.status
             if status != 200:
-                raise HttpPoolError(f"HTTP status {status}")
+                raise fail(f"HTTP status {status}", "http_status")
+            phase = "response_body"
             chunks, size = [], 0
             while True:
                 if connection.sock is not None:
@@ -103,13 +135,14 @@ class JsonConnectionPool:
                 chunks.append(chunk)
                 size += len(chunk)
                 if size > self.max_bytes:
-                    raise HttpPoolError("HTTP response exceeds size limit")
+                    raise fail("HTTP response exceeds size limit", "response_size_limit")
             if getattr(response, "length", None) not in (None, 0):
-                raise HttpPoolError("HTTP response body truncated")
+                raise fail("HTTP response body truncated", "response_truncated")
             # Python 3.10 read1() reaches Content-Length zero without closing the
             # response file. getresponse() otherwise sees the previous response
             # as active and raises ResponseNotReady on the next use of the socket.
             response.close()
+            phase = "parse_json"
             result = json.loads(b"".join(chunks))
             remaining()
             ok = True
@@ -117,13 +150,17 @@ class JsonConnectionPool:
                 connection.close()
                 connection = None
             return result
-        except HttpPoolError:
+        except HttpPoolError as exc:
+            failure = exc.diagnostic
             raise
         except Exception as exc:
-            raise HttpPoolError(f"HTTP request failed: {type(exc).__name__}") from None
+            failure = diagnostic("request_failed", safe_exception_type(exc))
+            raise HttpPoolError(f"HTTP request failed: {failure['exception_type']}",
+                                diagnostic=failure) from None
         finally:
             finished = time.monotonic()
             self.timings.append(dict(reused=reused, success=ok, status=status,
+                failure=failure,
                 pool_wait_ms=round((acquired-start)*1000, 3),
                 connect_ms=round((connected-acquired)*1000, 3),
                 response_ms=round((received-connected)*1000, 3),

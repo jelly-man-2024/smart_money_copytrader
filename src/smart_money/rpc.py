@@ -10,7 +10,7 @@ from collections import deque
 from urllib.parse import urlsplit
 
 from .simulation_diagnostics import rpc_error_diagnostic
-from .http_pool import JsonConnectionPool
+from .http_pool import JsonConnectionPool, HttpPoolError, safe_exception_type
 
 
 ALLOWED_METHODS = frozenset({
@@ -25,6 +25,17 @@ class RpcError(RuntimeError):
     def __init__(self, message: str, *, diagnostic: dict | None = None):
         super().__init__(message)
         self.diagnostic = diagnostic
+
+
+class CancelledBeforeSigningRpcError(RpcError):
+    """Executor attestation: prepare failed and this proposal was safely released.
+
+    Only the executor's successful cancellation boundary may create this marker;
+    a transport error alone never establishes absence of signing/broadcasting.
+    """
+    def __init__(self, proposal_id, error):
+        super().__init__(str(error), diagnostic=error.diagnostic)
+        self.proposal_id = proposal_id
 
 
 class ReadOnlyRpc:
@@ -60,14 +71,20 @@ class ReadOnlyRpc:
             if "result" not in result:
                 raise RpcError("RPC result missing")
             return result["result"]
-        except RpcError:
+        except RpcError as exc:
+            if exc.diagnostic is None:
+                exc.diagnostic = dict(kind="response_validation_error", code=None,
+                                      phase="response_validation")
+            exc.diagnostic["method"] = method
             raise
         except Exception as exc:
             # Do not leak provider credentials embedded in URLs or response bodies.
-            raise RpcError(f"RPC transport failure: {type(exc).__name__}", diagnostic={
-                "kind": "transport_or_response_error", "code": None,
-                "exception_type": type(exc).__name__,
-            }) from None
+            details = dict(exc.diagnostic or {}) if isinstance(exc, HttpPoolError) else {}
+            details.setdefault("exception_type", safe_exception_type(exc))
+            details.setdefault("phase", "response_validation")
+            details.update(kind="transport_or_response_error", code=None, method=method)
+            raise RpcError(f"RPC transport failure: {details['exception_type']}",
+                           diagnostic=details) from None
 
     async def call(self, method: str, params: list | None = None):
         if method not in ALLOWED_METHODS:
@@ -91,6 +108,7 @@ class ReadOnlyRpc:
                 raise RpcError("RPC concurrency wait timed out", diagnostic={
                     "kind": "transport_or_response_error", "code": None,
                     "exception_type": "TimeoutError",
+                    "method": method, "phase": "concurrency_wait", "reused": None,
                 }) from None
             acquired = time.monotonic()
             return await asyncio.to_thread(self._request, method, params or [], next(self.ids))

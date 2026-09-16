@@ -13,7 +13,7 @@ from eth_abi import encode
 
 from smart_money import cli, registry as R
 from smart_money.execution_prep import UnsignedExecutionPlan, simulate_aggregator_execution
-from smart_money.rpc import ALLOWED_METHODS, ReadOnlyRpc, RpcError
+from smart_money.rpc import ALLOWED_METHODS, ReadOnlyRpc, RpcError, CancelledBeforeSigningRpcError
 from smart_money.simulation_diagnostics import (
     AggregatorSimulationError, MAX_CALLDATA_BYTES, MAX_REVERT_BYTES,
     rpc_error_diagnostic,
@@ -36,6 +36,24 @@ def plan():
 
 
 class RpcDiagnosticTests(unittest.TestCase):
+    def test_rpc_transport_details_survive_wrapping(self):
+        import http.client
+        from test_http_pool import Connection
+        connection = Connection()
+        connection.getresponse = MagicMock(side_effect=http.client.RemoteDisconnected("secret"))
+        rpc = ReadOnlyRpc("https://provider.invalid/secret")
+        self.addCleanup(rpc.close)
+        with patch("http.client.HTTPSConnection", return_value=connection):
+            with self.assertRaises(RpcError) as caught:
+                rpc._request("eth_getTransactionCount", ["private-param", "pending"], 1)
+        detail = caught.exception.diagnostic
+        self.assertEqual(detail["method"], "eth_getTransactionCount")
+        self.assertEqual(detail["exception_type"], "RemoteDisconnected")
+        self.assertEqual(detail["phase"], "response_headers")
+        self.assertFalse(detail["reused"])
+        self.assertNotIn("secret", str(caught.exception) + json.dumps(detail))
+        self.assertNotIn("private-param", json.dumps(detail))
+
     def test_revert_reason_is_preserved_without_provider_message(self):
         details = rpc_error_diagnostic("eth_call", {
             "code": 3, "message": "execution reverted: https://provider.invalid/secret-token",
@@ -214,8 +232,13 @@ class MonitorDiagnosticTests(unittest.IsolatedAsyncioTestCase):
         from smart_money.store import Store
         from test_early_shadow import fixture
 
-        for stage in ("prepare", "sign", "review"):
-            with self.subTest(stage=stage):
+        cases = [(s, "simulation", "ok") for s in ("prepare", "sign", "review")]
+        cases += [(s, "rpc", "ok") for s in ("prepare", "sign", "review", "broadcast")]
+        cases += [("prepare", "rpc", c) for c in
+                  ("false", "exception", "pending", "prepared", "prepared_refused")]
+        for stage, kind, cleanup in cases:
+            with self.subTest(stage=stage, kind=kind, cleanup=cleanup):
+                cleanup_ok = cleanup in {"ok", "prepared"}
                 tx, wallet = fixture()
                 p = plan()
                 policy = WalletPaperPolicy(wallet, "synthetic", p.follower_wallet, "1", "mainnet_live",
@@ -249,11 +272,17 @@ class MonitorDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                 broadcaster = SimpleNamespace(broadcast=AsyncMock())
 
                 async def fail(*args, **kwargs):
+                    if kind == "rpc":
+                        raise RpcError("RPC transport failure: RemoteDisconnected", diagnostic={
+                            "kind": "transport_or_response_error", "method": "eth_getBalance",
+                            "exception_type": "RemoteDisconnected", "phase": "response_headers",
+                            "reused": True})
                     failing_rpc = SimpleNamespace(call=AsyncMock(side_effect=RpcError("failed",
                         diagnostic=rpc_error_diagnostic("eth_call", {"code": 3, "data": error_string("STF")}))))
                     return await simulate_aggregator_execution(failing_rpc, p)
 
-                getattr({"prepare": preparer, "sign": signer, "review": reviewer}[stage], stage).side_effect = fail
+                getattr({"prepare": preparer, "sign": signer, "review": reviewer,
+                         "broadcast": broadcaster}[stage], stage).side_effect = fail
                 emitted = []
 
                 def runtime_factory(*args, **kwargs):
@@ -261,22 +290,29 @@ class MonitorDiagnosticTests(unittest.IsolatedAsyncioTestCase):
 
                     async def handoff(*unused):
                         existing = None if stage == "prepare" else {"status": "prepared" if stage == "sign" else "signed"}
+                        if cleanup == "pending":
+                            existing = {"status": "signed"}
+                        elif cleanup.startswith("prepared"):
+                            existing = {"status": "prepared"}
                         with patch.object(db, "paper_proposal", return_value=proposal), \
                              patch.object(db, "check_early_trial_proposal"), \
                              patch.object(db, "execution_plan", return_value=existing), \
-                             patch.object(db, "cancel_prepared_execution_plan", return_value=True) as cancel_prepared, \
+                             patch.object(db, "cancel_prepared_execution_plan", return_value=cleanup != "prepared_refused") as cancel_prepared, \
                              patch.object(db, "cancel_unbroadcast_signed_execution_plan", return_value=True) as cancel_signed, \
-                             patch.object(db, "cancel_paper_proposal", return_value=True) as cancel_proposal:
+                             patch.object(db, "cancel_paper_proposal", return_value=cleanup != "false",
+                                 side_effect=ValueError("ledger mismatch") if cleanup == "exception" else None) as cancel_proposal:
                             try:
                                 await execute(policy, signal, p.proposal_id, early_intent=object())
                             except AggregatorSimulationError:
                                 emitted.append(True)
+                            except (RpcError, RuntimeError) as error:
+                                emitted.append(type(error))
                             except Exception as error:
                                 emitted.append((type(error).__name__, str(error)))
                             finally:
                                 completed.set()
-                            cancel_proposal.assert_called_once()
-                            self.assertEqual(cancel_prepared.call_count, int(stage == "sign"))
+                            self.assertEqual(cancel_proposal.call_count, int(stage != "broadcast" and cleanup not in {"pending", "prepared_refused"}))
+                            self.assertEqual(cancel_prepared.call_count, int(stage == "sign" or cleanup.startswith("prepared")))
                             self.assertEqual(cancel_signed.call_count, int(stage == "review"))
                     return handoff
 
@@ -303,24 +339,55 @@ class MonitorDiagnosticTests(unittest.IsolatedAsyncioTestCase):
                     "envelopes": MagicMock(return_value=[(b"raw", {"fresh": True})]), "decode_raw": MagicMock(return_value=tx),
                     "EarlyEvidenceResolver": MagicMock(return_value=AsyncMock(return_value={"candidates": []})),
                     "EarlyRuntime": MagicMock(side_effect=runtime_factory), "check_early_execution_source": MagicMock(),
-                    "report": MagicMock()}
+                    "trip_execution_stop": MagicMock(), "report": MagicMock()}
+                original_sleep = asyncio.sleep
+                async def quick_heartbeat(delay):
+                    await original_sleep(.005 if delay == 5 else delay)
                 with ExitStack() as stack:
                     for name, value in patches.items():
                         stack.enter_context(patch.object(cli, name, value))
                     stack.enter_context(patch("smart_money.execution_controls._stop_controls"))
                     stack.enter_context(patch.object(cli.websockets, "connect", return_value=Socket()))
+                    stack.enter_context(patch.object(cli.asyncio, "sleep", side_effect=quick_heartbeat))
+                    stack.enter_context(patch.object(cli, "execution_health", return_value={"state": "stopped"}))
                     await asyncio.wait_for(cli.monitor(args), 2)
                 self.assertTrue(completed.is_set())
-                self.assertEqual(emitted, [True])
+                heartbeats = [c.kwargs for c in patches["report"].call_args_list if c.args == ("health",)]
+                self.assertTrue(heartbeats)
+                self.assertTrue(heartbeats[0]["feed_healthy"])
+                self.assertEqual(heartbeats[0]["execution"]["state"], "stopped")
+                if kind == "simulation":
+                    self.assertEqual(emitted, [True])
+                else:
+                    expected = (RuntimeError if not cleanup_ok else
+                                CancelledBeforeSigningRpcError if stage == "prepare" else RpcError)
+                    self.assertEqual(emitted, [expected])
+                self.assertEqual(patches["trip_execution_stop"].call_count,
+                                 int(not cleanup_ok or stage == "broadcast"))
+                if stage == "broadcast":
+                    broadcaster.broadcast.assert_awaited_once()
+                    continue
+                broadcaster.broadcast.assert_not_awaited()
+                if cleanup == "exception":
+                    events = [c.kwargs for c in patches["report"].call_args_list if c.args == ("live_execution_cleanup_failed",)]
+                    self.assertEqual(len(events), 1)
+                    self.assertTrue(events[0]["operator_review_required"])
+                    continue
                 events = [c.kwargs for c in patches["report"].call_args_list if c.args == ("live_execution_abandoned",)]
                 self.assertEqual(len(events), 1)
                 event = events[0]
                 self.assertEqual(event["stage"], stage)
-                self.assertTrue(event["proposal_released"])
-                self.assertEqual(event["early_trial_id"], "trial")
-                self.assertEqual(event["source_tx_hash"], tx.hash)
-                self.assertEqual(event["source_event_id"], "attributed-original-event")
-                self.assertEqual(event["simulation_failure"]["rpc_error"]["revert_reason"], "STF")
+                self.assertEqual(event["proposal_released"], cleanup_ok)
+                if kind == "simulation":
+                    self.assertEqual(event["early_trial_id"], "trial")
+                    self.assertEqual(event["source_tx_hash"], tx.hash)
+                    self.assertEqual(event["source_event_id"], "attributed-original-event")
+                    self.assertEqual(event["simulation_failure"]["rpc_error"]["revert_reason"], "STF")
+                else:
+                    self.assertEqual(event["safely_cancelled_before_signing"], stage == "prepare" and cleanup_ok)
+                    self.assertEqual(event["operator_review_required"], not cleanup_ok)
+                    self.assertEqual(event["rpc_diagnostic"]["method"], "eth_getBalance")
+                    self.assertEqual(event["rpc_diagnostic"]["exception_type"], "RemoteDisconnected")
                 self.assertNotIn("synthetic-signed-bytes", json.dumps(event))
                 broadcaster.broadcast.assert_not_awaited()
                 if stage == "prepare": signer.sign.assert_not_awaited()

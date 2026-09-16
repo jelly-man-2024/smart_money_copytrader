@@ -11,6 +11,22 @@ def execution_fault_latched():
     return _fault_latched
 
 
+def execution_health(configured):
+    """Local stop controls only; not trial, budget, quote or trading eligibility."""
+    status = dict(configured=bool(configured), fault_latched=execution_fault_latched(),
+                  stop_file_active=None, state="unknown", scope="local_stop_controls_only")
+    try:
+        status["stop_file_active"] = Path(os.environ.get(
+            "SMART_MONEY_EMERGENCY_STOP_FILE", "var/EXECUTION_STOP")).exists()
+    except OSError:
+        if status["fault_latched"]:
+            status["state"] = "stopped"
+        return status
+    status["state"] = ("disabled" if not configured else "stopped"
+                       if status["fault_latched"] or status["stop_file_active"] else "not_stopped")
+    return status
+
+
 @contextmanager
 def runtime_instance_lock(path="var/sm-copy.instance.lock", pid_path=None):
     """Hold one local inode for the lifetime of a run; never unlink a held lock."""

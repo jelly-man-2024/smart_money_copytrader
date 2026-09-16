@@ -19,6 +19,7 @@ from smart_money.kyber import KyberSwapTransaction
 from smart_money.paper import AmountRule
 from smart_money.quotes import QuotePolicy
 from smart_money.store import Store
+from smart_money.rpc import RpcError, CancelledBeforeSigningRpcError
 
 
 def swap_for(signal, follower, minimum=194):
@@ -111,6 +112,62 @@ class EarlyRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.runtime(self.f.tx, self.result)
         self.assertEqual(self.store.paper_budget(self.policy.ledger_scope, "USDG")["reserved_raw"], "0")
         self.assertEqual(self.store.connection.execute("SELECT status FROM copy_operation_claims").fetchone()[0], "released")
+
+    async def test_safely_cancelled_prepare_rpc_failure_only_cancels_order(self):
+        async def fail(policy, signal, pid, **kwargs):
+            self.assertTrue(self.store.cancel_paper_proposal(pid, "live_prepare_rejected"))
+            raise CancelledBeforeSigningRpcError(pid, RpcError("RPC transport failure"))
+        self.execute.side_effect = fail
+        with patch("smart_money.early_runtime.trip_execution_stop") as stop:
+            await self.runtime(self.f.tx, self.result)
+            stop.assert_not_called()
+            self.assertEqual(self.store.paper_budget(self.policy.ledger_scope, "USDG")["reserved_raw"], "0")
+            self.assertEqual(self.store.connection.execute("SELECT status FROM copy_operation_claims").fetchone()[0], "released")
+            # The strict fallback may claim the released operation; no auto retry.
+            self.execute.side_effect = None
+            self.execute.assert_awaited_once()
+
+    async def test_readonly_decision_rpc_failure_does_not_stop_next_candidate(self):
+        quote = self.quoter.quote_with_reference
+        original = quote.return_value
+        quote.side_effect = RpcError("RPC transport failure")
+        with patch("smart_money.early_runtime.trip_execution_stop") as stop:
+            await self.runtime(self.f.tx, self.result)
+            stop.assert_not_called()
+            self.execute.assert_not_awaited()
+            self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM paper_proposals").fetchone()[0], 0)
+            quote.side_effect, quote.return_value = None, original
+            await self.runtime(self.f.tx, self.result)
+            self.execute.assert_awaited_once()
+
+    async def test_cancellation_marker_requires_cancelled_ledger_state(self):
+        async def fail(policy, signal, pid, **kwargs):
+            raise CancelledBeforeSigningRpcError(pid, RpcError("failed"))
+        self.execute.side_effect = fail
+        with patch("smart_money.early_runtime.trip_execution_stop") as stop:
+            with self.assertRaises(RuntimeError):
+                await self.runtime(self.f.tx, self.result)
+            stop.assert_called_once()
+
+    async def test_unattested_rpc_failure_still_trips_stop(self):
+        self.execute.side_effect = RpcError("unknown stage")
+        with patch("smart_money.early_runtime.trip_execution_stop") as stop:
+            await self.runtime(self.f.tx, self.result)
+            stop.assert_called_once()
+
+    async def test_cancellation_marker_for_other_proposal_still_stops(self):
+        self.execute.side_effect = CancelledBeforeSigningRpcError("other", RpcError("failed"))
+        with patch("smart_money.early_runtime.trip_execution_stop") as stop:
+            await self.runtime(self.f.tx, self.result)
+            stop.assert_called_once()
+
+    async def test_cleanup_valueerror_still_trips_stop(self):
+        self.execute.side_effect = ValueError("ordinary rejection")
+        with patch.object(self.store, "cancel_paper_proposal", side_effect=ValueError("ledger mismatch")), \
+             patch("smart_money.early_runtime.trip_execution_stop") as stop:
+            with self.assertRaises(RuntimeError):
+                await self.runtime(self.f.tx, self.result)
+            stop.assert_called_once()
 
     async def test_expired_or_stopped_trial_never_calls_executor(self):
         self.store.stop_early_trial("trial")

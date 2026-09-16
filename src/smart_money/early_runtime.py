@@ -16,6 +16,7 @@ from .runtime_safety import trip_execution_stop
 from .execution_controls import _stop_controls
 from .early_timing import EARLY_FEED_MAX_AGE_SECONDS
 from .models import Signal
+from .rpc import RpcError, CancelledBeforeSigningRpcError
 from . import registry as R
 
 
@@ -115,6 +116,7 @@ class EarlyRuntime:
                     continue
                 proposal_id = None
                 reserved_here = False
+                decision_rpc_failure = False
                 context = None
                 try:
                     if not self.healthy():
@@ -129,7 +131,13 @@ class EarlyRuntime:
                             policy.quote_policy.max_age_seconds,
                             policy.quote_policy.max_slippage_bps) as context:
                         config, portfolio = self.snapshots(intent, policy)
-                        decision = await EarlyDecisionEngine(self.quoter).evaluate(intent, config, portfolio)
+                        try:
+                            decision = await EarlyDecisionEngine(self.quoter).evaluate(intent, config, portfolio)
+                        except RpcError:
+                            # This read-only decision has not created a proposal or
+                            # called the executor. No ledger cleanup is necessary.
+                            decision_rpc_failure = True
+                            raise
                         signal = intent.quote_signal(time.time(), provider=decision["quote"]["protocol"])
                         proposal_id = hashlib.sha256((self.trial_id + ":" +
                             decision["relationship_key"]).encode()).hexdigest()
@@ -169,13 +177,28 @@ class EarlyRuntime:
                                     relationship_id=policy.relationship_id, checked_at=time.time())
                         await self.execute(policy, signal, proposal_id, early_intent=intent)
                 except Exception as exc:
-                    if not isinstance(exc, (ValueError, PermissionError)):
+                    safely_cancelled = (isinstance(exc, CancelledBeforeSigningRpcError)
+                                        and reserved_here and exc.proposal_id == proposal_id)
+                    if (not isinstance(exc, (ValueError, PermissionError))
+                            and not safely_cancelled and not decision_rpc_failure):
                         trip_execution_stop()
-                    if reserved_here and not self.store.execution_plan(proposal_id):
-                        self.store.cancel_paper_proposal(proposal_id, "early_handoff_rejected")
+                    try:
+                        if safely_cancelled:
+                            if self.store.paper_proposal(proposal_id)["status"] != "cancelled":
+                                raise RuntimeError("cancelled proposal attestation mismatch")
+                        elif reserved_here and not self.store.execution_plan(proposal_id):
+                            if self.store.paper_proposal(proposal_id)["status"] != "cancelled":
+                                if not self.store.cancel_paper_proposal(proposal_id, "early_handoff_rejected"):
+                                    raise RuntimeError("early proposal cancellation rejected")
+                    except Exception:
+                        trip_execution_stop()
+                        raise RuntimeError("early handoff cleanup failed; operator review required") from None
                     self.report("early_handoff_rejected", proposal_id=proposal_id,
                                 relationship_id=policy.relationship_id,
-                                error_type=type(exc).__name__, reason=str(exc)[:160])
+                                error_type=type(exc).__name__, reason=str(exc)[:160],
+                                safely_cancelled_before_signing=safely_cancelled,
+                                decision_rpc_failure=decision_rpc_failure,
+                                rpc_diagnostic=exc.diagnostic if isinstance(exc, RpcError) else None)
                 finally:
                     if isinstance(context, dict):
                         self.report("early_quote_requests", proposal_id=proposal_id,
