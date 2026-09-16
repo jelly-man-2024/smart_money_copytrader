@@ -77,9 +77,11 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS chain_cursors (
             name TEXT PRIMARY KEY, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
+            chain_id INTEGER NOT NULL DEFAULT 4663,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS canonical_blocks (
-            block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, parent_hash TEXT NOT NULL)""")
+            block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, parent_hash TEXT NOT NULL,
+            chain_id INTEGER NOT NULL DEFAULT 4663)""")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS candidate_inclusions (
             tx_hash TEXT PRIMARY KEY, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL)""")
         self.connection.execute("""CREATE INDEX IF NOT EXISTS candidate_inclusions_by_block
@@ -103,6 +105,7 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             bucket TEXT NOT NULL CHECK(bucket IN ('USDG','ETH_WETH')),
             limit_raw TEXT NOT NULL, reserved_raw TEXT NOT NULL DEFAULT '0',
             invested_raw TEXT NOT NULL DEFAULT '0',
+            chain_id INTEGER NOT NULL DEFAULT 4663,
             PRIMARY KEY(cycle_id,wallet,bucket),
             FOREIGN KEY(cycle_id) REFERENCES paper_budget_cycles(cycle_id))""")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS paper_proposals (
@@ -164,6 +167,7 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
                 "ALTER TABLE paper_fills ADD COLUMN gas_cost_wei TEXT NOT NULL DEFAULT '0'")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS paper_positions (
             lot_id TEXT PRIMARY KEY, wallet TEXT NOT NULL, token TEXT NOT NULL,
+            chain_id INTEGER NOT NULL DEFAULT 4663,
             budget_cycle_id TEXT NOT NULL, budget_bucket TEXT NOT NULL,
             principal_asset TEXT NOT NULL,
             principal_initial_raw TEXT NOT NULL, principal_remaining_raw TEXT NOT NULL,
@@ -177,6 +181,14 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
                 row[1] for row in self.connection.execute("PRAGMA table_info(paper_positions)")}:
             self.connection.execute(
                 "ALTER TABLE paper_positions ADD COLUMN principal_asset TEXT NOT NULL DEFAULT ''")
+        # Multi-chain: backfill chain_id on ledgers created before Arc support.
+        # Robinhood Chain (4663) is the historical default; Arc (5042) rows set
+        # it explicitly. Primary-key/unique tightening ships with Arc ingestion.
+        for _table in ("chain_cursors", "canonical_blocks", "paper_budgets", "paper_positions"):
+            if "chain_id" not in {
+                    row[1] for row in self.connection.execute(f"PRAGMA table_info({_table})")}:
+                self.connection.execute(
+                    f"ALTER TABLE {_table} ADD COLUMN chain_id INTEGER NOT NULL DEFAULT 4663")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS paper_position_reservations (
             proposal_id TEXT NOT NULL, lot_id TEXT NOT NULL, token_amount_raw TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('active','consumed','released')),

@@ -2,49 +2,208 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .models import address
 
-CHAIN_ID = 4663
+# The zero-address native sentinel is chain-agnostic (0x0 means "native asset").
 NATIVE = "0x0000000000000000000000000000000000000000"
-WETH = "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
-USDG = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
-ENTRYPOINT = "0x4337084d9e255ff0702461cf8895ce9e3b5ff108"
-SIMPLE_ACCOUNT = "0xe6cae83bde06e4c305530e199d7217f42808555b"
-METAMASK_ACCOUNT = "0x63c0c19a282a1b52b07dd5a65b58948a07dae32b"
-V2_ROUTER = "0x89e5db8b5aa49aa85ac63f691524311aeb649eba"
-V2_FACTORY = "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f"
-V3_ROUTER = "0xcaf681a66d020601342297493863e78c959e5cb2"
-V3_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa"
-V3_QUOTER = "0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7"
-UNIVERSAL_ROUTER = "0x8876789976decbfcbbbe364623c63652db8c0904"
-V4_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
-V4_QUOTER = "0x8dc178efb8111bb0973dd9d722ebeff267c98f94"
-KNOWN_V4_HOOK_CODE_HASHES = {
-    # Observed unchanged at both imported fixture blocks and 2026-09-11 latest.
-    "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044":
-        "0xc21b1e6c1b45403e81a581f22ed6d9c747997af1cfdac1b1dc9f4b1d346a10db",
+
+
+@dataclass(frozen=True)
+class ChainRegistry:
+    """Per-chain contract and asset registry.
+
+    Robinhood Chain (4663) and Arc (5042) differ structurally: Arc has no
+    Relay cross-chain solver, no ERC-4337 EntryPoint bundling, and no WETH
+    (its quote/gas asset is USDC, exposed both as native and as an enshrined
+    ERC-20). Chain-specific fields are therefore optional; a consumer that
+    reads one must confirm the chain provides it.
+
+    New multi-chain code resolves a registry with ``chain_for(chain_id)``.
+    The module-level constants below alias the Robinhood registry so existing
+    single-chain call sites keep working unchanged.
+    """
+
+    chain_id: int
+    name: str
+    # --- Assets ---
+    weth: str | None = None            # canonical wrapped native (RH); Arc has none
+    usdg: str | None = None            # RH settlement stablecoin
+    usdc_erc20: str | None = None      # Arc enshrined USDC ERC-20 (6 decimals)
+    quote_assets: frozenset[str] = frozenset()
+    # --- Account abstraction (RH only) ---
+    entrypoint: str | None = None
+    simple_account: str | None = None
+    metamask_account: str | None = None
+    # --- DEX ---
+    v2_router: str | None = None
+    v2_factory: str | None = None
+    v3_router: str | None = None
+    v3_factory: str | None = None
+    v3_quoter: str | None = None
+    universal_router: str | None = None
+    v4_manager: str | None = None
+    v4_quoter: str | None = None
+    v4_state_view: str | None = None
+    v4_position_descriptor: str | None = None
+    known_v4_hook_code_hashes: dict[str, str] = field(default_factory=dict)
+    position_managers: frozenset[str] = frozenset()
+    # --- Relay cross-chain solver (RH only) ---
+    relay_proxy: str | None = None
+    relay_router: str | None = None
+    depository: str | None = None
+    ripe_claim: str | None = None
+    relay_usdg_equivalents: frozenset[tuple[int, str]] = frozenset()
+    # --- Aggregators / execution ---
+    zero_x_allowance_holder: str | None = None
+    kyber_router: str | None = None
+    kyber_chain_slug: str | None = None
+    okx_router: str | None = None
+    okx_approval: str | None = None
+    permit2: str | None = None
+
+
+ROBINHOOD = ChainRegistry(
+    chain_id=4663,
+    name="robinhood",
+    weth="0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+    usdg="0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+    quote_assets=frozenset({
+        NATIVE,
+        "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+        "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+    }),
+    entrypoint="0x4337084d9e255ff0702461cf8895ce9e3b5ff108",
+    simple_account="0xe6cae83bde06e4c305530e199d7217f42808555b",
+    metamask_account="0x63c0c19a282a1b52b07dd5a65b58948a07dae32b",
+    v2_router="0x89e5db8b5aa49aa85ac63f691524311aeb649eba",
+    v2_factory="0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
+    v3_router="0xcaf681a66d020601342297493863e78c959e5cb2",
+    v3_factory="0x1f7d7550b1b028f7571e69a784071f0205fd2efa",
+    v3_quoter="0x33e885ed0ec9bf04ecfb19341582aadcb4c8a9e7",
+    universal_router="0x8876789976decbfcbbbe364623c63652db8c0904",
+    v4_manager="0x8366a39cc670b4001a1121b8f6a443a643e40951",
+    v4_quoter="0x8dc178efb8111bb0973dd9d722ebeff267c98f94",
+    known_v4_hook_code_hashes={
+        # Observed unchanged at both imported fixture blocks and 2026-09-11 latest.
+        "0xe5e702641ea86f4ae6cc3cdaed2b886f976be044":
+            "0xc21b1e6c1b45403e81a581f22ed6d9c747997af1cfdac1b1dc9f4b1d346a10db",
+    },
+    position_managers=frozenset({
+        "0x73991a25c818bf1f1128deaab1492d45638de0d3",
+        "0x58daec3116aae6d93017baaea7749052e8a04fa7",
+    }),
+    relay_proxy="0xccc88a9d1b4ed6b0eaba998850414b24f1c315be",
+    relay_router="0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
+    depository="0x4cd00e387622c35bddb9b4c962c136462338bc31",
+    ripe_claim="0x2d3cb2b39289f402187d7dc9b609ead6646f2506",
+    relay_usdg_equivalents=frozenset({
+        # Relay's Solana mainnet chain id and canonical USDC mint. Both this
+        # asset and Robinhood USDG use six decimals; the source identity
+        # remains evidence.
+        (792703809, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+    }),
+    zero_x_allowance_holder="0x0000000000001ff3684f28c67538d4d072c22734",
+    kyber_router="0x6131b5fae19ea4f9d964eac0408e4408b66337b5",
+    kyber_chain_slug="robinhood",
+    okx_router="0x6e2a35a7ad683cf634d91492d73bb7ff774c6919",
+    okx_approval="0x42170295f1173c9e5874ea9d00c6d137e1a4f53d",
+    permit2="0x000000000022d473030f116ddee9f6b43ac78ba3",
+)
+
+ARC = ChainRegistry(
+    chain_id=5042,
+    name="arc",
+    # Arc has no wrapped native and no separate stablecoin: USDC is the native
+    # gas token (18 decimals) and is also exposed as an enshrined ERC-20 at the
+    # address below (6 decimals). Both forms share one balance; the ERC-20 form
+    # is canonical for quoting/execution. Quote/settlement asset is USDC itself.
+    weth=None,
+    usdg=None,
+    usdc_erc20="0x3600000000000000000000000000000000000000",
+    quote_assets=frozenset({NATIVE, "0x3600000000000000000000000000000000000000"}),
+    # No Relay/EntryPoint account-abstraction world on Arc.
+    entrypoint=None,
+    simple_account=None,
+    metamask_account=None,
+    # Uniswap v4 dominates Arc volume; v2/v3 addresses are added if a decoded
+    # smart-money swap needs them. All values below were confirmed on-chain via
+    # eth_getCode against ARC_RPC_URL (chain id 5042) on 2026-09-16.
+    v2_router=None,
+    v2_factory=None,
+    v3_router=None,
+    v3_factory=None,
+    v3_quoter=None,
+    universal_router="0x4fca4a51ab4f23a7447b3284fbd7d73289a89fb1",
+    v4_manager="0x8366a39cc670b4001a1121b8f6a443a643e40951",
+    v4_quoter="0x8dc178efb8111bb0973dd9d722ebeff267c98f94",
+    v4_state_view="0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
+    v4_position_descriptor="0x516b8a945700d6bbfdedaa6dcfc4586ba60b8707",
+    known_v4_hook_code_hashes={},
+    position_managers=frozenset({"0x6049c9a0e26405c0985f9e3685c87d0ae917f82b"}),
+    # No cross-chain solver on Arc.
+    relay_proxy=None,
+    relay_router=None,
+    depository=None,
+    ripe_claim=None,
+    relay_usdg_equivalents=frozenset(),
+    # Execution venues: 0x does not list Arc yet; Kyber's aggregator uses the
+    # "arc" chain slug (router address confirmed in Phase 3). OKX not present.
+    zero_x_allowance_holder=None,
+    kyber_router=None,
+    kyber_chain_slug="arc",
+    okx_router=None,
+    okx_approval=None,
+    permit2="0x000000000022d473030f116ddee9f6b43ac78ba3",
+)
+
+CHAINS: dict[int, ChainRegistry] = {
+    ROBINHOOD.chain_id: ROBINHOOD,
+    ARC.chain_id: ARC,
 }
-RELAY_PROXY = "0xccc88a9d1b4ed6b0eaba998850414b24f1c315be"
-RELAY_ROUTER = "0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f"
-ZERO_X_ALLOWANCE_HOLDER = "0x0000000000001ff3684f28c67538d4d072c22734"
-KYBER_META_AGGREGATION_ROUTER_V2 = "0x6131b5fae19ea4f9d964eac0408e4408b66337b5"
-PERMIT2 = "0x000000000022d473030f116ddee9f6b43ac78ba3"
-OKX_ROUTER = "0x6e2a35a7ad683cf634d91492d73bb7ff774c6919"
-OKX_APPROVAL = "0x42170295f1173c9e5874ea9d00c6d137e1a4f53d"
-DEPOSITORY = "0x4cd00e387622c35bddb9b4c962c136462338bc31"
-RIPE_CLAIM = "0x2d3cb2b39289f402187d7dc9b609ead6646f2506"
-POSITION_MANAGERS = {
-    "0x73991a25c818bf1f1128deaab1492d45638de0d3",
-    "0x58daec3116aae6d93017baaea7749052e8a04fa7",
-}
-QUOTE_ASSETS = {NATIVE, WETH, USDG}
-RELAY_USDG_EQUIVALENTS = {
-    # Relay's Solana mainnet chain id and canonical USDC mint. Both this asset
-    # and Robinhood USDG use six decimals; the source identity remains evidence.
-    (792703809, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
-}
+
+
+def chain_for(chain_id: int) -> ChainRegistry:
+    """Resolve the registry for a chain id, or raise on an unsupported chain."""
+    try:
+        return CHAINS[chain_id]
+    except KeyError:
+        raise ValueError(f"unsupported chain id: {chain_id}")
+
+
+# --- Backward-compatible module-level aliases (Robinhood Chain) ---------------
+# Existing single-chain call sites import these names directly. They resolve to
+# the Robinhood registry so this refactor is behavior-preserving. New code that
+# must work across chains should read fields off ``chain_for(chain_id)`` instead.
+CHAIN_ID = ROBINHOOD.chain_id
+WETH = ROBINHOOD.weth
+USDG = ROBINHOOD.usdg
+ENTRYPOINT = ROBINHOOD.entrypoint
+SIMPLE_ACCOUNT = ROBINHOOD.simple_account
+METAMASK_ACCOUNT = ROBINHOOD.metamask_account
+V2_ROUTER = ROBINHOOD.v2_router
+V2_FACTORY = ROBINHOOD.v2_factory
+V3_ROUTER = ROBINHOOD.v3_router
+V3_FACTORY = ROBINHOOD.v3_factory
+V3_QUOTER = ROBINHOOD.v3_quoter
+UNIVERSAL_ROUTER = ROBINHOOD.universal_router
+V4_MANAGER = ROBINHOOD.v4_manager
+V4_QUOTER = ROBINHOOD.v4_quoter
+KNOWN_V4_HOOK_CODE_HASHES = ROBINHOOD.known_v4_hook_code_hashes
+RELAY_PROXY = ROBINHOOD.relay_proxy
+RELAY_ROUTER = ROBINHOOD.relay_router
+ZERO_X_ALLOWANCE_HOLDER = ROBINHOOD.zero_x_allowance_holder
+KYBER_META_AGGREGATION_ROUTER_V2 = ROBINHOOD.kyber_router
+PERMIT2 = ROBINHOOD.permit2
+OKX_ROUTER = ROBINHOOD.okx_router
+OKX_APPROVAL = ROBINHOOD.okx_approval
+DEPOSITORY = ROBINHOOD.depository
+RIPE_CLAIM = ROBINHOOD.ripe_claim
+POSITION_MANAGERS = ROBINHOOD.position_managers
+QUOTE_ASSETS = ROBINHOOD.quote_assets
+RELAY_USDG_EQUIVALENTS = ROBINHOOD.relay_usdg_equivalents
 
 
 def load_watchlist(path: str | Path) -> dict[str, dict]:

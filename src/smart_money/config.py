@@ -4,7 +4,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-ALLOWED_ENV_KEYS = frozenset({"ROBINHOOD_RPC_URL", "ROBINHOOD_FEED_URL", "0X_API_KEY"})
+ALLOWED_ENV_KEYS = frozenset({
+    "ROBINHOOD_RPC_URL", "ROBINHOOD_FEED_URL", "0X_API_KEY",
+    # Arc (chain 5042): HTTPS for calls/quotes/backfill, WSS for eth_subscribe.
+    "ARC_RPC_URL", "ARC_WS_URL",
+})
 MAX_ENV_BYTES = 64 * 1024
 
 
