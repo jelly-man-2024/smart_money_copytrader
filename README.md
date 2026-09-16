@@ -13,6 +13,7 @@ Robinhood Chain 聪明钱跟单工程，独立于同级 `fomo_sniper`。
 - [09-15 停机准备结果（已准备，未启动实盘）](docs/EARLY_FEED_PRELAUNCH_2026-09-15.md)
 - [历史 Feed 覆盖回放操作](docs/HOWTO_REPLAY_EARLY_FEED.md)
 - [观察名单历史交易路径分析](docs/WATCHLIST_ROUTE_ANALYSIS_2026-09-12.md)
+- [当前运行与开发交接（面向后续模型，2026-09-16）](docs/MODEL_HANDOFF_2026-09-16.md)
 - [继续开发交接](docs/HANDOFF.md)
 - [新服务器测试与开发交付](docs/SERVER_HANDOFF.md)
 - [Mac mini 空运行环境交付](docs/MAC_MINI_ENV_HANDOFF.md)
