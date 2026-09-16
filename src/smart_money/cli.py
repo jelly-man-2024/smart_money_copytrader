@@ -213,6 +213,38 @@ def dispatch_pending(store, queue, stats) -> int:
     return len(candidates)
 
 
+CRITICAL_TASK_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
+
+
+async def supervise_critical_task(name, iteration, stats, fail_closed,
+                                  backoffs=CRITICAL_TASK_BACKOFF_SECONDS):
+    """Retry a critical monitor loop through transient faults; fail closed when stuck.
+
+    On 2026-09-16 a ledger socket loss killed the heartbeat and dispatcher tasks
+    silently while the process kept running. Every failure now emits a structured
+    event carrying only the exception type (no raw error text, URLs or params).
+    Consecutive failures beyond the backoff schedule call ``fail_closed`` once and
+    re-raise so the monitor exits loudly instead of degrading unnoticed.
+    """
+    failures = 0
+    while True:
+        try:
+            await iteration()
+            failures = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failures += 1
+            stats[f"{name}_errors"] += 1
+            exhausted = failures > len(backoffs)
+            report("critical_task_error", task=name, error_type=type(exc).__name__,
+                   consecutive_failures=failures, will_fail_closed=exhausted)
+            if exhausted:
+                fail_closed()
+                raise
+            await asyncio.sleep(backoffs[failures - 1])
+
+
 def replay(args):
     watchlist = load_watchlist(args.watchlist)
     decoder = Decoder(watchlist, snapshot_delegations(args.accounts))
@@ -1191,34 +1223,37 @@ async def monitor(args):
                 timings.observe("candidate_processing_ms", time.monotonic() - started)
                 queue.task_done()
 
-    async def dispatcher():
-        while True:
-            wake_dispatcher.clear()
-            if not dispatch_pending(store, queue, stats):
-                try:
-                    await asyncio.wait_for(wake_dispatcher.wait(), timeout=0.25)
-                except asyncio.TimeoutError:
-                    pass
-            else:
-                await asyncio.sleep(0)
+    def critical_fail_closed():
+        """A stuck ledger loop must stop live signing before the loud exit."""
+        if live_pipelines or early_trial_id:
+            trip_execution_stop()
 
-    async def heartbeat():
-        while True:
-            await asyncio.sleep(5)
-            stats["ledger_reconnections"] = getattr(store.connection, "reconnections", 0)
-            feed_healthy = health.healthy()
-            report("health", healthy=feed_healthy, feed_healthy=feed_healthy,
-                   execution=execution_health(bool(live_pipelines)),
-                   queued=queue.qsize(), counters=dict(stats),
-                   relay_http_timings=list(getattr(relay_client, "timings", ()))[-8:],
-                   rpc_http_timings=list(getattr(getattr(rpc, "transport", None), "timings", ()))[-8:],
-                   rpc_call_timings=list(getattr(rpc, "timings", ()))[-8:],
-                   aggregator_http_timings={name: list(client.transport.timings)[-8:]
-                       for name, client in (quoter.aggregators.items() if paper_config else [])},
-                   early_feed_counters=dict(early_lane.stats) if early_lane else {},
-                   deployment_verification=deployment_monitor.status() if deployment_monitor else None,
-                   candidate_states=store.candidate_counts(), chain_cursor=store.chain_cursor(),
-                   latency_ms=timings.summary(), coverage=coverage_summary(stats))
+    async def dispatcher_iteration():
+        wake_dispatcher.clear()
+        if not dispatch_pending(store, queue, stats):
+            try:
+                await asyncio.wait_for(wake_dispatcher.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(0)
+
+    async def heartbeat_iteration():
+        await asyncio.sleep(5)
+        stats["ledger_reconnections"] = getattr(store.connection, "reconnections", 0)
+        feed_healthy = health.healthy()
+        report("health", healthy=feed_healthy, feed_healthy=feed_healthy,
+               execution=execution_health(bool(live_pipelines)),
+               queued=queue.qsize(), counters=dict(stats),
+               relay_http_timings=list(getattr(relay_client, "timings", ()))[-8:],
+               rpc_http_timings=list(getattr(getattr(rpc, "transport", None), "timings", ()))[-8:],
+               rpc_call_timings=list(getattr(rpc, "timings", ()))[-8:],
+               aggregator_http_timings={name: list(client.transport.timings)[-8:]
+                   for name, client in (quoter.aggregators.items() if paper_config else [])},
+               early_feed_counters=dict(early_lane.stats) if early_lane else {},
+               deployment_verification=deployment_monitor.status() if deployment_monitor else None,
+               candidate_states=store.candidate_counts(), chain_cursor=store.chain_cursor(),
+               latency_ms=timings.summary(), coverage=coverage_summary(stats))
 
     async def backfill():
         def progress(candidates, passive_candidates):
@@ -1319,9 +1354,11 @@ async def monitor(args):
             await deployment_monitor.close()
             raise
     workers = [asyncio.create_task(worker()) for _ in range(args.workers)]
-    dispatch_task = asyncio.create_task(dispatcher())
+    dispatch_task = asyncio.create_task(supervise_critical_task(
+        "dispatcher", dispatcher_iteration, stats, critical_fail_closed))
     backfill_task = asyncio.create_task(backfill())
-    beat = asyncio.create_task(heartbeat())
+    beat = asyncio.create_task(supervise_critical_task(
+        "heartbeat", heartbeat_iteration, stats, critical_fail_closed))
     receiver = asyncio.create_task(receive())
     try:
         report("monitor_started", wallets=len(watchlist),
@@ -1330,13 +1367,15 @@ async def monitor(args):
                backfill_wallets=len(backfill_watchlist),
                backfill_range_blocks=args.backfill_batch, seconds=args.seconds,
                live_trading=bool(live_pipelines))
-        if args.seconds > 0:
-            try:
-                await asyncio.wait_for(receiver, timeout=args.seconds)
-            except asyncio.TimeoutError:
-                pass
-        else:
-            await receiver
+        # Waiting on every core task (not only the receiver) turns the silent
+        # death of the dispatcher, heartbeat or a worker into a loud exit.
+        core_tasks = [receiver, dispatch_task, beat, *workers]
+        done, _ = await asyncio.wait(
+            core_tasks, timeout=args.seconds if args.seconds > 0 else None,
+            return_when=asyncio.FIRST_COMPLETED)
+        for finished in done:
+            if finished.exception() is not None:
+                raise finished.exception()
         try:
             await asyncio.wait_for(queue.join(), timeout=15)
         except asyncio.TimeoutError:
