@@ -12,6 +12,7 @@ import time
 import websockets
 
 from .account_state import prestate_implementations
+from .arc_observer import observe_arc
 from .approval import (
     approve_relationship_token, approve_relationship_usdg,
     confirm_relationship_token_approval,
@@ -48,7 +49,7 @@ from .pools import discover_v3_execution_route, verify_signal_pools
 from .quotes import LiveQuoter
 from .receipts import direct_token_transfer_evidence, enrich
 from .registry import (
-    CHAIN_ID, ENTRYPOINT, NATIVE, USDG, V2_ROUTER, V3_ROUTER, delegation,
+    ARC, CHAIN_ID, ENTRYPOINT, NATIVE, USDG, V2_ROUTER, V3_ROUTER, delegation,
     load_watchlist, snapshot_delegations,
 )
 from .rpc import ReadOnlyRpc, RpcError, CancelledBeforeSigningRpcError
@@ -76,6 +77,40 @@ def emit(store, signal):
                    source_tx_hash=signal.tx_hash, smart_wallet=signal.wallet,
                    stage=signal.stage, order_id=signal.evidence.get("relay_order_id",
                        signal.evidence.get("relay_deposit_order_id")))
+
+
+async def arc_monitor(args):
+    """Run the independent Arc observer; no paper/live execution is wired here."""
+    load_endpoint_env()
+    rpc_url = os.environ.get("ARC_RPC_URL")
+    ws_url = os.environ.get("ARC_WS_URL")
+    if not rpc_url or not ws_url:
+        raise ValueError("ARC_RPC_URL and ARC_WS_URL are required")
+    rpc = ReadOnlyRpc(rpc_url)
+    store = Store(args.db)
+    watchlist = load_watchlist(args.watchlist)
+
+    def output(signal):
+        print(json.dumps(signal.to_dict(), ensure_ascii=False), flush=True)
+        report("arc_signal_observed", source_event_id=signal.event_id,
+               source_tx_hash=signal.tx_hash, smart_wallet=signal.wallet,
+               stage=signal.stage, chain_id=signal.chain_id,
+               read_only=True, live_trading=False)
+
+    report("arc_observer_started", chain_id=ARC.chain_id,
+           smart_wallets=len(watchlist), read_only=True, live_trading=False)
+    try:
+        task = observe_arc(rpc, ws_url, store, watchlist, output)
+        if args.seconds:
+            try:
+                await asyncio.wait_for(task, timeout=args.seconds)
+            except asyncio.TimeoutError:
+                report("arc_observer_duration_complete", seconds=args.seconds)
+        else:
+            await task
+    finally:
+        rpc.close()
+        store.close()
 
 
 def runtime_paper_config(args):
@@ -1535,6 +1570,13 @@ def parser():
     monitor_parser.add_argument(
         "--early-feed-evidence", action="store_true",
         help="Collect early intent evidence using the SAME Feed connection; does not enable early trading")
+    arc_parser = commands.add_parser(
+        "arc-monitor", help="Observe Arc v4 Swap logs over WSS; read-only")
+    arc_parser.add_argument("--watchlist", default="data/fomo_watchlist.csv")
+    arc_parser.add_argument("--db", default="var/arc-observer.sqlite3")
+    arc_parser.add_argument(
+        "--seconds", type=float, default=60,
+        help="Duration; 0 runs until interrupted")
     monitor_source = monitor_parser.add_mutually_exclusive_group()
     monitor_source.add_argument("--paper-config")
     monitor_source.add_argument("--paper-mysql", action="store_true",
@@ -1649,6 +1691,12 @@ def main():
     try:
         if args.command == "replay":
             replay(args)
+        elif args.command == "arc-monitor":
+            if args.seconds < 0:
+                raise ValueError("invalid Arc monitor duration")
+            with runtime_instance_lock(
+                    "var/sm-copy-arc.instance.lock", "var/sm-copy-arc.pid"):
+                asyncio.run(arc_monitor(args))
         elif args.command in {"monitor", "run"}:
             if (args.seconds < 0 or not 1 <= args.workers <= 8 or not 1 <= args.queue_size <= 10000
                     or args.confirmations < 0 or not 1 <= args.backfill_batch <= MAX_RANGE_BLOCKS

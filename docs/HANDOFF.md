@@ -1727,3 +1727,27 @@ healthy。188/188 unittest、pip check、13 笔回放、diff check 通过。
 查询并升级，事件 `relay_sell_order_confirmed` / `relay_sell_confirmation_rejected` /
 `relay_lookup_pending`，计数器 `relay_sell_confirmed`。真实样本
 `data/relay_sell_evidence_2026-09-13.json`（含另一用户的打包订单）作为测试夹具。196/196 unittest。
+
+## 2026-09-16 Arc Phase 0/1 只读观察接入
+
+Phase 0 已提交 `4ecec51`（链注册表、Arc 端点 allowlist、账本 chain_id）和 `9f29648`
+（迁移 011 强制 INSTANT）。迁移 011 已在线应用到业务 MySQL；5 张表的历史行均为 chain 4663，
+原 `sm-copy run` PID 未重启且迁移后持续健康。迁移未启用 Arc 执行。
+
+Phase 1 新增独立 `.venv/bin/sm-copy arc-monitor --seconds N`。它仅使用 `ARC_WS_URL` 的标准
+`eth_subscribe(logs)` 订阅 Arc Uniswap v4 PoolManager Swap topic，并用 `ARC_RPC_URL` 对 chain ID、
+交易、回执、PoolManager 代码、pool key、settlement action 和钱包净变化重新核验。只有顶层发送者
+属于 watchlist 才建立候选；Arc 没有被当作 Robinhood Feed/EntryPoint/Relay。每个信号显式携带
+`chain_id=5042`，event_id 因而与 Robinhood 隔离。removed log、订阅 ID 不匹配、链 ID 不匹配及
+回执找不到同一日志均 fail closed。
+
+默认账本为独立 `var/arc-observer.sqlite3`，进程锁也是独立的
+`var/sm-copy-arc.instance.lock`，所以不会改写当前业务 MySQL 或阻塞 Robinhood 进程。
+15 秒真实只读冒烟测试已成功连接 chain 5042 与 QuickNode WSS，期间未出现 watchlist 候选；
+528 项 unittest 通过，12 项可选 py-evm 测试跳过。
+
+迁移 `012_arc_chain_keys.sql` 已准备，但**尚未在线执行**。它把 `chain_cursors`、
+`canonical_blocks` 主键改成 chain-scoped，现有库执行时会重建主键，必须先停写、备份并安排维护窗口。
+Phase 1 的独立 SQLite 观察器不依赖该迁移；在共享 MySQL Arc backfill/候选写入和任何 Arc
+纸面/实盘功能接线前，还需完成 Store 全部候选、游标与重组查询的 chain_id 作用域改造。
+本阶段没有 Arc 报价、聚合器执行、签名、广播或真实交易。

@@ -22,10 +22,11 @@ def selector(signature: str) -> bytes:
     return keccak(text=signature)[:4]
 
 
-def side(token_in: str, token_out: str) -> str:
-    if token_in in R.QUOTE_ASSETS and token_out not in R.QUOTE_ASSETS:
+def side(token_in: str, token_out: str,
+         quote_assets: frozenset[str] = R.QUOTE_ASSETS) -> str:
+    if token_in in quote_assets and token_out not in quote_assets:
         return "BUY"
-    if token_out in R.QUOTE_ASSETS and token_in not in R.QUOTE_ASSETS:
+    if token_out in quote_assets and token_in not in quote_assets:
         return "SELL"
     return "TOKEN_SWAP"
 
@@ -54,12 +55,15 @@ def v3_path(data: bytes, exact_in: bool) -> tuple[str, str]:
 
 
 class Decoder:
-    def __init__(self, watchlist: dict, delegations: dict[str, str] | None = None):
+    def __init__(self, watchlist: dict, delegations: dict[str, str] | None = None,
+                 chain_id: int = R.CHAIN_ID):
         self.watchlist = watchlist
         self.delegations = delegations or {}
+        self.chain = R.chain_for(chain_id)
 
     def decode(self, tx: Transaction) -> list[Signal]:
-        if tx.chain_id != R.CHAIN_ID:
+        C = self.chain
+        if tx.chain_id != C.chain_id:
             return []
         result: list[Signal] = []
         budget = [0]
@@ -68,6 +72,7 @@ class Decoder:
             signal = Signal(
                 tx_hash=tx.hash, wallet=wallet, mode=mode, behavior=behavior,
                 path=path, contract=to, selector="0x" + data[:4].hex(), fresh=tx.fresh,
+                chain_id=tx.chain_id,
                 userop_index=op[0] if op else None, userop_nonce=str(op[1]) if op else None,
                 **fields,
             )
@@ -78,7 +83,7 @@ class Decoder:
                  amount, limit, recipient, protocol, exact_in=True, **extra):
             token_in, token_out = address(token_in), address(token_out)
             item = emit(
-                wallet, mode, path, to, data, side(token_in, token_out), op,
+                wallet, mode, path, to, data, side(token_in, token_out, C.quote_assets), op,
                 token_in=token_in, token_out=token_out,
                 amount_in_raw=str(amount) if exact_in else None,
                 amount_out_raw=None if exact_in else str(amount), amount_limit_raw=str(limit),
@@ -103,12 +108,12 @@ class Decoder:
                 implementation = self.delegations.get(wallet)
                 if to == wallet and implementation:
                     calls = None
-                    if implementation == R.SIMPLE_ACCOUNT:
+                    if implementation == C.simple_account:
                         if sel == bytes.fromhex("b61d27f6"):
                             calls = [decode(["address", "uint256", "bytes"], args)]
                         elif sel == bytes.fromhex("34fcd5be"):
                             calls = decode([CALLS], args)[0]
-                    elif implementation == R.METAMASK_ACCOUNT and sel == bytes.fromhex("e9ae5c53"):
+                    elif implementation == C.metamask_account and sel == bytes.fromhex("e9ae5c53"):
                         execution_mode, body = decode(["bytes32", "bytes"], args)
                         if execution_mode == bytes(32) and len(body) >= 52:
                             calls = [("0x" + body[:20].hex(), int.from_bytes(body[20:52], "big"), body[52:])]
@@ -121,23 +126,23 @@ class Decoder:
                             child(dest, amount, body, str(i))
                         return
 
-                if to == R.RELAY_PROXY and sel == bytes.fromhex("f9e4bab4"):
+                if to == C.relay_proxy and sel == bytes.fromhex("f9e4bab4"):
                     tokens, amounts, calls, refund, nft, metadata = decode(
                         ["address[]", "uint256[]", RELAY_CALLS, "address", "address", "bytes"], args)
                     if len(tokens) != len(amounts) or len(calls) > 256:
                         raise ValueError("invalid Relay batch")
                     for i, (dest, allow_failure, amount, body) in enumerate(calls):
                         # Relay Router executes these calls, not the proxy itself.
-                        walk(wallet, mode, dest, amount, body, path + f"/relay/{i}", op, depth + 1, R.RELAY_ROUTER)
+                        walk(wallet, mode, dest, amount, body, path + f"/relay/{i}", op, depth + 1, C.relay_router)
                     return
-                if to == R.RELAY_ROUTER and sel == bytes.fromhex("cd6e13f7"):
+                if to == C.relay_router and sel == bytes.fromhex("cd6e13f7"):
                     calls, refund, nft, metadata = decode([RELAY_CALLS, "address", "address", "bytes"], args)
                     if len(calls) > 256:
                         raise ValueError("Relay batch limit")
                     for i, (dest, allow_failure, amount, body) in enumerate(calls):
                         child(dest, amount, body, f"relay/{i}")
                     return
-                if to == R.RELAY_ROUTER and sel == bytes.fromhex("73b7bb2f"):
+                if to == C.relay_router and sel == bytes.fromhex("73b7bb2f"):
                     tokens, targets, payloads, minimums = decode(
                         ["address[]", "address[]", "bytes[]", "uint256[]"], args)
                     if (not len(tokens) == len(targets) == len(payloads) == len(minimums)
@@ -155,7 +160,7 @@ class Decoder:
                             })
                     return
 
-                if to == R.DEPOSITORY:
+                if to == C.depository:
                     if sel == bytes.fromhex("e8017952"):
                         depositor, token, amount, order = decode(["address", "address", "uint256", "bytes32"], args)
                         amount_source = "calldata"
@@ -175,7 +180,7 @@ class Decoder:
                          reasons=["deposit_is_not_a_destination_purchase"])
                     return
 
-                if to == R.ZERO_X_ALLOWANCE_HOLDER and sel == bytes.fromhex("2213bc0b"):
+                if to == C.zero_x_allowance_holder and sel == bytes.fromhex("2213bc0b"):
                     operator, token, amount, target, payload = decode(
                         ["address", "address", "uint256", "address", "bytes"], args)
                     emit(wallet, mode, path, to, data, "AGGREGATOR_SWAP_INTENT", op,
@@ -188,7 +193,7 @@ class Decoder:
                          }, reasons=["decoded_aggregator_intent_not_execution"])
                     return
 
-                if (to == R.KYBER_META_AGGREGATION_ROUTER_V2
+                if (to == C.kyber_router
                         and sel == bytes.fromhex("e21fd0e9")):
                     execution = decode([KYBER_SWAP_EXECUTION], args)[0]
                     call_target, approve_target, target_data, desc, client_data = execution
@@ -202,7 +207,7 @@ class Decoder:
                     emit(wallet, mode, path, to, data, "AGGREGATOR_SWAP_INTENT", op,
                          token_in=src_token, token_out=dst_token,
                          amount_in_raw=str(amount), amount_limit_raw=str(minimum),
-                         recipient=dst_receiver if int(dst_receiver, 16) else R.RELAY_ROUTER,
+                         recipient=dst_receiver if int(dst_receiver, 16) else C.relay_router,
                          protocol="kyber", evidence={
                              "source_aggregator": "kyber",
                              "kyber_call_target": address(call_target),
@@ -212,27 +217,27 @@ class Decoder:
                          }, reasons=["decoded_aggregator_intent_not_execution"])
                     return
 
-                if to == R.RIPE_CLAIM and sel == bytes.fromhex("815a4392"):
+                if to == C.ripe_claim and sel == bytes.fromhex("815a4392"):
                     recipient, flag = decode(["address", "bool"], args)
                     emit(wallet, mode, path, to, data, "CLAIM", op, recipient=recipient)
                     return
 
-                if to == R.WETH:
+                if to == C.weth:
                     if sel == bytes.fromhex("d0e30db0") and not args and value > 0:
                         emit(wallet, mode, path, to, data, "WRAP_NATIVE", op,
-                             token_in=R.NATIVE, token_out=R.WETH,
+                             token_in=R.NATIVE, token_out=C.weth,
                              amount_in_raw=str(value), recipient=wallet,
                              reasons=["wrap_is_asset_conversion_not_purchase"])
                         return
                     if sel == bytes.fromhex("2e1a7d4d"):
                         amount = decode(["uint256"], args)[0]
                         emit(wallet, mode, path, to, data, "UNWRAP_WETH", op,
-                             token_in=R.WETH, token_out=R.NATIVE,
+                             token_in=C.weth, token_out=R.NATIVE,
                              amount_in_raw=str(amount), recipient=wallet,
                              reasons=["unwrap_is_asset_conversion_not_sale"])
                         return
 
-                if to == R.V3_ROUTER and sel in {bytes.fromhex("ac9650d8"), bytes.fromhex("5ae401dc")}:
+                if to == C.v3_router and sel in {bytes.fromhex("ac9650d8"), bytes.fromhex("5ae401dc")}:
                     calls = decode(["bytes[]"], args)[0] if sel.hex() == "ac9650d8" else decode(["uint256", "bytes[]"], args)[1]
                     if len(calls) > 256:
                         raise ValueError("router batch limit")
@@ -240,7 +245,7 @@ class Decoder:
                         child(to, value, body, f"multicall/{i}")
                     return
 
-                if to == R.V2_ROUTER:
+                if to == C.v2_router:
                     methods = {
                         "swapExactTokensForTokens(uint256,uint256,address[],address,uint256)": (True, False, False),
                         "swapTokensForExactTokens(uint256,uint256,address[],address,uint256)": (False, False, False),
@@ -274,7 +279,7 @@ class Decoder:
                         emit(wallet, mode, path, to, data, "LIQUIDITY", op)
                         return
 
-                if to == R.V3_ROUTER:
+                if to == C.v3_router:
                     if sel in {bytes.fromhex("04e45aaf"), bytes.fromhex("5023b4df")}:
                         a, b, fee, recipient, amount, limit, sqrt = decode(["(address,address,uint24,address,uint256,uint256,uint160)"], args)[0]
                         swap(wallet, mode, path, to, data, op, a, b, amount, limit, recipient,
@@ -288,7 +293,7 @@ class Decoder:
                              amount, limit, recipient, "v3", exact, evidence={"hops": hops})
                         return
 
-                if to == R.UNIVERSAL_ROUTER and sel in {bytes.fromhex("3593564c"), bytes.fromhex("24856bc3")}:
+                if to == C.universal_router and sel in {bytes.fromhex("3593564c"), bytes.fromhex("24856bc3")}:
                     types = ["bytes", "bytes[]", "uint256"] if sel.hex() == "3593564c" else ["bytes", "bytes[]"]
                     values = decode(types, args)
                     commands, inputs = values[:2]
@@ -423,12 +428,12 @@ class Decoder:
                             emit(wallet, mode, subpath, to, data, "UNKNOWN", op, reasons=[f"unsupported_router_command:{cmd}"])
                     return
 
-                if to == R.PERMIT2 and sel == bytes.fromhex("87517c45"):
+                if to == C.permit2 and sel == bytes.fromhex("87517c45"):
                     token, spender, amount, expiration = decode(["address", "address", "uint160", "uint48"], args)
                     emit(wallet, mode, path, to, data, "APPROVAL", op, token_in=token,
                          recipient=spender, amount_limit_raw=str(amount))
                     return
-                if to in R.POSITION_MANAGERS:
+                if to in C.position_managers:
                     emit(wallet, mode, path, to, data, "LIQUIDITY_OR_POSITION_CALL", op,
                          reasons=["position_manager_not_a_plain_token_purchase"])
                     return
@@ -451,7 +456,7 @@ class Decoder:
                 emit(wallet, mode, path + "/decode_error", to, data, "UNKNOWN", op,
                      reasons=["decode_error:" + type(exc).__name__])
 
-        if tx.to == R.ENTRYPOINT and tx.data[:4] == bytes.fromhex("765e827f"):
+        if tx.to == C.entrypoint and tx.data[:4] == bytes.fromhex("765e827f"):
             try:
                 ops, beneficiary = decode([PACKED_OPS, "address"], tx.data[4:])
                 if len(ops) > 256:
@@ -459,7 +464,7 @@ class Decoder:
                 for i, op in enumerate(ops):
                     wallet = address(op[0])
                     if wallet in self.watchlist:
-                        walk(wallet, "bundled_account", wallet, 0, op[3], f"userop/{i}", (i, op[1]), caller=R.ENTRYPOINT)
+                        walk(wallet, "bundled_account", wallet, 0, op[3], f"userop/{i}", (i, op[1]), caller=C.entrypoint)
             except Exception:
                 # Untrusted malformed sender bytes must never become ownership evidence.
                 return []
@@ -483,16 +488,16 @@ class Decoder:
                     item.reasons.append("aggregator_call_not_linked_to_unique_relay_deposit")
                 continue
             trade, deposit = aggregators[0], deposits[0]
-            if (deposit.recipient != trade.wallet or deposit.token_in != R.USDG
+            if (deposit.recipient != trade.wallet or deposit.token_in != C.usdg
                     or deposit.evidence.get("relay_cleanup_token") != deposit.token_in
                     or trade.token_out not in (None, deposit.token_in)
-                    or (trade.protocol == "kyber" and trade.recipient != R.RELAY_ROUTER)):
+                    or (trade.protocol == "kyber" and trade.recipient != C.relay_router)):
                 trade.behavior = "UNKNOWN"
                 trade.reasons.append("aggregator_call_relay_deposit_identity_mismatch")
                 continue
             trade.token_out = deposit.token_in
-            trade.recipient = R.RELAY_ROUTER
-            trade.behavior = side(trade.token_in, trade.token_out)
+            trade.recipient = C.relay_router
+            trade.behavior = side(trade.token_in, trade.token_out, C.quote_assets)
             if trade.behavior != "SELL":
                 trade.behavior = "UNKNOWN"
                 trade.reasons.append("relay_mvp_only_supports_token_to_usdg_sell")

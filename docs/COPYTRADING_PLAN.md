@@ -193,6 +193,17 @@ M2：补齐确认链路和持久化补洞；接历史/实时可得报价做模�
 M3：独立钱包、有限资产和小额预算，经用户明确确认后实现并验收实盘执行器。
 M4：对比确认/快速模式的真实延迟、价格偏离、失败成本；评估是否值得订单前置监听。
 
+### Arc 扩展里程碑（2026-09-16）
+
+Arc mainnet（chain ID 5042）先作为独立只读观察源接入，不继承 Robinhood 的 Feed、EntryPoint
+或 Relay 假设。Phase 1 仅订阅 Uniswap v4 PoolManager Swap 日志，并以 HTTPS RPC 重新核验发送者、
+calldata、回执、pool key、settlement 与钱包净变化；默认使用独立 SQLite 账本，所有信号携带 chain_id。
+native USDC 18 位 raw amount 与 ERC-20 USDC 6 位 raw amount 永不混算。
+
+共享 MySQL、纸面报价和执行均不属于本阶段。`012_arc_chain_keys.sql` 只准备规范区块与游标的
+复合键，必须在维护窗口执行；候选/重组查询完成全链作用域改造前，不允许 Arc 写入共享运行账本。
+任何 Arc 签名、广播或真实跟单仍需单独批准里程碑和完整风险检查清单。
+
 ## 9. 验收指标
 
 - 必须通过真实领取、转账、LP、存款、230 地址分发等负例；不能产生自动买单。

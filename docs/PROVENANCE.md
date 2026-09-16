@@ -102,3 +102,19 @@ tuple 布局。
   26 笔历史公开签名及独立 EIP-712 编码器用于交叉测试；这不替代部署字节码身份核验。
 - `tests/test_early_feed.py` 中的 policy/portfolio/order/market/preparation 快照为显式合成测试数据，
   不宣称在真实交易 Feed 时刻曾存在，不用这些正例提高历史覆盖率。
+
+## 2026-09-16 Arc 主网只读接入
+
+- Arc 主网 chain ID、HTTPS/WSS provider 列表、native USDC 语义来自 Arc 官方
+  `connect-to-arc`、`contract-addresses`、`evm-differences` 与 `usdc-system-events` 文档。
+  特别保留 18 位 native system Transfer 与 6 位 ERC-20 Transfer 是两个日志流、不得重复计算的限制。
+- Uniswap v4/Universal Router 地址先从公开部署注册表取得，并在 2026-09-16 使用项目已配置的
+  `ARC_RPC_URL` 以只读 `eth_chainId`/`eth_getCode` 核对；未保存或输出 endpoint 凭据。
+- `ARC_WS_URL` 的 QuickNode/Blockdaemon 90 秒延迟对比仅用于 provider 选择，未写入交易数据、
+  凭据或付费采购承诺。最终 15 秒 `arc-monitor` 冒烟测试只订阅公开 Swap 日志，未观察到 watchlist
+  候选，未签名或广播。
+- 官方依据：
+  https://docs.arc.io/arc/references/connect-to-arc 、
+  https://docs.arc.io/arc/references/contract-addresses 、
+  https://docs.arc.io/arc/references/evm-differences 、
+  https://docs.arc.io/arc/references/usdc-system-events 。

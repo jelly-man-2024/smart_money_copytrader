@@ -124,12 +124,16 @@ def deltas(logs: list[dict], wallet: str) -> dict[str, str]:
     return {token: str(amount) for token, amount in net.items() if amount}
 
 
-def operation_scopes(logs: list[dict]) -> dict[tuple[str, int], list[tuple[bool, list[dict], str]]]:
+def operation_scopes(logs: list[dict], chain_id: int = R.CHAIN_ID
+                     ) -> dict[tuple[str, int], list[tuple[bool, list[dict], str]]]:
+    entrypoint = R.chain_for(chain_id).entrypoint
+    if entrypoint is None:
+        return {}
     result = defaultdict(list)
     start = None
     for i, log in enumerate(logs):
         topics = log.get("topics", [])
-        if log.get("address", "").lower() != R.ENTRYPOINT or not topics:
+        if log.get("address", "").lower() != entrypoint or not topics:
             continue
         if topics[0] == BEFORE:
             start = i + 1
@@ -148,13 +152,16 @@ def operation_scopes(logs: list[dict]) -> dict[tuple[str, int], list[tuple[bool,
 def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dict,
            pool_checks: dict[str, dict] | None = None,
            native_checks: dict[str, dict] | None = None) -> list[Signal]:
+    C = R.chain_for(tx.chain_id)
+    if any(signal.chain_id != tx.chain_id for signal in signals):
+        raise ValueError("signal chain id mismatch")
     if receipt.get("transactionHash", "").lower() != tx.hash:
         raise ValueError("receipt transaction hash mismatch")
     logs = sorted(receipt.get("logs", []), key=lambda log: number(log.get("logIndex", 0)))
     if any(log.get("removed", False) for log in logs):
         raise ValueError("removed receipt logs")
     succeeded = number(receipt.get("status", 0)) == 1
-    scopes = operation_scopes(logs)
+    scopes = operation_scopes(logs, tx.chain_id)
     trade_counts = Counter((s.wallet, s.userop_index) for s in signals if s.behavior in TRADE_BEHAVIORS)
     uncertain_groups = {(s.wallet, s.userop_index) for s in signals if s.behavior == "UNKNOWN"}
     for signal in signals:
@@ -186,13 +193,13 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
         signal.evidence["wallet_erc20_deltas_raw"] = deltas(local_logs, signal.wallet)
         signal.stage = "execution_observed"
         if signal.behavior == "WRAP_NATIVE":
-            received = int(signal.evidence["wallet_erc20_deltas_raw"].get(R.WETH, "0"))
+            received = int(signal.evidence["wallet_erc20_deltas_raw"].get(C.weth, "0"))
             signal.evidence["actual_output_credit_raw"] = str(max(received, 0))
             if received != int(signal.amount_in_raw or "0"):
                 signal.stage = "needs_review"
                 signal.reasons.append("weth_wrap_credit_does_not_match_call_value")
         elif signal.behavior == "UNWRAP_WETH":
-            spent = -int(signal.evidence["wallet_erc20_deltas_raw"].get(R.WETH, "0"))
+            spent = -int(signal.evidence["wallet_erc20_deltas_raw"].get(C.weth, "0"))
             signal.evidence["actual_input_debit_raw"] = str(max(spent, 0))
             if spent != int(signal.amount_in_raw or "0"):
                 signal.stage = "needs_review"
@@ -201,7 +208,7 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
             matches = []
             for item in local_logs:
                 topics = item.get("topics", [])
-                if (item.get("address", "").lower() != R.DEPOSITORY or not topics
+                if (item.get("address", "").lower() != C.depository or not topics
                         or topics[0] != DEPOSIT_RECORDED or len(item.get("data", "")) != 258):
                     continue
                 try:
@@ -254,7 +261,7 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
                 "verified": False, "reason": "historical_pool_verification_unavailable"}
             matching = [log for log in swap_logs if (
                 signal.protocol == "v4" and check and check.get("verified")
-                and log["address"].lower() == R.V4_MANAGER
+                and log["address"].lower() == C.v4_manager
                 and SWAPS[log["topics"][0]] == "v4" and len(log["topics"]) >= 2
                 and log["topics"][1].lower() in expected_v4_ids
             )]

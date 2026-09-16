@@ -3087,6 +3087,14 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn('private_key', acceptance_sql)
         self.assertIn('realized_pnl_raw VARCHAR(81)', sql)
         self.assertIn('UNIQUE KEY uq_one_active_paper_budget_cycle', sql)
+        arc_keys = (
+            ROOT / 'docker/mysql/init/012_arc_chain_keys.sql').read_text()
+        self.assertIn('ADD PRIMARY KEY (chain_id, name)', arc_keys)
+        self.assertIn('ADD PRIMARY KEY (chain_id, block_number)', arc_keys)
+        self.assertIn(
+            'ADD UNIQUE KEY uq_canonical_block_hash (chain_id, block_hash)',
+            arc_keys)
+        self.assertIn('maintenance window', arc_keys)
 
     def test_mysql_store_translates_only_bounded_store_sql(self):
         self.assertEqual(

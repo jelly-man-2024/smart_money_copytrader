@@ -76,6 +76,24 @@ SQLite 默认在 `var/replay.sqlite3`；重复回放不会重复插入相同信�
 仅接受这两个端点键及可选 `0X_API_KEY`（0x 聚合器凭据）；钱包和私钥变量会被忽略。
 不要把含 API key 的完整 URL 提交 Git 或贴到日志中。公开端点可能限流。
 
+Arc 主网使用独立的只读观察入口和账本，不会启动纸面或实盘执行器：
+
+```bash
+.venv/bin/sm-copy arc-monitor --seconds 60
+```
+
+它从 `.env` 的 `ARC_WS_URL` 订阅 chain ID 5042 上配置的 Uniswap v4 PoolManager
+`Swap` 日志，再通过 `ARC_RPC_URL` 重新取得交易和回执。只有发送者在 watchlist、calldata
+能按 Arc Universal Router 严格解码、日志由回执复核且池身份与钱包资产净变化闭合时，才升级为
+`swap_evidenced`；其余保留为未知/待复核。WebSocket 不是归属证据。默认写入
+`var/arc-observer.sqlite3`，并使用独立进程锁，可与 Robinhood 观察器并行运行。
+
+Arc 的 native USDC（18 位）和 `0x3600…0000` ERC-20 接口（6 位）共用余额，但 raw amount
+与日志流不能混算：前者只通过有界状态差分核验，后者只读取 ERC-20 emitter 的 Transfer。
+当前 Arc 路径仍是只读 observer，不连接 MySQL 跟单配置、不报价、不签名、不广播。
+`docker/mysql/init/012_arc_chain_keys.sql` 只是共享账本的后续准备；现有数据库只能在停写、备份和
+维护窗口中执行，本阶段未在线应用。
+
 只读纸面模式使用独立、严格校验且不接受私钥字段的 JSON 配置。示例中的钱包和额度必须先
 替换，再在每次启动时明确选择沿用或重置手动额度周期：
 

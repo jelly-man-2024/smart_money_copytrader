@@ -108,6 +108,7 @@ async def verify_signal_pools(rpc, signals: list[Signal], receipt: dict) -> dict
     for signal in signals:
         if signal.protocol not in ("v2", "v3", "v4") or signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}:
             continue
+        C = R.chain_for(signal.chain_id)
         evidence = {"verified": False, "block_number": str(number(receipt.get("blockNumber", 0))),
                     "protocol": signal.protocol, "pools": []}
         results[signal.event_id] = evidence
@@ -117,7 +118,9 @@ async def verify_signal_pools(rpc, signals: list[Signal], receipt: dict) -> dict
                         [hop.get("pool_key", []) for hop in signal.evidence.get("v4_hops", [])])
                 if not keys:
                     raise ValueError("invalid_v4_pool_key")
-                manager_code = await rpc.call("eth_getCode", [R.V4_MANAGER, block])
+                if C.v4_manager is None:
+                    raise ValueError("v4_manager_not_configured")
+                manager_code = await rpc.call("eth_getCode", [C.v4_manager, block])
                 if manager_code in ("0x", "0x0"):
                     raise ValueError("v4_manager_has_no_code_at_receipt_block")
                 computed_ids = []
@@ -134,14 +137,14 @@ async def verify_signal_pools(rpc, signals: list[Signal], receipt: dict) -> dict
                     if hook != R.NATIVE:
                         hook_code = await rpc.call("eth_getCode", [hook, block])
                         observed_hash = "0x" + keccak(bytes.fromhex(hook_code[2:])).hex()
-                        if R.KNOWN_V4_HOOK_CODE_HASHES.get(hook) != observed_hash:
+                        if C.known_v4_hook_code_hashes.get(hook) != observed_hash:
                             raise ValueError("v4_hook_code_not_recognized")
                         pool_evidence["hook_code_hash"] = observed_hash
                     evidence["pools"].append(pool_evidence)
                 declared = ([signal.pool_id] if signal.pool_id else signal.evidence.get("v4_pool_ids", []))
                 if computed_ids != declared:
                     raise ValueError("v4_pool_id_mismatch")
-                evidence.update({"verified": True, "manager": R.V4_MANAGER,
+                evidence.update({"verified": True, "manager": C.v4_manager,
                                  "pool_ids": computed_ids})
                 if len(evidence["pools"]) == 1:
                     evidence["pool_id"] = computed_ids[0]
@@ -153,11 +156,11 @@ async def verify_signal_pools(rpc, signals: list[Signal], receipt: dict) -> dict
                 route = [address(a) for a in signal.evidence.get("route", [])]
                 if len(route) < 2:
                     raise ValueError("v2_route_unavailable")
-                factory, router = R.V2_FACTORY, R.V2_ROUTER
+                factory, router = C.v2_factory, C.v2_router
                 hops = [(a, b, None) for a, b in zip(route, route[1:])]
                 lookup = "getPair(address,address)"
             else:
-                factory, router = R.V3_FACTORY, R.V3_ROUTER
+                factory, router = C.v3_factory, C.v3_router
                 if "hops" in signal.evidence:
                     hops = [(address(h["token_in"]), address(h["token_out"]), int(h["fee"]))
                             for h in signal.evidence["hops"]]
@@ -169,6 +172,8 @@ async def verify_signal_pools(rpc, signals: list[Signal], receipt: dict) -> dict
                     raise ValueError("v3_path_fees_unavailable")
                 lookup = "getPool(address,address,uint24)"
 
+            if factory is None:
+                raise ValueError("factory_not_configured")
             if not await factory_has_code(factory):
                 raise ValueError("factory_has_no_code_at_receipt_block")
             if signal.contract == router:
