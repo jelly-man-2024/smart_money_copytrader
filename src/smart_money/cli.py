@@ -97,10 +97,17 @@ async def arc_monitor(args):
                stage=signal.stage, chain_id=signal.chain_id,
                read_only=True, live_trading=False)
 
+    def status(event, details):
+        report(event, **details, chain_id=ARC.chain_id,
+               read_only=True, live_trading=False)
+
     report("arc_observer_started", chain_id=ARC.chain_id,
            smart_wallets=len(watchlist), read_only=True, live_trading=False)
     try:
-        task = observe_arc(rpc, ws_url, store, watchlist, output)
+        task = observe_arc(
+            rpc, ws_url, store, watchlist, output, status,
+            backfill_interval=args.backfill_interval,
+            backfill_batch=args.backfill_batch)
         if args.seconds:
             try:
                 await asyncio.wait_for(task, timeout=args.seconds)
@@ -1577,6 +1584,12 @@ def parser():
     arc_parser.add_argument(
         "--seconds", type=float, default=60,
         help="Duration; 0 runs until interrupted")
+    arc_parser.add_argument(
+        "--backfill-interval", type=float, default=5.0,
+        help="Seconds between bounded Arc log catch-up scans")
+    arc_parser.add_argument(
+        "--backfill-batch", type=int, default=500,
+        help="Maximum Arc blocks per catch-up scan")
     monitor_source = monitor_parser.add_mutually_exclusive_group()
     monitor_source.add_argument("--paper-config")
     monitor_source.add_argument("--paper-mysql", action="store_true",
@@ -1692,8 +1705,9 @@ def main():
         if args.command == "replay":
             replay(args)
         elif args.command == "arc-monitor":
-            if args.seconds < 0:
-                raise ValueError("invalid Arc monitor duration")
+            if (args.seconds < 0 or not 0.5 <= args.backfill_interval <= 60
+                    or not 1 <= args.backfill_batch <= 2000):
+                raise ValueError("invalid Arc monitor limits")
             with runtime_instance_lock(
                     "var/sm-copy-arc.instance.lock", "var/sm-copy-arc.pid"):
                 asyncio.run(arc_monitor(args))

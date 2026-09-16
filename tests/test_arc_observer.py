@@ -11,7 +11,8 @@ from eth_utils import keccak
 
 from smart_money import registry as R
 from smart_money.arc_observer import (
-    ARC_SWAP_TOPIC, ArcObserver, ArcSwapSubscriber, validate_arc_swap_log,
+    ARC_CURSOR, ARC_SWAP_TOPIC, ArcCanonicalMismatch, ArcObserver,
+    ArcSwapSubscriber, arc_backfill_once, validate_arc_swap_log,
 )
 from smart_money.decode import POOL_KEY, Decoder
 from smart_money.models import Transaction
@@ -74,6 +75,8 @@ class FakeRpc:
             "input": "0x" + arc_swap_calldata().hex(), "value": "0x0",
             "chainId": hex(R.ARC.chain_id), "nonce": "0x1", "type": "0x2",
         }
+        self.transactions = [self.transaction]
+        self.block_calls = 0
         swap = hint()
         self.transaction_receipt = {
             "transactionHash": TX_HASH, "blockHash": BLOCK_HASH,
@@ -89,6 +92,11 @@ class FakeRpc:
     async def call(self, method, params=None):
         if method == "eth_getTransactionByHash":
             return self.transaction
+        if method == "eth_getBlockByNumber":
+            self.block_calls += 1
+            return {"number": "0x10", "hash": BLOCK_HASH,
+                    "parentHash": "0x" + "cc" * 32,
+                    "transactions": self.transactions}
         if method == "eth_getCode":
             self.last_code_params = params
             return "0x01"
@@ -98,6 +106,30 @@ class FakeRpc:
         if tx_hash != TX_HASH:
             raise AssertionError("wrong receipt hash")
         return self.transaction_receipt
+
+
+class BackfillRpc(FakeRpc):
+    def __init__(self):
+        super().__init__()
+        self.latest = 15
+        self.logs = []
+        self.headers = {
+            15: {"number": "0xf", "hash": "0x" + "cc" * 32,
+                 "parentHash": "0x" + "dd" * 32, "transactions": []},
+            16: {"number": "0x10", "hash": BLOCK_HASH,
+                 "parentHash": "0x" + "cc" * 32,
+                 "transactions": [self.transaction]},
+        }
+
+    async def call(self, method, params=None):
+        if method == "eth_blockNumber":
+            return hex(self.latest)
+        if method == "eth_getBlockByNumber":
+            return self.headers[int(params[0], 16)]
+        if method == "eth_getLogs":
+            self.last_log_filter = params[0]
+            return self.logs
+        return await super().call(method, params)
 
 
 class ArcDecodeTests(unittest.TestCase):
@@ -143,11 +175,77 @@ class ArcObserverTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
+    async def test_live_logs_share_one_full_block_rpc_lookup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "arc.sqlite3")
+            rpc = FakeRpc()
+            other_hash = "0x" + "dd" * 32
+            rpc.transactions.append({
+                **rpc.transaction, "hash": other_hash,
+                "from": "0x" + "55" * 20,
+            })
+            other_hint = {**hint(), "transactionHash": other_hash, "logIndex": "0x3"}
+            observer = ArcObserver(rpc, store, {WALLET: {}})
+            try:
+                await observer.observe(hint())
+                self.assertEqual(await observer.observe(other_hint), [])
+                self.assertEqual(rpc.block_calls, 1)
+            finally:
+                store.close()
+
     def test_removed_log_fails_closed(self):
         value = hint()
         value["removed"] = True
         with self.assertRaisesRegex(ValueError, "canonical rescan"):
             validate_arc_swap_log(value)
+
+
+class ArcBackfillTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initializes_at_head_then_backfills_and_confirms_block(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "arc.sqlite3")
+            rpc = BackfillRpc()
+            observer = ArcObserver(rpc, store, {WALLET: {}})
+            try:
+                initialized = await arc_backfill_once(rpc, store, observer)
+                self.assertTrue(initialized["initialized"])
+                self.assertEqual(store.chain_cursor(ARC_CURSOR),
+                                 (15, "0x" + "cc" * 32))
+
+                rpc.latest = 16
+                rpc.logs = [hint()]
+                progress = await arc_backfill_once(rpc, store, observer)
+                self.assertEqual((progress["from_block"], progress["to_block"],
+                                  progress["logs"], progress["rejected"]),
+                                 (16, 16, 1, 0))
+                self.assertEqual(store.chain_cursor(ARC_CURSOR), (16, BLOCK_HASH))
+                self.assertEqual(rpc.last_log_filter, {
+                    "fromBlock": "0x10", "toBlock": "0x10",
+                    "address": R.ARC.v4_manager, "topics": [ARC_SWAP_TOPIC],
+                })
+                payload = json.loads(store.connection.execute(
+                    "SELECT payload FROM signals").fetchone()[0])
+                self.assertEqual(payload["canonical_status"], "safe_head_confirmed")
+                self.assertEqual(
+                    payload["evidence"]["canonicality"],
+                    "safe_head_hash_rechecked_not_l1_finality")
+            finally:
+                store.close()
+
+    async def test_cursor_hash_change_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "arc.sqlite3")
+            rpc = BackfillRpc()
+            observer = ArcObserver(rpc, store, {WALLET: {}})
+            try:
+                await arc_backfill_once(rpc, store, observer)
+                rpc.headers[15]["hash"] = "0x" + "ee" * 32
+                with self.assertRaisesRegex(ArcCanonicalMismatch, "manual review"):
+                    await arc_backfill_once(rpc, store, observer)
+                self.assertEqual(store.chain_cursor(ARC_CURSOR),
+                                 (15, "0x" + "cc" * 32))
+            finally:
+                store.close()
 
 
 class Socket:

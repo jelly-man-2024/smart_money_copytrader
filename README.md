@@ -87,6 +87,10 @@ Arc 主网使用独立的只读观察入口和账本，不会启动纸面或实�
 能按 Arc Universal Router 严格解码、日志由回执复核且池身份与钱包资产净变化闭合时，才升级为
 `swap_evidenced`；其余保留为未知/待复核。WebSocket 不是归属证据。默认写入
 `var/arc-observer.sqlite3`，并使用独立进程锁，可与 Robinhood 观察器并行运行。
+观察器会自动重连 WSS，并按独立 `arc_v4` 游标定期使用地址/topic 过滤的 `eth_getLogs`
+补洞；补洞按含 Swap 的区块批量读取完整交易，不逐日志重复请求。启动时扫描当前确定区块以闭合
+订阅竞态，游标哈希若与 HTTPS RPC 不一致则停止等待人工复核。可用
+`--backfill-interval` 和 `--backfill-batch` 调整有界扫描，但不能关闭规范哈希检查。
 
 Arc 的 native USDC（18 位）和 `0x3600…0000` ERC-20 接口（6 位）共用余额，但 raw amount
 与日志流不能混算：前者只通过有界状态差分核验，后者只读取 ERC-20 emitter 的 Transfer。

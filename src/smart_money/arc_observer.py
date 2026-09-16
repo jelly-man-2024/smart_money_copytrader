@@ -6,6 +6,7 @@ checked against its canonical receipt before any signal is persisted.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -25,6 +26,16 @@ from .store import Store
 
 ARC_SWAP_TOPIC = next(topic for topic, protocol in SWAPS.items() if protocol == "v4")
 MAX_SEEN_TRANSACTIONS = 8192
+MAX_CACHED_BLOCKS = 64
+ARC_CURSOR = "arc_v4"
+
+
+class ArcCandidateRejected(ValueError):
+    """Permanent candidate-data rejection; safe to advance the scan cursor."""
+
+
+class ArcCanonicalMismatch(RuntimeError):
+    """Saved Arc cursor no longer matches the RPC canonical block."""
 
 
 def validate_arc_ws_url(url: str) -> str:
@@ -123,6 +134,51 @@ class ArcObserver:
         self.watchlist = watchlist
         self.decoder = Decoder(watchlist, chain_id=R.ARC.chain_id)
         self.on_signal = on_signal
+        self._lock = asyncio.Lock()
+        self._processed_order: deque[str] = deque()
+        self._processed: set[str] = set()
+        self._block_order: deque[tuple[int, str]] = deque()
+        self._block_transactions: dict[tuple[int, str], dict[str, dict]] = {}
+
+    def _remember(self, tx_hash: str) -> None:
+        if tx_hash in self._processed:
+            return
+        self._processed.add(tx_hash)
+        self._processed_order.append(tx_hash)
+        if len(self._processed_order) > MAX_SEEN_TRANSACTIONS:
+            self._processed.remove(self._processed_order.popleft())
+
+    async def _transaction_from_block(self, hint: dict) -> dict:
+        height = number(hint["blockNumber"])
+        hinted_hash = hint["blockHash"].lower()
+        key = (height, hinted_hash)
+        indexed = self._block_transactions.get(key)
+        if indexed is None:
+            block = await self.rpc.call(
+                "eth_getBlockByNumber", [hex(height), True])
+            if block is None:
+                raise RpcError("Arc block is not available yet")
+            block_hash, _ = _block_identity(block, height)
+            if block_hash != hinted_hash:
+                raise ArcCanonicalMismatch(
+                    "Arc subscription block hash does not match HTTPS RPC")
+            transactions = block.get("transactions")
+            if not isinstance(transactions, list):
+                raise ArcCandidateRejected(
+                    "Arc full block transactions unavailable")
+            indexed = {
+                item.get("hash", "").lower(): item
+                for item in transactions if isinstance(item, dict)
+            }
+            self._block_transactions[key] = indexed
+            self._block_order.append(key)
+            if len(self._block_order) > MAX_CACHED_BLOCKS:
+                self._block_transactions.pop(self._block_order.popleft(), None)
+        raw = indexed.get(hint["transactionHash"].lower())
+        if raw is None:
+            raise ArcCanonicalMismatch(
+                "Arc Swap transaction missing from its canonical block")
+        return raw
 
     @staticmethod
     def _receipt_contains_hint(receipt: dict, hint: dict) -> bool:
@@ -144,48 +200,227 @@ class ArcObserver:
                 return True
         return False
 
-    async def observe(self, hint: dict) -> list[Signal]:
+    async def observe(self, hint: dict,
+                      raw_transaction: dict | None = None) -> list[Signal]:
         hint = validate_arc_swap_log(hint)
         tx_hash = hint["transactionHash"].lower()
-        raw = await self.rpc.call("eth_getTransactionByHash", [tx_hash])
-        if not isinstance(raw, dict) or "chainId" not in raw:
-            raise ValueError("Arc transaction or chain id unavailable")
-        tx = Transaction.from_rpc(raw, observation_source="arc_v4_subscription")
-        if tx.hash != tx_hash or tx.chain_id != R.ARC.chain_id:
-            raise ValueError("Arc transaction identity mismatch")
-        if tx.sender not in self.watchlist:
-            return []
-
-        self.store.put_candidate(tx)
-        try:
-            signals = self.decoder.decode(tx)
-            receipt = await self.rpc.receipt(tx.hash)
-            if not isinstance(receipt, dict) or not self._receipt_contains_hint(receipt, hint):
-                raise ValueError("Arc subscription log not confirmed by receipt")
-            pool_checks = await verify_signal_pools(self.rpc, signals, receipt)
+        async with self._lock:
+            if tx_hash in self._processed:
+                return []
+            raw = raw_transaction
+            if raw is None:
+                raw = await self._transaction_from_block(hint)
+            if raw is None:
+                raise RpcError("Arc transaction is not available yet")
+            if not isinstance(raw, dict) or "chainId" not in raw:
+                raise ArcCandidateRejected("Arc transaction chain id unavailable")
             try:
-                native_checks = await verify_native_flows(self.rpc, tx, receipt, signals)
-            except (RpcError, ValueError, TypeError):
-                # A provider without the bounded state-diff tracer cannot promote
-                # native-USDC routes; enrich() leaves them review-only.
-                native_checks = {}
-            final = enrich(
-                tx, signals, receipt, self.watchlist, pool_checks, native_checks)
-            for signal in final:
-                if self.store.put(signal) and self.on_signal is not None:
-                    self.on_signal(signal)
-            self.store.complete_candidate(
-                tx.hash, number(receipt["blockNumber"]), receipt["blockHash"])
-            return final
-        except Exception as exc:
-            self.store.fail_candidate(tx.hash, type(exc).__name__)
-            raise
+                tx = Transaction.from_rpc(raw, observation_source="arc_v4_subscription")
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ArcCandidateRejected("invalid Arc transaction") from exc
+            if tx.hash != tx_hash or tx.chain_id != R.ARC.chain_id:
+                raise ArcCandidateRejected("Arc transaction identity mismatch")
+            if tx.sender not in self.watchlist:
+                self._remember(tx_hash)
+                return []
+
+            self.store.put_candidate(tx)
+            try:
+                signals = self.decoder.decode(tx)
+                receipt = await self.rpc.receipt(tx.hash)
+                if receipt is None:
+                    raise RpcError("Arc receipt is not available yet")
+                if (not isinstance(receipt, dict)
+                        or not self._receipt_contains_hint(receipt, hint)):
+                    raise ArcCandidateRejected(
+                        "Arc subscription log not confirmed by receipt")
+                pool_checks = await verify_signal_pools(self.rpc, signals, receipt)
+                try:
+                    native_checks = await verify_native_flows(
+                        self.rpc, tx, receipt, signals)
+                except (RpcError, ValueError, TypeError):
+                    # A provider without the bounded state-diff tracer cannot
+                    # promote native-USDC routes; enrich leaves them review-only.
+                    native_checks = {}
+                final = enrich(
+                    tx, signals, receipt, self.watchlist, pool_checks, native_checks)
+                for signal in final:
+                    if self.store.put(signal) and self.on_signal is not None:
+                        self.on_signal(signal)
+                self.store.complete_candidate(
+                    tx.hash, number(receipt["blockNumber"]), receipt["blockHash"])
+                self._remember(tx_hash)
+                return final
+            except ArcCandidateRejected:
+                self.store.fail_candidate(tx.hash, "ArcCandidateRejected")
+                self._remember(tx_hash)
+                raise
+            except Exception as exc:
+                self.store.fail_candidate(tx.hash, type(exc).__name__)
+                raise
+
+
+def _block_identity(block: object, expected_number: int) -> tuple[str, str]:
+    if (not isinstance(block, dict) or number(block.get("number", -1)) != expected_number
+            or not isinstance(block.get("hash"), str)
+            or not isinstance(block.get("parentHash"), str)):
+        raise ValueError("invalid Arc block header")
+    block_hash, parent_hash = block["hash"].lower(), block["parentHash"].lower()
+    if (len(block_hash) != 66 or len(parent_hash) != 66
+            or not block_hash.startswith("0x") or not parent_hash.startswith("0x")):
+        raise ValueError("invalid Arc block hash")
+    int(block_hash[2:], 16)
+    int(parent_hash[2:], 16)
+    return block_hash, parent_hash
+
+
+async def arc_backfill_once(rpc: ReadOnlyRpc, store: Store, observer: ArcObserver,
+                            batch_size: int = 500) -> dict:
+    """Scan the next bounded finalized range and advance only after processing."""
+    if not 1 <= batch_size <= 2000:
+        raise ValueError("invalid Arc backfill batch size")
+    latest = number(await rpc.call("eth_blockNumber"))
+    cursor = store.chain_cursor(ARC_CURSOR)
+    initialized = cursor is None
+    if cursor is None:
+        # The WSS task is already starting in parallel. Scanning the current
+        # finalized block closes the startup race without replaying full history.
+        start = end = latest
+    else:
+        cursor_header = await rpc.call(
+            "eth_getBlockByNumber", [hex(cursor[0]), False])
+        observed_cursor_hash, _ = _block_identity(cursor_header, cursor[0])
+        if observed_cursor_hash != cursor[1].lower():
+            raise ArcCanonicalMismatch(
+                "Arc cursor hash changed; manual review required")
+        if latest <= cursor[0]:
+            return {"initialized": False, "from_block": cursor[0],
+                    "to_block": cursor[0], "logs": 0, "rejected": 0}
+        start = cursor[0] + 1
+        end = min(latest, start + batch_size - 1)
+    raw_logs = await rpc.call("eth_getLogs", [{
+        "fromBlock": hex(start), "toBlock": hex(end),
+        "address": R.ARC.v4_manager, "topics": [ARC_SWAP_TOPIC],
+    }])
+    if not isinstance(raw_logs, list):
+        raise ValueError("invalid Arc eth_getLogs result")
+    logs = sorted(
+        (validate_arc_swap_log(item) for item in raw_logs),
+        key=lambda item: (number(item["blockNumber"]), number(item["logIndex"])),
+    )
+    rejected = 0
+    by_block: dict[int, list[dict]] = {}
+    for log in logs:
+        height = number(log["blockNumber"])
+        if height < start or height > end:
+            raise ValueError("Arc log is outside requested range")
+        by_block.setdefault(height, []).append(log)
+
+    verified_blocks: dict[int, tuple[str, str]] = {}
+    for height, block_logs in sorted(by_block.items()):
+        block = await rpc.call("eth_getBlockByNumber", [hex(height), True])
+        block_hash, parent_hash = _block_identity(block, height)
+        if any(item["blockHash"].lower() != block_hash for item in block_logs):
+            raise ArcCanonicalMismatch("Arc log block hash changed during backfill")
+        transactions = block.get("transactions")
+        if not isinstance(transactions, list):
+            raise ValueError("Arc full block transactions unavailable")
+        indexed = {
+            item.get("hash", "").lower(): item
+            for item in transactions if isinstance(item, dict)
+        }
+        for log in block_logs:
+            raw = indexed.get(log["transactionHash"].lower())
+            if raw is None:
+                raise ArcCanonicalMismatch(
+                    "Arc Swap transaction missing from its canonical block")
+            try:
+                await observer.observe(log, raw_transaction=raw)
+            except ArcCandidateRejected:
+                rejected += 1
+        store.record_chain_block(
+            height, block_hash, parent_hash, name=ARC_CURSOR)
+        verified_blocks[height] = (block_hash, parent_hash)
+    if end in verified_blocks:
+        end_hash = verified_blocks[end][0]
+    else:
+        end_header = await rpc.call("eth_getBlockByNumber", [hex(end), False])
+        end_hash, _ = _block_identity(end_header, end)
+    store.set_chain_cursor(end, end_hash, ARC_CURSOR)
+    return {"initialized": initialized, "from_block": start, "to_block": end,
+            "logs": len(logs), "rejected": rejected}
 
 
 async def observe_arc(rpc: ReadOnlyRpc, ws_url: str, store: Store, watchlist: dict,
-                      on_signal: Callable[[Signal], None] | None = None) -> None:
+                      on_signal: Callable[[Signal], None] | None = None,
+                      on_status: Callable[[str, dict], None] | None = None,
+                      backfill_interval: float = 5.0,
+                      backfill_batch: int = 500) -> None:
     if number(await rpc.call("eth_chainId")) != R.ARC.chain_id:
         raise ValueError("Arc RPC is connected to the wrong chain")
+    if not 0.5 <= backfill_interval <= 60:
+        raise ValueError("invalid Arc backfill interval")
     observer = ArcObserver(rpc, store, watchlist, on_signal)
-    async for log in ArcSwapSubscriber(ws_url).logs():
-        await observer.observe(log)
+
+    def status(event: str, **details) -> None:
+        if on_status is not None:
+            on_status(event, details)
+
+    async def subscribe_forever() -> None:
+        failures = 0
+        while True:
+            try:
+                status("arc_ws_connecting")
+                async for log in ArcSwapSubscriber(ws_url).logs():
+                    failures = 0
+                    try:
+                        await observer.observe(log)
+                    except ArcCandidateRejected as exc:
+                        status("arc_candidate_rejected", error_type=type(exc).__name__)
+                raise ConnectionError("Arc WebSocket closed")
+            except asyncio.CancelledError:
+                raise
+            except ArcCanonicalMismatch:
+                raise
+            except Exception as exc:
+                failures += 1
+                status("arc_ws_reconnect", error_type=type(exc).__name__,
+                       consecutive_failures=failures)
+                if failures >= 8:
+                    raise RuntimeError("Arc WebSocket repeatedly failed") from exc
+                await asyncio.sleep(min(10.0, 2 ** (failures - 1)))
+
+    async def backfill_forever() -> None:
+        failures = 0
+        while True:
+            try:
+                progress = await arc_backfill_once(
+                    rpc, store, observer, backfill_batch)
+                failures = 0
+                if progress["initialized"] or progress["logs"]:
+                    status("arc_backfill_progress", **progress)
+                await asyncio.sleep(backfill_interval)
+            except asyncio.CancelledError:
+                raise
+            except ArcCanonicalMismatch:
+                raise
+            except Exception as exc:
+                failures += 1
+                status("arc_backfill_error", error_type=type(exc).__name__,
+                       consecutive_failures=failures)
+                if failures >= 8:
+                    raise RuntimeError("Arc backfill repeatedly failed") from exc
+                await asyncio.sleep(min(10.0, 2 ** (failures - 1)))
+
+    tasks = [asyncio.create_task(subscribe_forever()),
+             asyncio.create_task(backfill_forever())]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for task in done:
+            exception = task.exception()
+            if exception is not None:
+                raise exception
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)

@@ -199,6 +199,8 @@ Arc mainnet（chain ID 5042）先作为独立只读观察源接入，不继承 R
 或 Relay 假设。Phase 1 仅订阅 Uniswap v4 PoolManager Swap 日志，并以 HTTPS RPC 重新核验发送者、
 calldata、回执、pool key、settlement 与钱包净变化；默认使用独立 SQLite 账本，所有信号携带 chain_id。
 native USDC 18 位 raw amount 与 ERC-20 USDC 6 位 raw amount 永不混算。
+实时入口与独立 `eth_getLogs` 游标并行：WSS 负责低延迟，按区块批量读取完整交易的补洞负责断线恢复；
+补洞处理成功后才推进游标，历史游标哈希发生变化时 fail closed，不自动制造重组结论。
 
 共享 MySQL、纸面报价和执行均不属于本阶段。`012_arc_chain_keys.sql` 只准备规范区块与游标的
 复合键，必须在维护窗口执行；候选/重组查询完成全链作用域改造前，不允许 Arc 写入共享运行账本。

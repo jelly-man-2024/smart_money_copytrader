@@ -1797,12 +1797,13 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             (name, block_number, block_hash.lower()))
         self.connection.commit()
 
-    def record_chain_block(self, block_number: int, block_hash: str, parent_hash: str) -> None:
+    def record_chain_block(self, block_number: int, block_hash: str, parent_hash: str,
+                           name: str = "canonical_l2") -> None:
         if block_number < 0 or not all(
                 isinstance(value, str) and value.startswith("0x")
                 for value in (block_hash, parent_hash)):
             raise ValueError("invalid canonical block")
-        old = self.chain_cursor()
+        old = self.chain_cursor(name)
         if old and block_number < old[0]:
             raise ValueError("canonical block rewind requires explicit reorg handling")
         self.connection.execute("""INSERT INTO canonical_blocks(block_number,block_hash,parent_hash)
@@ -1810,9 +1811,9 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             parent_hash=excluded.parent_hash""",
             (block_number, block_hash.lower(), parent_hash.lower()))
         self.connection.execute("""INSERT INTO chain_cursors(name,block_number,block_hash)
-            VALUES('canonical_l2',?,?) ON CONFLICT(name) DO UPDATE SET
+            VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET
             block_number=excluded.block_number,block_hash=excluded.block_hash,
-            updated_at=CURRENT_TIMESTAMP""", (block_number, block_hash.lower()))
+            updated_at=CURRENT_TIMESTAMP""", (name, block_number, block_hash.lower()))
         self._mark_block_safe_head(block_number, block_hash.lower())
         self.connection.commit()
 

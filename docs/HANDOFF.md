@@ -1751,3 +1751,18 @@ Phase 1 新增独立 `.venv/bin/sm-copy arc-monitor --seconds N`。它仅使用 
 Phase 1 的独立 SQLite 观察器不依赖该迁移；在共享 MySQL Arc backfill/候选写入和任何 Arc
 纸面/实盘功能接线前，还需完成 Store 全部候选、游标与重组查询的 chain_id 作用域改造。
 本阶段没有 Arc 报价、聚合器执行、签名、广播或真实交易。
+
+### Phase 1B：重连与规范日志补洞
+
+`arc-monitor` 已增加 WSS 指数退避重连和独立 `arc_v4` 游标。后台每 5 秒（可配置）读取 Arc 链头，
+以 PoolManager + v4 Swap topic 做有界 `eth_getLogs`；只有整段日志处理完成并重新读取区块哈希后才
+推进游标。当前游标哈希若变化会抛出 `ArcCanonicalMismatch` 并停机，不自动回滚。
+
+Arc v4 当前每块可有数十条 Swap。首版逐日志 `eth_getTransactionByHash` 在真实冒烟中吞吐不足，
+现改为每个含 Swap 的区块只读取一次完整交易并按 tx hash 过滤 watchlist；WSS 实时路径也使用
+64 区块的小型缓存。最终 10 秒冒烟连续处理 359 条 Swap 日志并推进 15 个区块，没有再次触发
+WSS/RPC 重连；仍未发现 67 地址 watchlist 候选。回补后的候选 inclusion 由重新核对的区块哈希升级为
+`safe_head_confirmed`，文字明确不是 L1 finality 或盈利证明。
+
+尚未完成的 Phase 1B 项目是 Arc 专属 EIP-7702/智能账户实现识别及真实 watchlist 样本覆盖；在取得
+Arc 上实际 implementation 代码和 calldata 样本前不复用 Robinhood 的账户实现地址或猜测 ABI。

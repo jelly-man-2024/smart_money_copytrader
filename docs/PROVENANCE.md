@@ -111,8 +111,8 @@ tuple 布局。
 - Uniswap v4/Universal Router 地址先从公开部署注册表取得，并在 2026-09-16 使用项目已配置的
   `ARC_RPC_URL` 以只读 `eth_chainId`/`eth_getCode` 核对；未保存或输出 endpoint 凭据。
 - `ARC_WS_URL` 的 QuickNode/Blockdaemon 90 秒延迟对比仅用于 provider 选择，未写入交易数据、
-  凭据或付费采购承诺。最终 15 秒 `arc-monitor` 冒烟测试只订阅公开 Swap 日志，未观察到 watchlist
-  候选，未签名或广播。
+  凭据或付费采购承诺。后续有界 `arc-monitor` 冒烟测试只订阅/补抓公开 Swap 日志，未观察到
+  watchlist 候选，未签名或广播；临时 SQLite 位于 `/private/tmp`，不作为交易样本或收益证据。
 - 官方依据：
   https://docs.arc.io/arc/references/connect-to-arc 、
   https://docs.arc.io/arc/references/contract-addresses 、
