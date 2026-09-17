@@ -137,3 +137,74 @@ class ChainScopedPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported chain id"):
             self.parse(self.policy_row(
                 999999, {"USDG": "1"}, {"USDG": {"mode": "fixed", "fixed_amount_raw": "1"}}))
+
+
+class MySqlRelationshipLoadingTests(unittest.TestCase):
+    """The same pair on two chains is two relationships, not a duplicate."""
+
+    def rows(self):
+        import json
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        template = json.loads((root / "config/paper.example.json").read_text())
+        policy = template["wallets"][0]
+        base = {
+            "follower_wallet": WALLET, "follower_label": "follower",
+            "smart_wallet": "0x" + "22" * 20, "smart_wallet_label": "smart-a",
+            "run_mode": "paper", "strategy_version": template["strategy_version"],
+            "trigger_mode": template["trigger_mode"],
+            "shadow_trigger_modes": template["shadow_trigger_modes"],
+            "quote_policy": template["quote_policy"],
+            "allowed_protocols": template["allowed_protocols"],
+            "allowed_assets": template["allowed_assets"],
+            "allowed_routes": template["allowed_routes"],
+            "usdg_rule_mode": policy["buy_rules"]["USDG"]["mode"],
+            "usdg_fixed_amount_raw": policy["buy_rules"]["USDG"]["fixed_amount_raw"],
+            "usdg_ratio_ppm": None,
+            "usdg_budget_limit_raw": policy["budget_limits"]["USDG"],
+            "eth_rule_mode": policy["buy_rules"]["ETH_WETH"]["mode"],
+            "eth_fixed_amount_raw": None,
+            "eth_ratio_ppm": policy["buy_rules"]["ETH_WETH"]["ratio_ppm"],
+            "eth_budget_limit_raw": policy["budget_limits"]["ETH_WETH"],
+            "sell_rule_mode": policy["sell_rule"]["mode"],
+            "sell_fixed_amount_raw": None,
+            "sell_ratio_ppm": policy["sell_rule"]["ratio_ppm"],
+        }
+        return [dict(base, id=1, chain_id=R.CHAIN_ID),
+                dict(base, id=2, chain_id=R.ARC.chain_id,
+                     allowed_assets=[R.ARC.usdc_erc20], allowed_routes=[])]
+
+    def load(self, rows):
+        import unittest.mock as mock
+        from smart_money import mysql_config
+
+        class Cursor:
+            def execute(self, *args): pass
+            def fetchall(self): return rows
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+
+        class Connection:
+            def cursor(self): return Cursor()
+            def close(self): pass
+
+        with mock.patch.object(mysql_config, "mysql_connection",
+                               return_value=Connection()):
+            return mysql_config.load_mysql_paper_config()
+
+    def test_one_pair_on_two_chains_loads_as_two_relationships(self):
+        config = self.load(self.rows())
+        by_chain = {p.chain_id: p for p in config.relationships}
+        self.assertEqual(set(by_chain), {R.CHAIN_ID, R.ARC.chain_id})
+        self.assertEqual(set(by_chain[R.CHAIN_ID].budget_limits), {"USDG", "ETH_WETH"})
+        self.assertEqual(set(by_chain[R.ARC.chain_id].budget_limits), {"USDC"})
+        # Their ledgers are separate, so neither can spend the other's budget.
+        self.assertNotEqual(by_chain[R.CHAIN_ID].ledger_scope,
+                            by_chain[R.ARC.chain_id].ledger_scope)
+
+    def test_the_same_pair_twice_on_one_chain_is_still_refused(self):
+        rows = self.rows()
+        rows[1]["chain_id"] = R.CHAIN_ID
+        rows[1]["allowed_assets"] = rows[0]["allowed_assets"]
+        with self.assertRaisesRegex(ValueError, "duplicate enabled"):
+            self.load(rows)

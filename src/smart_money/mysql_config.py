@@ -154,9 +154,14 @@ def load_mysql_paper_config() -> PaperConfig:
     relationships = []
     seen = set()
     for row in rows:
-        pair = (address(row["follower_wallet"]), address(row["smart_wallet"]))
+        # Chain-scoped, like the database key: the same follower copying the
+        # same smart wallet on another chain is a different relationship with
+        # its own budget and ledger scope, not a duplicate.
+        pair = (int(row.get("chain_id") or R.CHAIN_ID),
+                address(row["follower_wallet"]), address(row["smart_wallet"]))
         if pair in seen:
-            raise ValueError("duplicate enabled follower and smart wallet relationship")
+            raise ValueError(
+                "duplicate enabled follower and smart wallet relationship on one chain")
         seen.add(pair)
         document = rows_to_document([row])
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json") as stream:
