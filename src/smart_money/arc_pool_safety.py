@@ -28,6 +28,7 @@ from eth_utils import keccak
 from .models import address
 from .registry import chain_for
 from .rpc import RpcError
+from .zeroex import ZeroExLiquidityUnavailable
 
 POOL_KEY = "(address,address,uint24,int24,address)"
 _QUOTE_PARAMS = f"({POOL_KEY},bool,uint128,bytes)"
@@ -191,5 +192,64 @@ async def verify_arc_pool_sellable(rpc, pool_key, *, chain_id, policy,
     if tax_bps is not None and tax_bps > policy.max_tax_bps:
         return verdict(False, "tax_rate_above_policy")
     if loss_bps > policy.max_round_trip_loss_bps:
+        return verdict(False, "round_trip_loss_above_policy")
+    return verdict(True, None)
+
+
+async def verify_arc_exit_via_aggregator(client, token, *, chain_id, policy,
+                                         quote_asset=None):
+    """Probe a round trip through the aggregator we would actually execute on.
+
+    verify_arc_pool_sellable asks one pool whether it can be sold out of, which
+    is the right question when we execute against that pool ourselves. On Arc we
+    execute through 0x, which picks its own route, so the binding question is
+    whether the aggregator can quote the SELL at all: a token it will not route
+    back is one we could buy into and not get out of.
+
+    Read-only: both legs are price requests, nothing is built or signed. A
+    provider that cannot answer raises, because a failed request is not evidence
+    that a token cannot be sold; only an answer saying so is.
+    """
+    chain = chain_for(chain_id)
+    if quote_asset is None:
+        quote_asset = chain.settlement_asset
+        if quote_asset is None:
+            raise ValueError(f"chain {chain.chain_id} has no settlement asset")
+    quote_asset, token = address(quote_asset), address(token)
+    if quote_asset == token:
+        raise ValueError("round trip requires two distinct assets")
+    evidence = {
+        "chain_id": chain.chain_id, "quote_asset": quote_asset, "token": token,
+        "venue": "zeroex", "probe_amount_raw": str(policy.probe_amount_raw),
+        "bought_raw": None, "returned_raw": None, "round_trip_loss_bps": None,
+    }
+
+    def verdict(accepted, reason):
+        return {"accepted": accepted, "reason": reason, **evidence}
+
+    try:
+        bought = await client.route(quote_asset, token, str(policy.probe_amount_raw),
+                                    chain_id=chain.chain_id)
+    except ZeroExLiquidityUnavailable:
+        return verdict(False, "buy_not_quotable")
+    amount_out = int(bought.amount_out_raw)
+    if amount_out <= 0:
+        return verdict(False, "buy_not_quotable")
+    evidence["bought_raw"] = str(amount_out)
+    try:
+        returned = await client.route(token, quote_asset, str(amount_out),
+                                      chain_id=chain.chain_id)
+    except ZeroExLiquidityUnavailable:
+        # Buys route, sells do not: the shape of an Arc pool that cannot be exited.
+        return verdict(False, "token_cannot_be_sold_out_of")
+    back = int(returned.amount_out_raw)
+    if back <= 0:
+        return verdict(False, "token_cannot_be_sold_out_of")
+    evidence["returned_raw"] = str(back)
+    loss_bps = max(0, (policy.probe_amount_raw - back) * 10_000 // policy.probe_amount_raw)
+    evidence["round_trip_loss_bps"] = loss_bps
+    if loss_bps > policy.max_round_trip_loss_bps:
+        # Any hook tax is already inside this number, measured on the route we
+        # would take rather than read out of one pool's immutables.
         return verdict(False, "round_trip_loss_above_policy")
     return verdict(True, None)

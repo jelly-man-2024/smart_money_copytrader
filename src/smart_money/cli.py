@@ -89,6 +89,10 @@ async def arc_monitor(args):
     rpc = ReadOnlyRpc(rpc_url)
     store = Store(args.db)
     watchlist = load_watchlist(args.watchlist)
+    # Relay is deployed on Arc with the same code as Robinhood Chain and its API
+    # serves chain 5042, so a cross-chain fill can be attributed here too. Without
+    # this the delivery reads as a plain receipt of tokens and is never a buy.
+    relay_client = None if args.no_relay else RelayPublicClient()
 
     def output(signal):
         print(json.dumps(signal.to_dict(), ensure_ascii=False), flush=True)
@@ -107,7 +111,8 @@ async def arc_monitor(args):
         task = observe_arc(
             rpc, ws_url, store, watchlist, output, status,
             backfill_interval=args.backfill_interval,
-            backfill_batch=args.backfill_batch)
+            backfill_batch=args.backfill_batch,
+            relay_client=relay_client)
         if args.seconds:
             try:
                 await asyncio.wait_for(task, timeout=args.seconds)
@@ -1631,6 +1636,9 @@ def parser():
         "arc-monitor", help="Observe Arc v4 Swap logs over WSS; read-only")
     arc_parser.add_argument("--watchlist", default="data/fomo_watchlist.csv")
     arc_parser.add_argument("--db", default="var/arc-observer.sqlite3")
+    arc_parser.add_argument(
+        "--no-relay", action="store_true",
+        help="skip Relay order lookups for cross-chain deliveries (read-only either way)")
     arc_parser.add_argument(
         "--seconds", type=float, default=60,
         help="Duration; 0 runs until interrupted")

@@ -212,6 +212,21 @@ CHAINS: dict[int, ChainRegistry] = {
 }
 
 
+def native_to_erc20_amount(raw: int, chain: ChainRegistry) -> tuple[int, int]:
+    """Restate a native-denominated amount in the ERC-20 form's scale.
+
+    Returns the converted amount and the remainder that does not survive the
+    change of scale. On Arc a native amount counts USDC in 18 decimals while the
+    enshrined ERC-20 counts the same balance in 6, so anything below 0.000001
+    USDC is dust the ERC-20 form cannot express; it is returned rather than
+    silently dropped. Chains whose two forms share a scale convert to themselves.
+    """
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+        raise ValueError("native amount must be a non-negative integer")
+    divisor = chain.native_to_erc20_divisor
+    return raw // divisor, raw % divisor
+
+
 def chain_for(chain_id: int) -> ChainRegistry:
     """Resolve the registry for a chain id, or raise on an unsupported chain."""
     try:

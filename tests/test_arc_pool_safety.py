@@ -1,13 +1,15 @@
 """Arc round-trip pool gate: no network, deterministic fake quoter responses."""
 import unittest
+from types import SimpleNamespace
 
 from eth_abi import encode
 
 from smart_money.arc_pool_safety import (
     ArcPoolSafetyPolicy, TAX_HOOK_CODE_SIZE, TAX_HOOK_RATE_OFFSET,
-    read_hook_tax_bps, verify_arc_pool_sellable)
+    read_hook_tax_bps, verify_arc_exit_via_aggregator, verify_arc_pool_sellable)
 from smart_money.registry import ARC
 from smart_money.rpc import RpcError
+from smart_money.zeroex import ZeroExApiError
 
 USDC = ARC.usdc_erc20
 TOKEN = "0x1111111111111111111111111111111111111111"
@@ -150,3 +152,76 @@ class ArcPoolSafetyTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AggregatorExitTests(unittest.IsolatedAsyncioTestCase):
+    """The exit test that binds is the one on the venue we would execute on."""
+
+    def client(self, *outcomes):
+        from smart_money.zeroex import ZeroExLiquidityUnavailable
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+                self.outcomes = list(outcomes)
+
+            async def route(self, token_in, token_out, amount, *, chain_id):
+                self.calls.append((token_in, token_out, amount, chain_id))
+                outcome = self.outcomes.pop(0)
+                if outcome == "no_liquidity":
+                    raise ZeroExLiquidityUnavailable("0x liquidity unavailable")
+                if outcome == "transport":
+                    raise ZeroExApiError("0x request failed: TimeoutError")
+                return SimpleNamespace(amount_out_raw=str(outcome))
+
+        return Client()
+
+    async def verify(self, client, **kwargs):
+        policy = kwargs.pop("policy", ArcPoolSafetyPolicy())
+        return await verify_arc_exit_via_aggregator(
+            client, TOKEN, chain_id=ARC.chain_id, policy=policy, **kwargs)
+
+    async def test_a_routable_round_trip_within_policy_is_accepted(self):
+        client = self.client(10**18, 950_000)
+        result = await self.verify(client)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["round_trip_loss_bps"], 500)
+        # The sell leg is quoted for exactly what the buy leg returned.
+        self.assertEqual(client.calls, [
+            (USDC, TOKEN, "1000000", ARC.chain_id),
+            (TOKEN, USDC, str(10**18), ARC.chain_id)])
+
+    async def test_a_token_0x_will_not_route_back_is_refused(self):
+        client = self.client(10**18, "no_liquidity")
+        result = await self.verify(client)
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["reason"], "token_cannot_be_sold_out_of")
+        self.assertEqual(result["bought_raw"], str(10**18))
+        self.assertIsNone(result["returned_raw"])
+
+    async def test_an_unroutable_buy_is_refused_without_a_sell_probe(self):
+        client = self.client("no_liquidity")
+        result = await self.verify(client)
+        self.assertEqual(result["reason"], "buy_not_quotable")
+        self.assertEqual(len(client.calls), 1)
+
+    async def test_loss_above_policy_is_refused_and_configurable(self):
+        result = await self.verify(self.client(10**18, 700_000))
+        self.assertEqual(result["reason"], "round_trip_loss_above_policy")
+        self.assertEqual(result["round_trip_loss_bps"], 3000)
+        widened = ArcPoolSafetyPolicy(max_round_trip_loss_bps=3500)
+        self.assertTrue(
+            (await self.verify(self.client(10**18, 700_000), policy=widened))["accepted"])
+
+    async def test_a_failed_request_is_never_a_verdict_about_the_token(self):
+        with self.assertRaises(ZeroExApiError):
+            await self.verify(self.client("transport"))
+        with self.assertRaises(ZeroExApiError):
+            await self.verify(self.client(10**18, "transport"))
+
+    async def test_the_quote_asset_defaults_to_the_chain_settlement_asset(self):
+        client = self.client(10**18, 1_000_000)
+        result = await self.verify(client)
+        self.assertEqual(result["quote_asset"], ARC.settlement_asset)
+        self.assertEqual(result["quote_asset"], USDC)
+        self.assertEqual(result["venue"], "zeroex")

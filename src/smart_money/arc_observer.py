@@ -23,13 +23,16 @@ from urllib.parse import urlsplit
 import websockets
 
 from . import registry as R
+from .registry import native_to_erc20_amount
 from .account_state import prestate_implementations
 from .decode import Decoder
 from .models import Signal, Transaction, address, number
 from .native_flows import verify_native_flows
 from .pools import verify_signal_pools
-from .receipts import TRANSFER, enrich
+from .receipts import TRANSFER, direct_token_transfer_evidence, enrich
+from .relay_api import RelayApiError, RelayNotReady
 from .rpc import ReadOnlyRpc, RpcError
+from .solver import relay_passive_buy
 from .store import Store
 
 
@@ -173,10 +176,14 @@ class ArcObserver:
     """Turn verified Arc log hints into the existing candidate/signal model."""
 
     def __init__(self, rpc: ReadOnlyRpc, store: Store, watchlist: dict,
-                 on_signal: Callable[[Signal], None] | None = None):
+                 on_signal: Callable[[Signal], None] | None = None,
+                 relay_client=None,
+                 on_status: Callable[[str, dict], None] | None = None):
         self.rpc = rpc
         self.store = store
         self.watchlist = watchlist
+        self.relay_client = relay_client
+        self.on_status = on_status
         self.decoder = Decoder(watchlist, chain_id=R.ARC.chain_id)
         self.on_signal = on_signal
         self._lock = asyncio.Lock()
@@ -269,6 +276,122 @@ class ArcObserver:
                 return True
         return False
 
+    def _status(self, event: str, **details) -> None:
+        if self.on_status is not None:
+            self.on_status(event, details)
+
+    def _normalize_native_scale(self, signal: Signal) -> Signal:
+        """Restate a native-denominated leg in the ERC-20 scale used downstream.
+
+        Arc's gas asset and its enshrined ERC-20 are one balance counted two
+        ways, 18 decimals natively and 6 through the token. enrich reads a
+        native leg out of the state diff and an ERC-20 leg out of the Transfer
+        logs, so a signal can carry both scales at once and every later
+        comparison — budget bucket, amount rule, price deviation — would be off
+        by a factor of a trillion. Quoting and execution use the ERC-20 form, so
+        that is the scale the amounts are restated in.
+
+        The asset identity is left alone: the pool key and the state diff record
+        what the chain actually did, and rewriting the native sentinel would
+        break the pool-key checks that depend on it.
+        """
+        chain = R.chain_for(signal.chain_id)
+        divisor = chain.native_to_erc20_divisor
+        if divisor == 1 or R.NATIVE not in (signal.token_in, signal.token_out):
+            return signal
+        native_in = signal.token_in == R.NATIVE
+        native_out = signal.token_out == R.NATIVE
+        fields = []
+        if native_in:
+            fields += ["amount_in_raw", "actual_input_debit_raw"]
+        if native_out:
+            fields += ["amount_out_raw", "actual_output_credit_raw"]
+        if signal.amount_limit_raw is not None:
+            # The limit bounds the output of an exact-input swap and the input of
+            # an exact-output one. With no direction recorded it cannot be tied to
+            # a leg, so the signal is held rather than rescaled on a guess.
+            if signal.exact_in is None:
+                signal.stage = "needs_review"
+                signal.reasons.append("native_amount_limit_scale_undetermined")
+                return signal
+            if (native_out if signal.exact_in else native_in):
+                fields.append("amount_limit_raw")
+        dust = {}
+        for field in fields:
+            container = signal.evidence if field.startswith("actual_") else None
+            raw = (container.get(field) if container is not None
+                   else getattr(signal, field, None))
+            if raw is None:
+                continue
+            try:
+                scaled, remainder = native_to_erc20_amount(int(raw), chain)
+            except (TypeError, ValueError):
+                signal.stage = "needs_review"
+                signal.reasons.append("native_amount_not_rescalable")
+                return signal
+            if container is not None:
+                container[field] = str(scaled)
+            else:
+                setattr(signal, field, str(scaled))
+            if remainder:
+                dust[field] = str(remainder)
+        signal.evidence["native_scale_normalization"] = {
+            "rule": "native-to-erc20-scale-v1",
+            "divisor": str(divisor),
+            "rescaled_fields": fields,
+            "dropped_dust_raw": dust,
+            "note": ("amounts are in the ERC-20 scale; native_flow_verification "
+                     "keeps the chain's own 18-decimal values"),
+        }
+        return signal
+
+    async def _associate_relay_delivery(self, signal: Signal, tx: Transaction,
+                                        receipt: dict) -> Signal:
+        """Turn a credit with no local debit into a BUY when Relay orchestrated it.
+
+        A cross-chain fill debits the wallet on the source chain, so on Arc it
+        looks like a plain receipt of tokens and enrich holds it for review. The
+        Relay order is what binds the two ends, and it is checked against this
+        receipt amount for amount in relay_passive_buy.
+
+        The filter is negative on purpose: only a transaction that is itself a
+        plain ERC-20 transfer is skipped. Requiring the credit to come straight
+        from a Relay contract would be tighter but wrong, because a fill can be
+        settled through an intermediary and would then be silently dropped.
+        """
+        if (self.relay_client is None
+                or signal.behavior not in {"EXTERNAL_DELIVERY_CANDIDATE", "INCOMING_TRANSFER"}
+                or signal.stage != "needs_review"):
+            return signal
+        for key in ("relay_lookup_skipped", "relay_lookup_skip_reason",
+                    "relay_lookup_skip_evidence"):
+            signal.evidence.pop(key, None)
+        skip_evidence = direct_token_transfer_evidence(tx, receipt, signal.wallet)
+        if skip_evidence is not None:
+            signal.evidence.update({
+                "relay_lookup_skipped": True,
+                "relay_lookup_skip_reason": "direct_token_transfer",
+                "relay_lookup_skip_evidence": skip_evidence,
+            })
+            self._status("arc_relay_lookup_skipped", source_event_id=signal.event_id,
+                         reason="direct_token_transfer")
+            return signal
+        try:
+            document = await self.relay_client.lookup_by_destination_hash(signal.tx_hash)
+            associated = relay_passive_buy(document, signal)
+        except RelayNotReady:
+            # The order is not settled in Relay's view yet. Leave the signal for
+            # review; backfill re-reads the transaction from canonical state.
+            self._status("arc_relay_lookup_pending", source_event_id=signal.event_id)
+            return signal
+        except (RelayApiError, RpcError, ValueError) as exc:
+            self._status("arc_relay_association_rejected",
+                         source_event_id=signal.event_id, error_type=type(exc).__name__)
+            return signal
+        self._status("arc_relay_buy_associated", source_event_id=associated.event_id,
+                     relay_order_id=associated.evidence.get("relay_order_id"))
+        return associated
+
     async def observe(self, hint: dict,
                       raw_transaction: dict | None = None) -> list[Signal]:
         hint, _wallets = validate_arc_transfer_log(hint, self.watchlist)
@@ -314,6 +437,9 @@ class ArcObserver:
                     native_checks = {}
                 final = enrich(
                     tx, signals, receipt, self.watchlist, pool_checks, native_checks)
+                final = [self._normalize_native_scale(item) for item in final]
+                final = [await self._associate_relay_delivery(item, tx, receipt)
+                         for item in final]
                 for signal in final:
                     if self.store.put(signal) and self.on_signal is not None:
                         self.on_signal(signal)
@@ -441,16 +567,18 @@ async def observe_arc(rpc: ReadOnlyRpc, ws_url: str, store: Store, watchlist: di
                       on_signal: Callable[[Signal], None] | None = None,
                       on_status: Callable[[str, dict], None] | None = None,
                       backfill_interval: float = 5.0,
-                      backfill_batch: int = 500) -> None:
+                      backfill_batch: int = 500,
+                      relay_client=None) -> None:
     if number(await rpc.call("eth_chainId")) != R.ARC.chain_id:
         raise ValueError("Arc RPC is connected to the wrong chain")
     if not 0.5 <= backfill_interval <= 60:
         raise ValueError("invalid Arc backfill interval")
-    observer = ArcObserver(rpc, store, watchlist, on_signal)
-
     def status(event: str, **details) -> None:
         if on_status is not None:
             on_status(event, details)
+
+    observer = ArcObserver(rpc, store, watchlist, on_signal,
+                           relay_client=relay_client, on_status=status)
 
     async def subscribe_forever() -> None:
         failures = 0

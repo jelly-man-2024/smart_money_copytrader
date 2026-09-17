@@ -498,6 +498,14 @@ class LiveQuoter:
         }
 
     async def _quote_at(self, signal: Signal, amount_in_raw: str, header: dict) -> Quote:
+        quote_chain = R.chain_for(signal.chain_id)
+        if (quote_chain.native_to_erc20_divisor != 1
+                and R.NATIVE in (signal.token_in, signal.token_out)
+                and "native_scale_normalization" not in signal.evidence):
+            # Quoting reads the native asset through its ERC-20 form, which
+            # counts the same balance in fewer decimals. An amount still in the
+            # native scale would be quoted a trillion times too large.
+            raise ValueError("native amounts require ERC-20 scale before quoting")
         if (signal.stage in {"needs_review", "failed"}
                 or signal.canonical_status == "orphaned"
                 or signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}

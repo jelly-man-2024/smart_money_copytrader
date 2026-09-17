@@ -30,6 +30,10 @@ class ZeroExApiError(ValueError):
     pass
 
 
+class ZeroExLiquidityUnavailable(ZeroExApiError):
+    """0x answered and cannot route this pair: a verdict, not a failed request."""
+
+
 def decode_zeroex_swap(data):
     try:
         if not isinstance(data, str) or not 10 <= len(data) <= 2*1024*1024+2:
@@ -99,7 +103,7 @@ class ZeroExAggregatorClient:
         except Exception as exc:
             raise ZeroExApiError("0x request failed: " + type(exc).__name__) from None
         if not isinstance(result, dict) or result.get("liquidityAvailable") is not True:
-            raise ZeroExApiError("0x liquidity unavailable")
+            raise ZeroExLiquidityUnavailable("0x liquidity unavailable")
         return result
 
     @classmethod
