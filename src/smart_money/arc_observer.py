@@ -440,7 +440,10 @@ async def observe_arc(rpc: ReadOnlyRpc, ws_url: str, store: Store, watchlist: di
                 failures += 1
                 status("arc_backfill_error", error_type=type(exc).__name__,
                        consecutive_failures=failures)
-                if failures >= 8:
+                if failures >= 30:
+                    # Backfill only tops up the real-time WSS lane; tolerate long
+                    # runs of transient RPC blips before giving up (the conn pool
+                    # now drops idle connections, so these should be rare).
                     raise RuntimeError("Arc backfill repeatedly failed") from exc
                 await asyncio.sleep(min(10.0, 2 ** (failures - 1)))
 

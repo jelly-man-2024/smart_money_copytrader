@@ -42,7 +42,8 @@ _RETRYABLE_STALE_REUSE = frozenset({
 
 
 class JsonConnectionPool:
-    def __init__(self, endpoint, *, capacity=4, timeout=10, max_bytes=2*1024*1024):
+    def __init__(self, endpoint, *, capacity=4, timeout=10, max_bytes=2*1024*1024,
+                 idle_reuse_timeout=5.0):
         url = urlsplit(endpoint)
         if (not url.hostname or url.username or url.password or url.fragment
                 or (url.scheme != "https" and not
@@ -51,6 +52,7 @@ class JsonConnectionPool:
         if type(capacity) is not int or not 1 <= capacity <= 16 or not 0 < timeout <= 30:
             raise ValueError("invalid HTTP pool bounds")
         self.url, self.timeout, self.max_bytes = url, timeout, max_bytes
+        self._idle_reuse_timeout = idle_reuse_timeout
         self._tls = ssl.create_default_context()
         self._slots = queue.LifoQueue(capacity)
         for _ in range(capacity):
@@ -127,6 +129,14 @@ class JsonConnectionPool:
             raise exc from None
         acquired = time.monotonic()
         reused = connection is not None and connection.sock is not None
+        if reused and acquired - getattr(connection, "_smcopy_last_used", acquired) > self._idle_reuse_timeout:
+            # Proactively drop a connection idle longer than the provider is likely
+            # to keep alive, so we never reuse one it has already closed. This is
+            # what causes RemoteDisconnected, which only ever hits reused stale
+            # connections; a fresh connection is opened below instead.
+            connection.close()
+            connection = None
+            reused = False
         status, connected, received = None, acquired, acquired
         ok = False
         try:
@@ -179,6 +189,8 @@ class JsonConnectionPool:
             if response.will_close:
                 connection.close()
                 connection = None
+            else:
+                connection._smcopy_last_used = time.monotonic()
             return result
         except HttpPoolError as exc:
             failure = exc.diagnostic

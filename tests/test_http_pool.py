@@ -194,6 +194,28 @@ class PoolTests(unittest.TestCase):
                 pool.request(idempotent=True)  # retried exactly once, then surfaced
             self.assertTrue(stale.closed and fresh.closed)
 
+    def test_idle_connection_is_dropped_before_reuse(self):
+        stale, fresh = Connection(), Connection()
+        with patch('http.client.HTTPSConnection', side_effect=[stale, fresh]) as factory:
+            pool = JsonConnectionPool('https://example.invalid', capacity=1, idle_reuse_timeout=5.0)
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.request(), {'ok': True})  # builds `stale`, stamps last-used
+            stale._smcopy_last_used -= 10  # simulate sitting idle past the timeout
+            self.assertEqual(pool.request(), {'ok': True})  # stale dropped, `fresh` built
+            self.assertEqual(factory.call_count, 2)
+            self.assertTrue(stale.closed)
+            self.assertEqual([t['reused'] for t in pool.timings], [False, False])
+
+    def test_connection_is_reused_within_idle_window(self):
+        conn = Connection()
+        with patch('http.client.HTTPSConnection', return_value=conn) as factory:
+            pool = JsonConnectionPool('https://example.invalid', capacity=1, idle_reuse_timeout=5.0)
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.request(), {'ok': True})
+            self.assertEqual(pool.request(), {'ok': True})  # within the window -> reused
+            factory.assert_called_once()
+            self.assertEqual([t['reused'] for t in pool.timings], [False, True])
+
     def test_send_guard_runs_after_connect_and_before_request(self):
         connection = Connection()
         guard = Mock(side_effect=ValueError('expired'))
