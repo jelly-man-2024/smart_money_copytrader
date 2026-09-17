@@ -321,7 +321,7 @@ class ArcBackfillTests(unittest.IsolatedAsyncioTestCase):
             try:
                 initialized = await arc_backfill_once(rpc, store, observer)
                 self.assertTrue(initialized["initialized"])
-                self.assertEqual(store.chain_cursor(ARC_CURSOR),
+                self.assertEqual(store.chain_cursor(ARC_CURSOR, R.ARC.chain_id),
                                  (15, "0x" + "cc" * 32))
 
                 rpc.latest = 16
@@ -330,7 +330,7 @@ class ArcBackfillTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((progress["from_block"], progress["to_block"],
                                   progress["logs"], progress["rejected"]),
                                  (16, 16, 1, 0))
-                self.assertEqual(store.chain_cursor(ARC_CURSOR), (16, BLOCK_HASH))
+                self.assertEqual(store.chain_cursor(ARC_CURSOR, R.ARC.chain_id), (16, BLOCK_HASH))
                 # Both directions are asked for, scoped to the watchlist and
                 # to no particular token or venue.
                 self.assertEqual(rpc.log_filters[-2:], [
@@ -358,7 +358,7 @@ class ArcBackfillTests(unittest.IsolatedAsyncioTestCase):
                 rpc.headers[15]["hash"] = "0x" + "ee" * 32
                 with self.assertRaisesRegex(ArcCanonicalMismatch, "manual review"):
                     await arc_backfill_once(rpc, store, observer)
-                self.assertEqual(store.chain_cursor(ARC_CURSOR),
+                self.assertEqual(store.chain_cursor(ARC_CURSOR, R.ARC.chain_id),
                                  (15, "0x" + "cc" * 32))
             finally:
                 store.close()

@@ -75,13 +75,18 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at REAL NOT NULL DEFAULT 0,
             last_error TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        # Keys are chain-scoped: block numbers collide across chains, so a
+        # single-chain key would let one chain overwrite another's canonical
+        # state. MySQL gets the same shape from migration 012.
         self.connection.execute("""CREATE TABLE IF NOT EXISTS chain_cursors (
-            name TEXT PRIMARY KEY, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
+            name TEXT NOT NULL, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
             chain_id INTEGER NOT NULL DEFAULT 4663,
-            updated_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(chain_id,name))""")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS canonical_blocks (
-            block_number INTEGER PRIMARY KEY, block_hash TEXT NOT NULL, parent_hash TEXT NOT NULL,
-            chain_id INTEGER NOT NULL DEFAULT 4663)""")
+            block_number INTEGER NOT NULL, block_hash TEXT NOT NULL, parent_hash TEXT NOT NULL,
+            chain_id INTEGER NOT NULL DEFAULT 4663,
+            PRIMARY KEY(chain_id,block_number))""")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS candidate_inclusions (
             tx_hash TEXT PRIMARY KEY, block_number INTEGER NOT NULL, block_hash TEXT NOT NULL)""")
         self.connection.execute("""CREATE INDEX IF NOT EXISTS candidate_inclusions_by_block
@@ -189,6 +194,37 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
                     row[1] for row in self.connection.execute(f"PRAGMA table_info({_table})")}:
                 self.connection.execute(
                     f"ALTER TABLE {_table} ADD COLUMN chain_id INTEGER NOT NULL DEFAULT 4663")
+        # A ledger created before Arc support keeps a single-chain key even after
+        # the chain_id column is added, which would let one chain's block number
+        # overwrite another's row. SQLite cannot alter a primary key in place, so
+        # rebuild those two tables once. MySQL gets the same shape from migration
+        # 012 and never reaches this code.
+        for _table, _columns, _key in (
+                ("chain_cursors", "name,block_number,block_hash,chain_id,updated_at",
+                 "chain_id,name"),
+                ("canonical_blocks", "block_number,block_hash,parent_hash,chain_id",
+                 "chain_id,block_number")):
+            _info = list(self.connection.execute(f"PRAGMA table_info({_table})"))
+            _primary = [row[1] for row in sorted(
+                (row for row in _info if row[5]), key=lambda row: row[5])]
+            if _primary == _key.split(","):
+                continue
+            self.connection.execute(f"ALTER TABLE {_table} RENAME TO {_table}_pre_chain_key")
+            if _table == "chain_cursors":
+                self.connection.execute("""CREATE TABLE chain_cursors (
+                    name TEXT NOT NULL, block_number INTEGER NOT NULL,
+                    block_hash TEXT NOT NULL, chain_id INTEGER NOT NULL DEFAULT 4663,
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY(chain_id,name))""")
+            else:
+                self.connection.execute("""CREATE TABLE canonical_blocks (
+                    block_number INTEGER NOT NULL, block_hash TEXT NOT NULL,
+                    parent_hash TEXT NOT NULL, chain_id INTEGER NOT NULL DEFAULT 4663,
+                    PRIMARY KEY(chain_id,block_number))""")
+            self.connection.execute(
+                f"INSERT INTO {_table}({_columns}) SELECT {_columns} FROM {_table}_pre_chain_key")
+            self.connection.execute(f"DROP TABLE {_table}_pre_chain_key")
+            self.connection.commit()
         self.connection.execute("""CREATE TABLE IF NOT EXISTS paper_position_reservations (
             proposal_id TEXT NOT NULL, lot_id TEXT NOT NULL, token_amount_raw TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('active','consumed','released')),
@@ -1865,42 +1901,49 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             "pending", "queued", "retry", "complete", "failed"
         )}
 
-    def chain_cursor(self, name: str = "canonical_l2") -> tuple[int, str] | None:
+    def chain_cursor(self, name: str = "canonical_l2",
+                     chain_id: int = R.CHAIN_ID) -> tuple[int, str] | None:
         row = self.connection.execute(
-            "SELECT block_number,block_hash FROM chain_cursors WHERE name=?", (name,)
+            "SELECT block_number,block_hash FROM chain_cursors WHERE name=? AND chain_id=?",
+            (name, chain_id),
         ).fetchone()
         return (row[0], row[1]) if row else None
 
     def set_chain_cursor(self, block_number: int, block_hash: str,
-                         name: str = "canonical_l2") -> None:
+                         name: str = "canonical_l2",
+                         chain_id: int = R.CHAIN_ID) -> None:
         if block_number < 0 or not isinstance(block_hash, str) or not block_hash.startswith("0x"):
             raise ValueError("invalid chain cursor")
-        old = self.chain_cursor(name)
+        old = self.chain_cursor(name, chain_id)
         if old and block_number < old[0]:
             raise ValueError("chain cursor rewind requires explicit reorg handling")
-        self.connection.execute("""INSERT INTO chain_cursors(name,block_number,block_hash) VALUES(?,?,?)
-            ON CONFLICT(name) DO UPDATE SET block_number=excluded.block_number,
+        self.connection.execute("""INSERT INTO chain_cursors(name,block_number,block_hash,chain_id)
+            VALUES(?,?,?,?)
+            ON CONFLICT(chain_id,name) DO UPDATE SET block_number=excluded.block_number,
             block_hash=excluded.block_hash, updated_at=CURRENT_TIMESTAMP""",
-            (name, block_number, block_hash.lower()))
+            (name, block_number, block_hash.lower(), chain_id))
         self.connection.commit()
 
     def record_chain_block(self, block_number: int, block_hash: str, parent_hash: str,
-                           name: str = "canonical_l2") -> None:
+                           name: str = "canonical_l2",
+                           chain_id: int = R.CHAIN_ID) -> None:
         if block_number < 0 or not all(
                 isinstance(value, str) and value.startswith("0x")
                 for value in (block_hash, parent_hash)):
             raise ValueError("invalid canonical block")
-        old = self.chain_cursor(name)
+        old = self.chain_cursor(name, chain_id)
         if old and block_number < old[0]:
             raise ValueError("canonical block rewind requires explicit reorg handling")
-        self.connection.execute("""INSERT INTO canonical_blocks(block_number,block_hash,parent_hash)
-            VALUES(?,?,?) ON CONFLICT(block_number) DO UPDATE SET block_hash=excluded.block_hash,
-            parent_hash=excluded.parent_hash""",
-            (block_number, block_hash.lower(), parent_hash.lower()))
-        self.connection.execute("""INSERT INTO chain_cursors(name,block_number,block_hash)
-            VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET
+        self.connection.execute("""INSERT INTO
+            canonical_blocks(block_number,block_hash,parent_hash,chain_id)
+            VALUES(?,?,?,?) ON CONFLICT(chain_id,block_number) DO UPDATE SET
+            block_hash=excluded.block_hash, parent_hash=excluded.parent_hash""",
+            (block_number, block_hash.lower(), parent_hash.lower(), chain_id))
+        self.connection.execute("""INSERT INTO chain_cursors(name,block_number,block_hash,chain_id)
+            VALUES(?,?,?,?) ON CONFLICT(chain_id,name) DO UPDATE SET
             block_number=excluded.block_number,block_hash=excluded.block_hash,
-            updated_at=CURRENT_TIMESTAMP""", (name, block_number, block_hash.lower()))
+            updated_at=CURRENT_TIMESTAMP""",
+            (name, block_number, block_hash.lower(), chain_id))
         self._mark_block_safe_head(block_number, block_hash.lower())
         self.connection.commit()
 
@@ -1924,15 +1967,20 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             updated += 1
         return updated
 
-    def chain_block_hash(self, block_number: int) -> str | None:
+    def chain_block_hash(self, block_number: int,
+                         chain_id: int = R.CHAIN_ID) -> str | None:
         row = self.connection.execute(
-            "SELECT block_hash FROM canonical_blocks WHERE block_number=?", (block_number,)
+            "SELECT block_hash FROM canonical_blocks WHERE block_number=? AND chain_id=?",
+            (block_number, chain_id),
         ).fetchone()
         return row[0] if row else None
 
-    def rewind_chain(self, block_number: int, block_hash: str) -> tuple[int, int]:
+    def rewind_chain(self, block_number: int, block_hash: str,
+                     name: str = "canonical_l2",
+                     chain_id: int = R.CHAIN_ID) -> tuple[int, int]:
         orphan_hashes = {row[0] for row in self.connection.execute(
-            "SELECT block_hash FROM canonical_blocks WHERE block_number>?", (block_number,)
+            "SELECT block_hash FROM canonical_blocks WHERE block_number>? AND chain_id=?",
+            (block_number, chain_id),
         )}
         orphaned_signals = 0
         for event_id, payload in self.connection.execute("SELECT event_id,payload FROM signals").fetchall():
@@ -1957,10 +2005,12 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             self.connection.execute(
                 "DELETE FROM solver_order_evidence WHERE tx_hash=?", (tx_hash,))
         self.connection.execute("DELETE FROM candidate_inclusions WHERE block_number>?", (block_number,))
-        self.connection.execute("DELETE FROM canonical_blocks WHERE block_number>?", (block_number,))
+        self.connection.execute(
+            "DELETE FROM canonical_blocks WHERE block_number>? AND chain_id=?",
+            (block_number, chain_id))
         self.connection.execute("""UPDATE chain_cursors SET block_number=?,block_hash=?,
-            updated_at=CURRENT_TIMESTAMP WHERE name='canonical_l2'""",
-            (block_number, block_hash.lower()))
+            updated_at=CURRENT_TIMESTAMP WHERE name=? AND chain_id=?""",
+            (block_number, block_hash.lower(), name, chain_id))
         self.connection.commit()
         return orphaned_signals, len(tx_rows)
 

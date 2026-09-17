@@ -476,7 +476,7 @@ async def arc_backfill_once(rpc: ReadOnlyRpc, store: Store, observer: ArcObserve
     if not 1 <= batch_size <= 2000:
         raise ValueError("invalid Arc backfill batch size")
     latest = number(await rpc.call("eth_blockNumber"))
-    cursor = store.chain_cursor(ARC_CURSOR)
+    cursor = store.chain_cursor(ARC_CURSOR, R.ARC.chain_id)
     initialized = cursor is None
     if cursor is None:
         # The WSS task is already starting in parallel. Scanning the current
@@ -550,15 +550,15 @@ async def arc_backfill_once(rpc: ReadOnlyRpc, store: Store, observer: ArcObserve
                 await observer.observe(log, raw_transaction=raw)
             except ArcCandidateRejected:
                 rejected += 1
-        store.record_chain_block(
-            height, block_hash, parent_hash, name=ARC_CURSOR)
+        store.record_chain_block(height, block_hash, parent_hash,
+                                 name=ARC_CURSOR, chain_id=R.ARC.chain_id)
         verified_blocks[height] = (block_hash, parent_hash)
     if end in verified_blocks:
         end_hash = verified_blocks[end][0]
     else:
         end_header = await rpc.call("eth_getBlockByNumber", [hex(end), False])
         end_hash, _ = _block_identity(end_header, end)
-    store.set_chain_cursor(end, end_hash, ARC_CURSOR)
+    store.set_chain_cursor(end, end_hash, ARC_CURSOR, R.ARC.chain_id)
     return {"initialized": initialized, "from_block": start, "to_block": end,
             "logs": len(logs), "rejected": rejected}
 
