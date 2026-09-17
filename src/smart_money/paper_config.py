@@ -7,6 +7,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from . import registry as R
 from .models import address
 from .paper import (
     AmountRule, BUDGET_BUCKETS, SUPPORTED_EXECUTION_PROVIDERS, TRIGGER_MODES,
@@ -60,6 +61,9 @@ class WalletPaperPolicy:
     route_definitions: tuple[dict, ...]
     snapshot_hash: str
     execution_providers: tuple[str, ...] = DEFAULT_EXECUTION_PROVIDERS
+    # Which chain this relationship copies on. Defaults to Robinhood Chain so
+    # every existing configuration keeps its meaning.
+    chain_id: int = R.CHAIN_ID
 
     @property
     def ledger_scope(self) -> str:
@@ -215,7 +219,8 @@ def parse_paper_config(document: dict) -> PaperConfig:
     relationship_keys = set()
     for row in wallet_rows:
         _fields(row, {"wallet", "label", "follower_wallet", "relationship_id", "run_mode",
-                      "budget_limits", "buy_rules", "sell_rule", "execution_providers"},
+                      "budget_limits", "buy_rules", "sell_rule", "execution_providers",
+                      "chain_id"},
                 {"wallet", "budget_limits", "buy_rules", "sell_rule"}, "wallet policy")
         execution_providers = _execution_providers(row.get("execution_providers"))
         wallet = address(row["wallet"])
@@ -249,6 +254,19 @@ def parse_paper_config(document: dict) -> PaperConfig:
         run_mode = row.get("run_mode", "paper")
         if run_mode not in {"paper", "mainnet_live"}:
             raise ValueError("invalid relationship run mode")
+        chain_id = row.get("chain_id", R.CHAIN_ID)
+        if type(chain_id) is not int:
+            raise ValueError("invalid relationship chain id")
+        chain = R.chain_for(chain_id)   # refuses a chain this build does not know
+        # A bucket only exists where the chain has the asset behind it, so a
+        # configuration naming another chain's bucket is a configuration error.
+        settlement_bucket = "USDG" if chain.usdg is not None else "USDC"
+        allowed_buckets = {settlement_bucket}
+        if chain.weth is not None:
+            allowed_buckets.add("ETH_WETH")
+        if not set(normalized_limits) <= allowed_buckets:
+            raise ValueError(
+                f"chain {chain_id} supports buckets {sorted(allowed_buckets)}")
         if run_mode == "mainnet_live" and (
                 follower is None or relationship_id is None
                 or trigger not in {"swap_evidenced", "evidenced"}):
@@ -261,6 +279,7 @@ def parse_paper_config(document: dict) -> PaperConfig:
             quote_policy, frozenset(protocols), frozenset(normalized_assets),
             frozenset(route_keys), tuple(deepcopy(route_rows)), "",
             execution_providers,
+            chain_id,
         )
         relationship_key = (follower, relationship_id, wallet)
         if relationship_key in relationship_keys:
@@ -278,7 +297,7 @@ def parse_paper_config(document: dict) -> PaperConfig:
         policy.strategy_version, policy.trigger_mode, policy.shadow_trigger_modes,
         policy.quote_policy, policy.allowed_protocols, policy.allowed_assets,
         policy.allowed_routes, policy.route_definitions, snapshot_hash,
-        policy.execution_providers,
+        policy.execution_providers, policy.chain_id,
     ) for policy in relationships]
     wallets = {}
     for policy in relationships:

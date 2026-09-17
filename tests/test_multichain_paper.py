@@ -84,3 +84,56 @@ class ChainScopedRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChainScopedPolicyTests(unittest.TestCase):
+    """A relationship declares its chain, and its buckets must exist there."""
+
+    def policy_row(self, chain_id, limits, rules):
+        return {
+            "wallet": "0x89909912c58e2182d92b1a8638d6ff8d965e173b",
+            "label": "test", "follower_wallet": WALLET, "relationship_id": "9",
+            "run_mode": "paper", "chain_id": chain_id,
+            "budget_limits": limits, "buy_rules": rules,
+            "sell_rule": {"mode": "proportional", "ratio_ppm": 1000000},
+        }
+
+    def parse(self, row):
+        from smart_money.paper_config import parse_paper_config
+        return parse_paper_config({
+            "version": 1, "strategy_version": "v1", "trigger_mode": "evidenced",
+            "quote_policy": {},
+            "allowed_protocols": ["v4"], "allowed_assets": [TOKEN],
+            "allowed_routes": [], "wallets": [row]})
+
+    def test_an_arc_relationship_uses_the_usdc_bucket(self):
+        config = self.parse(self.policy_row(
+            R.ARC.chain_id, {"USDC": "10000000"},
+            {"USDC": {"mode": "fixed", "fixed_amount_raw": "100000"}}))
+        policy = config.relationships[0]
+        self.assertEqual(policy.chain_id, R.ARC.chain_id)
+        self.assertEqual(set(policy.budget_limits), {"USDC"})
+        # The chain survives snapshot hashing, which rebuilds every policy.
+        self.assertTrue(policy.snapshot_hash)
+
+    def test_robinhood_keeps_its_own_buckets(self):
+        policy = self.parse(self.policy_row(
+            R.CHAIN_ID, {"USDG": "10000000", "ETH_WETH": "1"},
+            {"USDG": {"mode": "fixed", "fixed_amount_raw": "100000"},
+             "ETH_WETH": {"mode": "fixed", "fixed_amount_raw": "1"}})).relationships[0]
+        self.assertEqual(policy.chain_id, R.CHAIN_ID)
+        self.assertEqual(set(policy.budget_limits), {"USDG", "ETH_WETH"})
+
+    def test_a_bucket_the_chain_does_not_have_is_refused(self):
+        # Arc has no USDG and no wrapped native, so neither bucket exists there.
+        for limits, rules in (
+                ({"USDG": "10000000"}, {"USDG": {"mode": "fixed", "fixed_amount_raw": "1"}}),
+                ({"ETH_WETH": "1"}, {"ETH_WETH": {"mode": "fixed", "fixed_amount_raw": "1"}})):
+            with self.subTest(bucket=list(limits)[0]):
+                with self.assertRaisesRegex(ValueError, "supports buckets"):
+                    self.parse(self.policy_row(R.ARC.chain_id, limits, rules))
+
+    def test_an_unknown_chain_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "unsupported chain id"):
+            self.parse(self.policy_row(
+                999999, {"USDG": "1"}, {"USDG": {"mode": "fixed", "fixed_amount_raw": "1"}}))

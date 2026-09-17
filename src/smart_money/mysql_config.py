@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pymysql
 
+from . import registry as R
 from .models import address
 from .paper_config import PaperConfig, ZERO_ADDRESS, load_paper_config
 from .registry import load_watchlist
@@ -110,17 +111,27 @@ def rows_to_document(rows: list[dict]) -> dict:
                 result["ratio_ppm"] = int(ratio)
             return result
         providers = row.get("execution_providers")
+        # The usdg_* columns carry the rule for whatever the chain settles in,
+        # and the eth_* columns the rule for its wrapped native asset. The bucket
+        # NAMES are per chain: Robinhood settles in USDG and wraps ETH, while Arc
+        # settles in USDC and has no wrapped native at all, so it has no second
+        # bucket to fill.
+        chain = R.chain_for(int(row.get("chain_id") or R.CHAIN_ID))
+        settlement_bucket = "USDG" if chain.usdg is not None else "USDC"
+        budget_limits = {settlement_bucket: str(row["usdg_budget_limit_raw"])}
+        buy_rules = {settlement_bucket: rule("usdg")}
+        if chain.weth is not None:
+            budget_limits["ETH_WETH"] = str(row["eth_budget_limit_raw"])
+            buy_rules["ETH_WETH"] = rule("eth")
         wallets.append({
             "wallet": smart,
             "label": row["smart_wallet_label"],
             "follower_wallet": follower,
             "relationship_id": str(row["id"]),
             "run_mode": row["run_mode"],
-            "budget_limits": {
-                "USDG": str(row["usdg_budget_limit_raw"]),
-                "ETH_WETH": str(row["eth_budget_limit_raw"]),
-            },
-            "buy_rules": {"USDG": rule("usdg"), "ETH_WETH": rule("eth")},
+            "chain_id": chain.chain_id,
+            "budget_limits": budget_limits,
+            "buy_rules": buy_rules,
             "sell_rule": rule("sell"),
             # Databases created before migration 007 have no column: keep the
             # verified local behaviour instead of guessing an aggregator.
