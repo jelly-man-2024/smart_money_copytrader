@@ -65,7 +65,9 @@ class EarlyRuntime:
         self.gate.validate(policy.relationship_id, policy.follower_wallet,
                            policy.wallet, policy.snapshot_hash)
         c = intent.candidate
-        bucket = budget_bucket(c.token_in if c.side == "BUY" else c.token_out)
+        # The early Feed lane is Robinhood-only (early_intent rejects any other
+        # chain id), so the candidate's bucket is resolved on that chain.
+        bucket = budget_bucket(c.token_in if c.side == "BUY" else c.token_out, R.CHAIN_ID)
         binding = dict(relationship_id=policy.relationship_id, follower=policy.follower_wallet,
                        smart_wallet=policy.wallet, config_snapshot_hash=policy.snapshot_hash)
         lots = []
@@ -161,7 +163,7 @@ class EarlyRuntime:
                             trigger_mode="feed_intent", strategy_version=policy.strategy_version,
                             input_asset=signal.token_in, output_asset=signal.token_out,
                             budget_bucket=budget_bucket(signal.token_in if signal.behavior == "BUY"
-                                                        else signal.token_out),
+                                                        else signal.token_out, signal.chain_id),
                             amount_in_raw=decision["amount_in_raw"], attribution=attr, quote=decision["quote"])
                         check_early_execution_source(self.store, intent, signal, proposal)
                         if not self.healthy():

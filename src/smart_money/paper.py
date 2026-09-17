@@ -16,13 +16,26 @@ from .rpc import RpcError
 RATIO_SCALE = 1_000_000
 AGGREGATOR_PROVIDERS = frozenset({"kyber", "zeroex"})
 SUPPORTED_EXECUTION_PROVIDERS = frozenset({"local", *AGGREGATOR_PROVIDERS})
-AGGREGATOR_ROUTERS = {"kyber": R.KYBER_META_AGGREGATION_ROUTER_V2,
-                      "zeroex": R.ZERO_X_ALLOWANCE_HOLDER}
+def aggregator_routers(chain_id: int) -> dict[str, str]:
+    """Aggregator routers a chain actually has; a provider it lacks is absent.
+
+    0x does not serve Arc, so Arc exposes only Kyber. Selecting a provider the
+    chain lacks must fail rather than reuse another chain's router address.
+    """
+    chain = R.chain_for(chain_id)
+    routers = {"kyber": chain.kyber_router,
+               "zeroex": chain.zero_x_allowance_holder}
+    return {name: value for name, value in routers.items() if value is not None}
+
+
+# The live execution path is Robinhood-only today (execution_prep refuses any
+# other chain id), so its allowlists stay pinned to this mapping.
+AGGREGATOR_ROUTERS = aggregator_routers(R.CHAIN_ID)
 TRIGGER_MODES = frozenset({
     "feed_intent", "receipt_success", "swap_evidenced",
     "relay_sell_evidenced", "relay_buy_evidenced", "evidenced",
 })
-BUDGET_BUCKETS = frozenset({"USDG", "ETH_WETH"})
+BUDGET_BUCKETS = frozenset({"USDG", "ETH_WETH", "USDC"})
 
 
 def normalized_route_key(protocol: str, assets: list[str],
@@ -90,16 +103,20 @@ def signal_route_key(signal: Signal) -> str | None:
         return None
 
 
-def aggregator_route_definition(token_in: str, token_out: str, provider: str) -> dict:
+def aggregator_route_definition(token_in: str, token_out: str, provider: str,
+                                chain_id: int) -> dict:
     """Describe an aggregator-provided execution pair; the route itself is quoted live."""
     if provider not in AGGREGATOR_PROVIDERS:
         raise ValueError("unsupported aggregator provider")
+    routers = aggregator_routers(chain_id)
+    if provider not in routers:
+        raise ValueError(f"chain {chain_id} has no {provider} router")
     token_in, token_out = address(token_in), address(token_out)
     if token_in == token_out or R.NATIVE in {token_in, token_out}:
         raise ValueError("aggregator execution requires two distinct ERC-20 assets")
     return {
         "protocol": provider, "assets": [token_in, token_out], "provider": provider,
-        "router": AGGREGATOR_ROUTERS[provider],
+        "router": routers[provider],
         "route_discovery": "aggregator_provider",
     }
 
@@ -107,6 +124,8 @@ def aggregator_route_definition(token_in: str, token_out: str, provider: str) ->
 def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
                            output_asset: str | None = None) -> Signal:
     """Select one validated local quote route without changing source attribution."""
+    chain = R.chain_for(source.chain_id)
+    routers = aggregator_routers(source.chain_id)
     output_asset = address(output_asset) if output_asset is not None else source.token_out
     selected_route = source.evidence.get("local_execution_route")
     selected_aggregator = (isinstance(selected_route, dict)
@@ -138,13 +157,14 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
         })
         if protocol in AGGREGATOR_PROVIDERS:
             if (len(assets) != 2 or definition.get("provider") != protocol
-                    or address(definition.get("router", "")) != AGGREGATOR_ROUTERS[protocol]):
+                    or protocol not in routers
+                    or address(definition.get("router", "")) != routers[protocol]):
                 continue
             evidence["aggregator_provider"] = protocol
-            contract = AGGREGATOR_ROUTERS[protocol]
+            contract = routers[protocol]
         elif protocol == "v2":
             evidence["route"] = ordered_assets
-            contract = R.V2_ROUTER
+            contract = _chain_venue(chain, "v2_router")
         elif protocol == "v3":
             fees = definition.get("fees")
             if not isinstance(fees, list) or len(fees) != len(assets) - 1:
@@ -155,7 +175,7 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
                  "fee": ordered_fees[i]}
                 for i in range(len(ordered_fees))
             ]
-            contract = R.V3_QUOTER
+            contract = _chain_venue(chain, "v3_quoter")
         elif protocol == "v4":
             fields = [definition.get(name) for name in (
                 "fees", "tick_spacings", "hooks", "hook_data")]
@@ -174,7 +194,7 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
                     "pool_key": [currency0, currency1, fee, tick, hook],
                     "hook_data": data,
                 })
-            contract = R.V4_QUOTER
+            contract = _chain_venue(chain, "v4_quoter")
         else:
             continue
         matches.append(replace(
@@ -186,11 +206,28 @@ def execution_quote_signal(source: Signal, routes: tuple[dict, ...] | None,
     return matches[0]
 
 
-def budget_bucket(asset: str) -> str | None:
+def _chain_venue(chain: R.ChainRegistry, field: str) -> str:
+    value = getattr(chain, field)
+    if value is None:
+        raise ValueError(f"chain {chain.chain_id} has no {field}")
+    return value
+
+
+def budget_bucket(asset: str, chain_id: int) -> str | None:
+    """Budget bucket an asset belongs to ON ITS OWN CHAIN.
+
+    Buckets are chain-scoped because the same bucket name means a different
+    asset per chain: Robinhood settles in USDG and wraps ETH, while Arc's
+    quote asset and gas asset are both USDC. An asset the chain does not
+    recognise returns None, which refuses the trade upstream.
+    """
+    chain = R.chain_for(chain_id)
     asset = address(asset)
-    if asset == R.USDG:
+    if chain.usdg is not None and asset == chain.usdg:
         return "USDG"
-    if asset in {R.NATIVE, R.WETH}:
+    if chain.usdc_erc20 is not None and asset in {R.NATIVE, chain.usdc_erc20}:
+        return "USDC"
+    if chain.weth is not None and asset in {R.NATIVE, chain.weth}:
         return "ETH_WETH"
     return None
 
@@ -223,7 +260,7 @@ def planned_input_amount(signal: Signal, rule: AmountRule) -> tuple[str | None, 
     if signal.behavior not in {"BUY", "SELL", "TOKEN_SWAP"}:
         return None, "not_a_supported_trade_signal"
     budget_asset = signal.token_out if signal.behavior == "SELL" else signal.token_in
-    if not budget_asset or (bucket := budget_bucket(budget_asset)) is None:
+    if not budget_asset or (bucket := budget_bucket(budget_asset, signal.chain_id)) is None:
         return None, ("output_asset_has_no_budget_bucket" if signal.behavior == "SELL"
                       else "input_asset_has_no_budget_bucket")
     if rule.mode == "proportional":
@@ -365,7 +402,7 @@ class PaperEngine:
             if provider != "local":
                 if provider in self._available_aggregators():
                     signal.evidence["local_execution_route"] = aggregator_route_definition(
-                        signal.token_in, signal.token_out, provider)
+                        signal.token_in, signal.token_out, provider, signal.chain_id)
                     self.store.put(signal)
                     return execution_quote_signal(signal, self.execution_routes)
                 failures.append(f"{provider}: provider unavailable")
@@ -543,7 +580,7 @@ class PaperEngine:
             return self._decision(signal, False, reason, {"source_signal": signal.to_dict()})
         if amount_rule.mode == "proportional":
             actual = signal.evidence.get("actual_input_debit_raw")
-            bucket_or_reason = budget_bucket(signal.token_out)
+            bucket_or_reason = budget_bucket(signal.token_out, signal.chain_id)
             if (not isinstance(actual, str) or not actual.isdecimal()
                     or int(actual) <= 0 or bucket_or_reason is None):
                 return self._decision(
@@ -635,7 +672,7 @@ class PaperEngine:
             "source_tx_hash": signal.tx_hash, "wallet": self._ledger_wallet(signal),
             "trigger_mode": self.trigger_mode, "strategy_version": self.strategy_version,
             "input_asset": signal.token_in, "output_asset": principal_asset,
-            "budget_bucket": budget_bucket(principal_asset), "amount_in_raw": amount,
+            "budget_bucket": budget_bucket(principal_asset, signal.chain_id), "amount_in_raw": amount,
             "quote": quote_payload, "attribution": attribution,
         })
         if not reserved:

@@ -153,7 +153,7 @@ class QuoteReuseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_explicit_aggregator_overrides_source_local_route(self):
         source = replace(self.signal, protocol="v3", evidence={"local_execution_route":
-                         aggregator_route_definition(R.USDG, B, "kyber")})
+                         aggregator_route_definition(R.USDG, B, "kyber", R.CHAIN_ID)})
         local = {"protocol": "v3", "assets": [R.USDG, B], "fees": [500]}
         self.assertEqual(execution_quote_signal(source, (local,)).protocol, "kyber")
 

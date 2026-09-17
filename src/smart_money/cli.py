@@ -771,7 +771,8 @@ async def monitor(args):
                 else:
                     from .paper import aggregator_route_definition
                     signal.evidence["local_execution_route"] = aggregator_route_definition(
-                        quote_signal.token_in, quote_signal.token_out, "kyber")
+                        quote_signal.token_in, quote_signal.token_out, "kyber",
+                        signal.chain_id)
                     store.put(signal)
                     quote_signal = execution_quote_signal(signal, policy.route_definitions, proposal["output_asset"])
                 report("execution_provider_fallback", proposal_id=proposal_id, previous="zeroex",
@@ -960,7 +961,7 @@ async def monitor(args):
                     if policies is None else policies)
         for policy in selected:
             if signal.behavior in {"BUY", "TOKEN_SWAP"}:
-                bucket = budget_bucket(signal.token_in) if signal.token_in else None
+                bucket = budget_bucket(signal.token_in, signal.chain_id) if signal.token_in else None
                 rule = policy.buy_rules.get(bucket)
                 if rule is None:
                     continue

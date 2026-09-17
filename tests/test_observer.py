@@ -3647,10 +3647,10 @@ class SafetyTests(unittest.TestCase):
                         stage='swap_evidenced', token_in=R.USDG, token_out=TOKEN,
                         execution_status='success',
                         evidence={'actual_input_debit_raw': '1001'})
-        self.assertEqual(budget_bucket(R.USDG), 'USDG')
-        self.assertEqual(budget_bucket(R.NATIVE), 'ETH_WETH')
-        self.assertEqual(budget_bucket(R.WETH), 'ETH_WETH')
-        self.assertEqual(budget_bucket(TOKEN), None)
+        self.assertEqual(budget_bucket(R.USDG, R.CHAIN_ID), 'USDG')
+        self.assertEqual(budget_bucket(R.NATIVE, R.CHAIN_ID), 'ETH_WETH')
+        self.assertEqual(budget_bucket(R.WETH, R.CHAIN_ID), 'ETH_WETH')
+        self.assertEqual(budget_bucket(TOKEN, R.CHAIN_ID), None)
         amount, bucket = planned_input_amount(
             signal, AmountRule('proportional', ratio_ppm=100_000))
         self.assertEqual((amount, bucket), ('100', 'USDG'))
@@ -4549,7 +4549,7 @@ class AggregatorExecutionTests(unittest.TestCase):
         from smart_money.paper import aggregator_route_definition
         signal = self._signal(protocol='relay_solver')
         signal.evidence['local_execution_route'] = aggregator_route_definition(
-            R.USDG, self.TOKEN_OUT, 'kyber')
+            R.USDG, self.TOKEN_OUT, 'kyber', R.CHAIN_ID)
         selected = execution_quote_signal(signal, None)
         self.assertEqual((selected.protocol, selected.contract, selected.exact_in),
                          ('kyber', R.KYBER_META_AGGREGATION_ROUTER_V2, True))
@@ -4561,9 +4561,9 @@ class AggregatorExecutionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'does not select one'):
             execution_quote_signal(tampered, None)
         with self.assertRaisesRegex(ValueError, 'unsupported aggregator'):
-            aggregator_route_definition(R.USDG, self.TOKEN_OUT, 'okx')
+            aggregator_route_definition(R.USDG, self.TOKEN_OUT, 'okx', R.CHAIN_ID)
         with self.assertRaisesRegex(ValueError, 'ERC-20'):
-            aggregator_route_definition(R.NATIVE, self.TOKEN_OUT, 'kyber')
+            aggregator_route_definition(R.NATIVE, self.TOKEN_OUT, 'kyber', R.CHAIN_ID)
         reversed_signal = reverse_quote_signal(selected, R.USDG)
         self.assertEqual((reversed_signal.behavior, reversed_signal.token_in,
                           reversed_signal.token_out), ('SELL', self.TOKEN_OUT, R.USDG))
@@ -5018,7 +5018,7 @@ class AggregatorExecutionTests(unittest.TestCase):
         store.configure_paper_budget(A, 'USDG', '1000000')
         signal = self._signal(protocol='relay_solver')
         signal.evidence['local_execution_route'] = aggregator_route_definition(
-            R.USDG, self.TOKEN_OUT, 'kyber')
+            R.USDG, self.TOKEN_OUT, 'kyber', R.CHAIN_ID)
         store.put(signal)
         reserved, reason = store.reserve_paper_proposal({
             'proposal_id': 'proposal-kyber-buy', 'source_event_id': signal.event_id,
