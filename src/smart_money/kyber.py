@@ -182,7 +182,7 @@ class KyberAggregatorClient:
             parsed = urllib.parse.urlsplit(url)
             document = self.transport.request("POST" if payload else "GET",
                 path=parsed.path + ("?" + parsed.query if parsed.query else ""),
-                body=payload, headers=headers)
+                body=payload, headers=headers, idempotent=True)
         except KyberApiError:
             raise
         except Exception as exc:

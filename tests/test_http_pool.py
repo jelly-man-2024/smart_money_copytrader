@@ -143,6 +143,57 @@ class PoolTests(unittest.TestCase):
             self.assertTrue(connection.closed)
             pool.close()
 
+    def test_idempotent_retries_once_on_stale_reused_connection(self):
+        stale, fresh = Connection(), Connection()
+        with patch('http.client.HTTPSConnection', side_effect=[stale, fresh]) as factory:
+            pool = JsonConnectionPool('https://example.invalid', capacity=1)
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.request(), {'ok': True})  # builds `stale`, reused=False
+            stale.getresponse = Mock(side_effect=http.client.RemoteDisconnected('x'))
+            # `stale` is reused and fails; the idempotent retry lands on `fresh`.
+            self.assertEqual(pool.request(idempotent=True), {'ok': True})
+            self.assertEqual(factory.call_count, 2)
+            self.assertTrue(stale.closed)
+            self.assertEqual([t['success'] for t in pool.timings], [True, False, True])
+            self.assertEqual([t['reused'] for t in pool.timings], [False, True, False])
+
+    def test_non_idempotent_never_retries_stale_reused_connection(self):
+        stale, unused = Connection(), Connection()
+        with patch('http.client.HTTPSConnection', side_effect=[stale, unused]) as factory:
+            pool = JsonConnectionPool('https://example.invalid', capacity=1)
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.request(), {'ok': True})
+            stale.getresponse = Mock(side_effect=http.client.RemoteDisconnected('x'))
+            with self.assertRaises(HttpPoolError):
+                pool.request()  # default idempotent=False protects eth_sendRawTransaction
+            self.assertEqual(factory.call_count, 1)  # no fresh connection was made
+            self.assertFalse(unused.closed)
+
+    def test_idempotent_does_not_retry_non_transport_failure(self):
+        conn = Connection()
+        rejected = Response()
+        rejected.status = 500
+        conn.responses = [rejected]
+        with patch('http.client.HTTPSConnection', side_effect=[conn, Connection()]) as factory:
+            pool = JsonConnectionPool('https://example.invalid', capacity=1)
+            self.addCleanup(pool.close)
+            with self.assertRaises(HttpPoolError) as caught:
+                pool.request(idempotent=True)
+            self.assertEqual(caught.exception.diagnostic["reason"], "http_status")
+            self.assertEqual(factory.call_count, 1)  # HTTP 500 is not a stale-reuse retry
+
+    def test_idempotent_retry_that_also_fails_is_raised(self):
+        stale, fresh = Connection(), Connection()
+        with patch('http.client.HTTPSConnection', side_effect=[stale, fresh]):
+            pool = JsonConnectionPool('https://example.invalid', capacity=1)
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.request(), {'ok': True})
+            stale.getresponse = Mock(side_effect=http.client.RemoteDisconnected('x'))
+            fresh.request = Mock(side_effect=http.client.RemoteDisconnected('x'))
+            with self.assertRaises(HttpPoolError):
+                pool.request(idempotent=True)  # retried exactly once, then surfaced
+            self.assertTrue(stale.closed and fresh.closed)
+
     def test_send_guard_runs_after_connect_and_before_request(self):
         connection = Connection()
         guard = Mock(side_effect=ValueError('expired'))

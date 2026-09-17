@@ -87,7 +87,7 @@ class ZeroExAggregatorClient:
         try:
             result = self.transport.request(path="/swap/allowance-holder/" + endpoint + "?" + urlencode(query),
                 headers={"0x-api-key": self._key, "0x-version": "v2", "Accept": "application/json",
-                         "User-Agent": "smart-money-copytrader/0.1"})
+                         "User-Agent": "smart-money-copytrader/0.1"}, idempotent=True)
         except Exception as exc:
             raise ZeroExApiError("0x request failed: " + type(exc).__name__) from None
         if not isinstance(result, dict) or result.get("liquidityAvailable") is not True:

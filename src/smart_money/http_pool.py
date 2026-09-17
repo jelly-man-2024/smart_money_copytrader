@@ -31,6 +31,16 @@ def safe_exception_type(exc):
     return name if name in known else "Exception"
 
 
+# Transport failures that mean a reused keep-alive connection was closed by the
+# server before the exchange completed (the request most likely never reached it).
+# Retrying ONCE on a fresh connection is safe only for idempotent requests
+# (reads/quotes) — never for eth_sendRawTransaction, which could double-broadcast.
+_RETRYABLE_STALE_REUSE = frozenset({
+    "RemoteDisconnected", "ConnectionResetError", "ConnectionError",
+    "BrokenPipeError", "ResponseNotReady", "CannotSendRequest", "BadStatusLine",
+})
+
+
 class JsonConnectionPool:
     def __init__(self, endpoint, *, capacity=4, timeout=10, max_bytes=2*1024*1024):
         url = urlsplit(endpoint)
@@ -63,7 +73,27 @@ class JsonConnectionPool:
             self._slots.put_nowait(item)
 
     def request(self, method="GET", *, path=None, body=None, headers=None,
-                before_send=None, deadline=None):
+                before_send=None, deadline=None, idempotent=False):
+        """One HTTP call. With idempotent=True a single stale-reused-connection
+        transport failure is retried once on a fresh connection. Never enable it
+        for a non-idempotent request (e.g. eth_sendRawTransaction): a retry there
+        could broadcast the same signed transaction twice."""
+        try:
+            return self._request_once(method, path=path, body=body, headers=headers,
+                                      before_send=before_send, deadline=deadline)
+        except HttpPoolError as exc:
+            diag = exc.diagnostic or {}
+            if (idempotent and diag.get("reused") is True
+                    and diag.get("reason") == "request_failed"
+                    and diag.get("exception_type") in _RETRYABLE_STALE_REUSE):
+                # The stale connection was already discarded on failure, so this
+                # second attempt establishes a fresh one within the same deadline.
+                return self._request_once(method, path=path, body=body, headers=headers,
+                                          before_send=before_send, deadline=deadline)
+            raise
+
+    def _request_once(self, method="GET", *, path=None, body=None, headers=None,
+                      before_send=None, deadline=None):
         start = time.monotonic()
         end = min(start + self.timeout, deadline) if deadline is not None else start + self.timeout
         phase, reused, status = "pool_wait", None, None

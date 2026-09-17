@@ -59,7 +59,7 @@ class ReadOnlyRpc:
         try:
             result = self.transport.request("POST", body=body, headers={
                 "Content-Type": "application/json", "User-Agent": "smart-money-observer/0.1"},
-                deadline=self._deadline.get())
+                deadline=self._deadline.get(), idempotent=True)
             if result.get("id") != request_id:
                 raise RpcError("RPC response id mismatch")
             if "error" in result:
