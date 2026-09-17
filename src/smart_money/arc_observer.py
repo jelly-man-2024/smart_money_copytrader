@@ -401,6 +401,14 @@ async def observe_arc(rpc: ReadOnlyRpc, ws_url: str, store: Store, watchlist: di
                         await observer.observe(log)
                     except ArcCandidateRejected as exc:
                         status("arc_candidate_rejected", error_type=type(exc).__name__)
+                    except RpcError as exc:
+                        # The WSS hint can outrun the HTTPS RPC's view of the newest
+                        # block/receipt (not available yet). The hint is optional and
+                        # backfill re-covers the swap from canonical state, so defer
+                        # this one instead of tearing down the whole subscription.
+                        # A real reorg raises ArcCanonicalMismatch (not RpcError) and
+                        # still surfaces loudly.
+                        status("arc_hint_deferred", error_type=type(exc).__name__)
                 raise ConnectionError("Arc WebSocket closed")
             except asyncio.CancelledError:
                 raise
