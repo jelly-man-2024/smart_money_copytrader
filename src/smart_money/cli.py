@@ -675,6 +675,23 @@ async def monitor(args):
             await asyncio.sleep(1)
         report("live_tracking_timeout", proposal_id=proposal_id, live_trading=True)
 
+    async def verify_broadcast_outcome(proposal_id, signed_hash, follower_wallet):
+        """After a broadcast send error, chain-check whether the signed tx reached
+        the network. Returns 'broadcast', 'not_broadcast', or 'uncertain'. Read-only
+        — it NEVER re-sends. 'not_broadcast' requires BOTH the tx absent from chain
+        AND the follower pending nonce not advanced past the reserved nonce; any
+        query failure or contradiction returns 'uncertain' (caller fault-latches)."""
+        try:
+            if await rpc.call("eth_getTransactionByHash", [signed_hash]) is not None:
+                return "broadcast"
+            pending = number(await rpc.call("eth_getTransactionCount", [follower_wallet, "pending"]))
+            reservation = store.execution_nonce_reservation(proposal_id)
+        except Exception:
+            return "uncertain"
+        if reservation is None or reservation["status"] != "signed":
+            return "uncertain"
+        return "not_broadcast" if pending <= int(reservation["nonce"]) else "uncertain"
+
     async def execute_live_serialized(policy, signal, proposal_id, *, early_intent=None):
         from .execution_controls import _stop_controls
         _stop_controls()
@@ -876,9 +893,41 @@ async def monitor(args):
                 follower_wallet=policy.follower_wallet,
                 relationship_id=policy.relationship_id,
                 config_snapshot_hash=policy.snapshot_hash, **trial_send_options)
-        except Exception:
+        except Exception as exc:
+            # Layer 2: a send that failed with an uncertain transport error must not
+            # blindly fault-latch. Chain-verify whether the signed tx actually
+            # reached the network; NEVER re-send (double-broadcast guard).
+            outcome = await verify_broadcast_outcome(
+                proposal_id, reviewed.signed_tx_hash, policy.follower_wallet)
+            if outcome == "broadcast":
+                # It landed despite the send error — record and track like success.
+                stats["live_broadcast"] += 1
+                report("live_execution_send_recovered", proposal_id=proposal_id,
+                       outcome="broadcast_confirmed_onchain", tx_hash=reviewed.signed_tx_hash,
+                       error_type=type(exc).__name__, relationship_id=policy.relationship_id,
+                       live_trading=True)
+                task = asyncio.create_task(track_live(policy, proposal_id))
+                live_tracking_tasks.add(task)
+                task.add_done_callback(live_tracking_tasks.discard)
+                return
+            if outcome == "not_broadcast":
+                # Chain-verified never broadcast and the nonce is unused: release
+                # everything (no re-send) so the follower's nonce line stays intact.
+                released = store.reconcile_unbroadcast_after_send_failure(
+                    proposal_id, f"send_failed_chain_verified_unbroadcast: {type(exc).__name__}")
+                report("live_execution_send_recovered", proposal_id=proposal_id,
+                       outcome="released_unbroadcast" if released else "release_returned_false",
+                       tx_hash=reviewed.signed_tx_hash, error_type=type(exc).__name__,
+                       relationship_id=policy.relationship_id, live_trading=True)
+                if released:
+                    return
+            # uncertain, or release unexpectedly returned False -> conservative latch.
             if early_trial_id:
                 trip_execution_stop()
+            report("live_execution_send_uncertain", proposal_id=proposal_id,
+                   tx_hash=reviewed.signed_tx_hash, error_type=type(exc).__name__,
+                   operator_review_required=True, relationship_id=policy.relationship_id,
+                   live_trading=True)
             # Signed attempt/fence remains durable; do not retry with another nonce.
             raise
         stats["live_broadcast"] += 1

@@ -211,3 +211,39 @@ class OperationTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 self.store.reserve_paper_proposal(p)
         self.assertEqual(self.claims(), [])
+
+    def test_reconcile_unbroadcast_after_send_failure_releases_everything(self):
+        # Layer 2: once the caller has chain-verified the signed tx never
+        # broadcast, this releases exactly what cancel_paper_proposal conservatively
+        # refuses for a broadcast_attempted claim.
+        self.store.reserve_paper_proposal(proposal())
+        self.fake_plan()
+        self.store.mark_copy_operation_broadcast_attempted("early")
+        self.store.connection.execute("""INSERT INTO execution_attempts
+            (tx_hash,plan_id,nonce,status,public_payload) VALUES(?,'plan',0,'signed','{}')""", (TX,))
+        self.store.connection.commit()
+        with self.assertRaisesRegex(ValueError, "outcome unresolved"):
+            self.store.cancel_paper_proposal("early", "conservative")
+        self.assertTrue(self.store.reconcile_unbroadcast_after_send_failure(
+            "early", "chain_verified_unbroadcast"))
+        q = self.store.connection.execute
+        self.assertEqual(self.store.paper_proposal("early")["status"], "cancelled")
+        self.assertEqual(self.claims()[0][2], "released")
+        self.assertEqual(self.store.paper_budget(A, "USDG")["reserved_raw"], "0")
+        self.assertEqual(q("SELECT status FROM execution_plans WHERE proposal_id='early'").fetchone()[0], "cancelled")
+        self.assertEqual(q("SELECT status FROM execution_nonce_reservations WHERE proposal_id='early'").fetchone()[0], "released")
+        self.assertEqual(q("SELECT COUNT(*) FROM execution_attempts WHERE plan_id='plan'").fetchone()[0], 0)
+        # The order stays recorded as already attempted (the cancelled plan is
+        # kept for audit), so the SAME order is never copied again — the released
+        # nonce/budget are for OTHER orders, not a re-try of this same trade.
+        self.assertEqual(self.store.reserve_paper_proposal(
+            proposal("strict", trigger_mode="evidenced")),
+            (False, "copy_operation_already_claimed"))
+
+    def test_reconcile_unbroadcast_refuses_when_plan_not_signed(self):
+        self.store.reserve_paper_proposal(proposal())
+        self.fake_plan(status="prepared")
+        self.assertFalse(self.store.reconcile_unbroadcast_after_send_failure("early", "x"))
+        self.assertEqual(self.store.paper_proposal("early")["status"], "reserved")
+        self.assertEqual(self.store.connection.execute(
+            "SELECT status FROM execution_plans WHERE proposal_id='early'").fetchone()[0], "prepared")

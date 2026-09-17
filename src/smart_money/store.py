@@ -8,7 +8,7 @@ import time
 
 from . import registry as R
 from .models import Signal, Transaction, address
-from .copy_operation import CopyOperationStore
+from .copy_operation import CopyOperationStore, attribution_operation_key
 from .early_feed_lane import EarlyFeedJobStore
 from .source_position import SourcePositionStore
 
@@ -537,6 +537,93 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
                 SET status='released',nonce=?,updated_at=CURRENT_TIMESTAMP
                 WHERE reservation_id=? AND status='signed'""",
                 (released_nonce_sentinel(reservation_id), reservation_id))
+            self.connection.commit()
+            return True
+        except Exception:
+            self.connection.rollback()
+            raise
+
+    def reconcile_unbroadcast_after_send_failure(self, proposal_id: str, reason: str) -> bool:
+        """Release a signed plan whose broadcast FAILED and was chain-verified to
+        have never reached the network (tx absent, follower nonce not advanced
+        past it). The caller MUST confirm that on chain first; this NEVER re-sends.
+
+        In one transaction it deletes the lone never-observed signed attempt,
+        cancels the plan (keeping the signed hash for audit), returns the nonce to
+        the pool, releases the operation claim (even a broadcast_attempted one,
+        which the on-chain proof of no-broadcast resolves) and the budget or
+        position reservation, and cancels the proposal. Returns False if the
+        ledger is not in the expected single-signed-attempt / reserved state.
+        """
+        if not reason:
+            raise ValueError("cancellation reason is required")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            plan = self.connection.execute("""SELECT plan_id,status,nonce_reservation_id,
+                signed_tx_hash,final_review_payload FROM execution_plans WHERE proposal_id=?""",
+                (proposal_id,)).fetchone()
+            if plan is None or plan[1] != "signed" or not plan[3]:
+                self.connection.rollback()
+                return False
+            plan_id, _, reservation_id, signed_hash, review_payload = plan
+            nonce_row = self.connection.execute("""SELECT status,nonce
+                FROM execution_nonce_reservations WHERE reservation_id=?""",
+                (reservation_id,)).fetchone()
+            attempts = self.connection.execute("""SELECT tx_hash,status,replaces_tx_hash
+                FROM execution_attempts WHERE plan_id=?""", (plan_id,)).fetchall()
+            proposal = self.connection.execute(
+                "SELECT status,attribution_payload FROM paper_proposals WHERE proposal_id=?",
+                (proposal_id,)).fetchone()
+            if (nonce_row is None or nonce_row[0] != "signed" or len(attempts) != 1
+                    or attempts[0][0] != signed_hash or attempts[0][1] != "signed"
+                    or attempts[0][2] is not None
+                    or proposal is None or proposal[0] != "reserved"):
+                self.connection.rollback()
+                return False
+            released_nonce = int(nonce_row[1])
+            self.connection.execute(
+                "DELETE FROM execution_attempts WHERE plan_id=? AND tx_hash=? AND status='signed'",
+                (plan_id, signed_hash))
+            try:
+                signing_review = json.loads(review_payload) if review_payload else None
+            except (TypeError, ValueError):
+                signing_review = None
+            self.connection.execute("""UPDATE execution_plans SET status='cancelled',
+                final_review_payload=?,updated_at=CURRENT_TIMESTAMP WHERE plan_id=?""",
+                (json.dumps({"cancelled": True, "reason": reason[:300], "signed": True,
+                             "broadcast_performed": False, "chain_verified_unbroadcast": True,
+                             "signed_tx_hash_never_broadcast": signed_hash,
+                             "released_nonce": released_nonce,
+                             "released_reservation_id": reservation_id,
+                             "signing_review": signing_review}, sort_keys=True), plan_id))
+            self.connection.execute("""UPDATE execution_nonce_reservations
+                SET status='released',nonce=?,updated_at=CURRENT_TIMESTAMP
+                WHERE reservation_id=? AND status='signed'""",
+                (released_nonce_sentinel(reservation_id), reservation_id))
+            key = attribution_operation_key(json.loads(proposal[1]))
+            if key is not None:
+                self.connection.execute("""UPDATE copy_operation_claims SET status='released',
+                    updated_at=CURRENT_TIMESTAMP WHERE operation_key=? AND proposal_id=?
+                    AND status IN ('held','broadcast_attempted')""", (key, proposal_id))
+            row = self.connection.execute("""SELECT cycle_id,wallet,bucket,amount_raw
+                FROM paper_reservations WHERE proposal_id=?""", (proposal_id,)).fetchone()
+            if row is not None:
+                budget = self.connection.execute("""SELECT reserved_raw FROM paper_budgets
+                    WHERE cycle_id=? AND wallet=? AND bucket=?""", row[:3]).fetchone()
+                if budget is None or int(budget[0]) < int(row[3]):
+                    raise ValueError("reservation ledger mismatch")
+                self.connection.execute("""UPDATE paper_budgets SET reserved_raw=?
+                    WHERE cycle_id=? AND wallet=? AND bucket=?""",
+                    (str(int(budget[0]) - int(row[3])), *row[:3]))
+                self.connection.execute("""UPDATE paper_reservations SET status='released',
+                    updated_at=CURRENT_TIMESTAMP WHERE proposal_id=?""", (proposal_id,))
+            else:
+                self.connection.execute("""UPDATE paper_position_reservations
+                    SET status='released' WHERE proposal_id=? AND status='active'""",
+                    (proposal_id,))
+            self.connection.execute("""UPDATE paper_proposals SET status='cancelled',
+                rejection_reason=?,updated_at=CURRENT_TIMESTAMP WHERE proposal_id=?""",
+                (reason, proposal_id))
             self.connection.commit()
             return True
         except Exception:
