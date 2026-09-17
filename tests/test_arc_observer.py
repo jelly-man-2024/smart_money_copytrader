@@ -10,9 +10,10 @@ from eth_abi import encode
 from eth_utils import keccak
 
 from smart_money import registry as R
+from smart_money.receipts import SWAPS
 from smart_money.arc_observer import (
-    ARC_CURSOR, ARC_SWAP_TOPIC, ArcCanonicalMismatch, ArcObserver,
-    ArcSwapSubscriber, arc_backfill_once, validate_arc_swap_log,
+    ARC_CURSOR, ArcCandidateRejected, ArcCanonicalMismatch, ArcObserver,
+    ArcWalletSubscriber, arc_backfill_once, validate_arc_transfer_log, wallet_topic,
 )
 from smart_money.decode import CALLS, POOL_KEY, Decoder
 from smart_money.models import Transaction
@@ -20,6 +21,7 @@ from smart_money.receipts import TRANSFER
 from smart_money.store import Store
 
 
+ARC_V4_SWAP_TOPIC = next(t for t, protocol in SWAPS.items() if protocol == "v4")
 WALLET = "0x" + "11" * 20
 TOKEN = "0x" + "44" * 20
 TX_HASH = "0x" + "aa" * 32
@@ -44,7 +46,7 @@ def arc_swap_calldata() -> bytes:
         ["bytes", "bytes[]", "uint256"], [b"\x10", [actions], 2_000_000_000])
 
 
-def hint() -> dict:
+def swap_log() -> dict:
     return {
         "address": R.ARC.v4_manager,
         "transactionHash": TX_HASH,
@@ -52,11 +54,16 @@ def hint() -> dict:
         "blockNumber": "0x10",
         "logIndex": "0x0",
         "removed": False,
-        "topics": [ARC_SWAP_TOPIC, POOL_ID, address_topic(R.ARC.universal_router)],
+        "topics": [ARC_V4_SWAP_TOPIC, POOL_ID, address_topic(R.ARC.universal_router)],
         "data": "0x" + encode(
             ["int128", "int128", "uint160", "uint128", "int24", "uint24"],
             [100, -95, 1, 1, 0, 0]).hex(),
     }
+
+
+def hint(**overrides) -> dict:
+    """What now triggers ingestion: the watched wallet's own token credit."""
+    return {**transfer(TOKEN, R.ARC.v4_manager, WALLET, 95, 2), **overrides}
 
 
 def transfer(token: str, sender: str, recipient: str, amount: int, index: int) -> dict:
@@ -79,7 +86,7 @@ class FakeRpc:
         self.block_calls = 0
         self.trace_calls = 0
         self.prestate = {}
-        swap = hint()
+        swap = swap_log()
         self.transaction_receipt = {
             "transactionHash": TX_HASH, "blockHash": BLOCK_HASH,
             "blockNumber": "0x10", "status": "0x1", "gasUsed": "0x1",
@@ -108,8 +115,10 @@ class FakeRpc:
         raise AssertionError(f"unexpected RPC method {method}")
 
     async def receipt(self, tx_hash):
+        # Another transaction in the same block gets its own receipt, which does
+        # not carry this transaction's logs.
         if tx_hash != TX_HASH:
-            raise AssertionError("wrong receipt hash")
+            return {**self.transaction_receipt, "transactionHash": tx_hash, "logs": []}
         return self.transaction_receipt
 
 
@@ -118,6 +127,7 @@ class BackfillRpc(FakeRpc):
         super().__init__()
         self.latest = 15
         self.logs = []
+        self.log_filters = []
         self.headers = {
             15: {"number": "0xf", "hash": "0x" + "cc" * 32,
                  "parentHash": "0x" + "dd" * 32, "transactions": []},
@@ -132,7 +142,7 @@ class BackfillRpc(FakeRpc):
         if method == "eth_getBlockByNumber":
             return self.headers[int(params[0], 16)]
         if method == "eth_getLogs":
-            self.last_log_filter = params[0]
+            self.log_filters.append(params[0])
             return self.logs
         return await super().call(method, params)
 
@@ -179,15 +189,38 @@ class ArcObserverTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
-    async def test_unwatched_sender_is_not_a_candidate(self):
+    async def test_transfer_touching_no_watched_wallet_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             store = Store(Path(directory) / "arc.sqlite3")
             try:
-                signals = await ArcObserver(FakeRpc(), store, {}).observe(hint())
-                self.assertEqual(signals, [])
+                with self.assertRaisesRegex(ValueError, "watched wallet"):
+                    await ArcObserver(FakeRpc(), store, {}).observe(hint())
                 self.assertEqual(store.candidate_counts()["pending"], 0)
             finally:
                 store.close()
+
+    async def test_delivery_sent_by_someone_else_is_still_a_candidate(self):
+        # A cross-chain Relay fill, an airdrop or a router refund is sent by a
+        # third party. The old sender gate dropped all of them; the wallet is
+        # matched on the Transfer instead, and attribution stays with enrich.
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory) / "arc.sqlite3")
+            rpc = FakeRpc()
+            rpc.transaction = {**rpc.transaction, "from": "0x" + "77" * 20}
+            rpc.transactions = [rpc.transaction]
+            try:
+                signals = await ArcObserver(rpc, store, {WALLET: {}}).observe(hint())
+                self.assertTrue(signals)
+                self.assertTrue(all(s.wallet == WALLET for s in signals))
+                self.assertEqual(store.candidate_counts()["complete"], 1)
+            finally:
+                store.close()
+
+    def test_erc721_transfer_shape_is_not_a_fungible_candidate(self):
+        value = hint()
+        value["topics"] = value["topics"] + ["0x" + "00" * 31 + "07"]
+        with self.assertRaisesRegex(ValueError, "not an ERC-20 Transfer"):
+            validate_arc_transfer_log(value, {WALLET: {}})
 
     async def test_live_logs_share_one_full_block_rpc_lookup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -202,7 +235,11 @@ class ArcObserverTests(unittest.IsolatedAsyncioTestCase):
             observer = ArcObserver(rpc, store, {WALLET: {}})
             try:
                 await observer.observe(hint())
-                self.assertEqual(await observer.observe(other_hint), [])
+                # The second hint names a different transaction in the same
+                # block, whose receipt does not carry this log: it is refused,
+                # but the block itself was only fetched once.
+                with self.assertRaises(ArcCandidateRejected):
+                    await observer.observe(other_hint)
                 self.assertEqual(rpc.block_calls, 1)
             finally:
                 store.close()
@@ -272,7 +309,7 @@ class ArcObserverTests(unittest.IsolatedAsyncioTestCase):
         value = hint()
         value["removed"] = True
         with self.assertRaisesRegex(ValueError, "canonical rescan"):
-            validate_arc_swap_log(value)
+            validate_arc_transfer_log(value, {WALLET: {}})
 
 
 class ArcBackfillTests(unittest.IsolatedAsyncioTestCase):
@@ -294,10 +331,14 @@ class ArcBackfillTests(unittest.IsolatedAsyncioTestCase):
                                   progress["logs"], progress["rejected"]),
                                  (16, 16, 1, 0))
                 self.assertEqual(store.chain_cursor(ARC_CURSOR), (16, BLOCK_HASH))
-                self.assertEqual(rpc.last_log_filter, {
-                    "fromBlock": "0x10", "toBlock": "0x10",
-                    "address": R.ARC.v4_manager, "topics": [ARC_SWAP_TOPIC],
-                })
+                # Both directions are asked for, scoped to the watchlist and
+                # to no particular token or venue.
+                self.assertEqual(rpc.log_filters[-2:], [
+                    {"fromBlock": "0x10", "toBlock": "0x10",
+                     "topics": [TRANSFER, [wallet_topic(WALLET)], None]},
+                    {"fromBlock": "0x10", "toBlock": "0x10",
+                     "topics": [TRANSFER, None, [wallet_topic(WALLET)]]},
+                ])
                 payload = json.loads(store.connection.execute(
                     "SELECT payload FROM signals").fetchone()[0])
                 self.assertEqual(payload["canonical_status"], "safe_head_confirmed")
@@ -335,6 +376,7 @@ class Socket:
 
     async def send(self, raw):
         self.request = json.loads(raw)
+        self.requests = getattr(self, "requests", []) + [self.request]
 
     async def recv(self):
         return next(self.messages)
@@ -350,22 +392,43 @@ class Socket:
 
 
 class ArcSubscriberTests(unittest.IsolatedAsyncioTestCase):
-    async def test_subscribes_only_to_manager_swap_and_deduplicates_transaction(self):
-        notification = json.dumps({
+    async def test_subscribes_to_both_wallet_directions_and_deduplicates(self):
+        # One swap puts the wallet on both sides, so it arrives on both
+        # subscriptions and must be ingested once.
+        outgoing = json.dumps({
             "jsonrpc": "2.0", "method": "eth_subscription",
-            "params": {"subscription": "0xsub", "result": hint()},
+            "params": {"subscription": "0xsub1",
+                       "result": transfer(R.ARC.usdc_erc20, WALLET, TOKEN, 100, 1)},
+        })
+        incoming = json.dumps({
+            "jsonrpc": "2.0", "method": "eth_subscription",
+            "params": {"subscription": "0xsub2", "result": hint()},
         })
         socket = Socket([
-            json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xsub"}),
-            notification, notification,
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xsub1"}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "result": "0xsub2"}),
+            outgoing, incoming,
         ])
         with patch("smart_money.arc_observer.websockets.connect", return_value=socket):
-            logs = [item async for item in ArcSwapSubscriber("wss://arc.example").logs()]
+            logs = [item async for item in
+                    ArcWalletSubscriber("wss://arc.example", {WALLET: {}}).logs()]
         self.assertEqual(len(logs), 1)
-        self.assertEqual(socket.request["method"], "eth_subscribe")
-        self.assertEqual(socket.request["params"][1], {
-            "address": R.ARC.v4_manager, "topics": [ARC_SWAP_TOPIC],
-        })
+        self.assertEqual([item["params"][1] for item in socket.requests], [
+            {"topics": [TRANSFER, [wallet_topic(WALLET)], None]},
+            {"topics": [TRANSFER, None, [wallet_topic(WALLET)]]},
+        ])
+
+    async def test_a_log_for_an_unknown_subscription_is_refused(self):
+        socket = Socket([
+            json.dumps({"jsonrpc": "2.0", "id": 1, "result": "0xsub1"}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "result": "0xsub2"}),
+            json.dumps({"jsonrpc": "2.0", "method": "eth_subscription",
+                        "params": {"subscription": "0xother", "result": hint()}}),
+        ])
+        with patch("smart_money.arc_observer.websockets.connect", return_value=socket):
+            with self.assertRaisesRegex(ValueError, "subscription identity mismatch"):
+                [item async for item in
+                 ArcWalletSubscriber("wss://arc.example", {WALLET: {}}).logs()]
 
 
 if __name__ == "__main__":

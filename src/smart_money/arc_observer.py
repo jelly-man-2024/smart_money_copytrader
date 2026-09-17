@@ -1,8 +1,16 @@
-"""Read-only Arc mainnet Swap-log ingestion.
+"""Read-only Arc mainnet ingestion, triggered by watched wallets' token moves.
 
-The WebSocket is only a low-latency hint.  Every candidate is re-read through
-the allowlisted HTTPS RPC client, decoded from transaction calldata, and
-checked against its canonical receipt before any signal is persisted.
+Arc is subscribed by WALLET, not by venue: the ERC-20 Transfer topics carry the
+sender and recipient as indexed fields, so the RPC filters server-side for the
+watchlist and a whole chain of swaps never reaches us. Measured over 1500 Arc
+blocks this is ~18 logs against 13752 for the v3 and v4 swap streams together,
+it covers every venue at once including the v3 forks that have no singleton
+contract to filter on, and it still sees a cross-chain Relay delivery, which
+emits a Transfer but no swap of ours.
+
+The WebSocket is only a low-latency hint. Every candidate is re-read through the
+allowlisted HTTPS RPC client, decoded from transaction calldata, and checked
+against its canonical receipt before any signal is persisted.
 """
 from __future__ import annotations
 
@@ -20,15 +28,16 @@ from .decode import Decoder
 from .models import Signal, Transaction, address, number
 from .native_flows import verify_native_flows
 from .pools import verify_signal_pools
-from .receipts import SWAPS, enrich
+from .receipts import TRANSFER, enrich
 from .rpc import ReadOnlyRpc, RpcError
 from .store import Store
 
 
-ARC_SWAP_TOPIC = next(topic for topic, protocol in SWAPS.items() if protocol == "v4")
 MAX_SEEN_TRANSACTIONS = 8192
 MAX_CACHED_BLOCKS = 64
-ARC_CURSOR = "arc_v4"
+# The cursor is named for what it now scans; an older "arc_v4" cursor is left
+# behind rather than resumed, because it indexed a different filter.
+ARC_CURSOR = "arc_wallet_transfers"
 
 
 class ArcCandidateRejected(ValueError):
@@ -48,8 +57,18 @@ def validate_arc_ws_url(url: str) -> str:
     raise ValueError("Arc WebSocket must use WSS, except on localhost")
 
 
-def validate_arc_swap_log(value: object) -> dict:
-    """Validate the untrusted subscription payload before using any identity."""
+def wallet_topic(wallet: str) -> str:
+    """A wallet address as an indexed 32-byte log topic."""
+    return "0x" + "0" * 24 + address(wallet)[2:]
+
+
+def validate_arc_transfer_log(value: object, watchlist: dict) -> tuple[dict, list[str]]:
+    """Validate the untrusted payload and name the watched wallets it touches.
+
+    Returns the log and the watchlist wallets appearing in it. A provider that
+    ignored our filter, or a token that reuses the Transfer topic with a
+    different shape, is rejected rather than trusted.
+    """
     if not isinstance(value, dict) or value.get("removed") is True:
         if isinstance(value, dict) and value.get("removed") is True:
             raise ValueError("removed Arc log requires canonical rescan")
@@ -57,12 +76,24 @@ def validate_arc_swap_log(value: object) -> dict:
     required = ("address", "transactionHash", "blockHash", "blockNumber", "logIndex", "topics")
     if any(key not in value for key in required):
         raise ValueError("incomplete Arc log")
-    if address(value["address"]) != R.ARC.v4_manager:
-        raise ValueError("Arc log is not from the configured v4 manager")
+    address(value["address"])
     topics = value["topics"]
-    if (not isinstance(topics, list) or len(topics) < 2
-            or not isinstance(topics[0], str) or topics[0].lower() != ARC_SWAP_TOPIC):
-        raise ValueError("Arc log is not a v4 Swap")
+    # Exactly three topics is the ERC-20 shape (from, to indexed; value is not).
+    # An ERC-721 Transfer indexes the token id as a fourth topic and is not a
+    # fungible balance change, so it is not a candidate here.
+    if (not isinstance(topics, list) or len(topics) != 3
+            or not all(isinstance(item, str) for item in topics)
+            or topics[0].lower() != TRANSFER):
+        raise ValueError("Arc log is not an ERC-20 Transfer")
+    wallets = []
+    for topic in topics[1:]:
+        if len(topic) != 66 or not topic.startswith("0x") or int(topic[2:26], 16) != 0:
+            raise ValueError("invalid Arc Transfer party topic")
+        party = "0x" + topic[-40:].lower()
+        if party in watchlist and party not in wallets:
+            wallets.append(party)
+    if not wallets:
+        raise ValueError("Arc Transfer does not touch a watched wallet")
     for field in ("transactionHash", "blockHash"):
         item = value[field]
         if (not isinstance(item, str) or len(item) != 66 or not item.startswith("0x")):
@@ -70,14 +101,21 @@ def validate_arc_swap_log(value: object) -> dict:
         int(item[2:], 16)
     number(value["blockNumber"])
     number(value["logIndex"])
-    return value
+    return value, wallets
 
 
-class ArcSwapSubscriber:
-    """One-purpose WSS subscriber with bounded duplicate suppression."""
+class ArcWalletSubscriber:
+    """WSS subscriber scoped to the watchlist, with duplicate suppression.
 
-    def __init__(self, url: str):
+    Two subscriptions are needed because one filter cannot express "the wallet
+    is the sender OR the recipient": a topic list constrains one position. A
+    swap shows the wallet on both sides and arrives twice, which the per
+    transaction suppression collapses.
+    """
+
+    def __init__(self, url: str, watchlist: dict):
         self.url = validate_arc_ws_url(url)
+        self.watchlist = watchlist
         self._seen_order: deque[str] = deque()
         self._seen: set[str] = set()
 
@@ -91,26 +129,31 @@ class ArcSwapSubscriber:
             self._seen.remove(self._seen_order.popleft())
         return True
 
+    def _filters(self) -> list[dict]:
+        parties = [wallet_topic(wallet) for wallet in sorted(self.watchlist)]
+        if not parties:
+            raise ValueError("Arc subscription requires a watchlist")
+        return [{"topics": [TRANSFER, parties, None]},
+                {"topics": [TRANSFER, None, parties]}]
+
     async def logs(self) -> AsyncIterator[dict]:
         async with websockets.connect(
                 self.url, open_timeout=15, close_timeout=5,
                 max_size=1024 * 1024, max_queue=256, ping_interval=20,
                 ping_timeout=20) as socket:
-            request = {
-                "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
-                "params": ["logs", {
-                    "address": R.ARC.v4_manager,
-                    "topics": [ARC_SWAP_TOPIC],
-                }],
-            }
-            await socket.send(json.dumps(request, separators=(",", ":")))
-            acknowledgement = json.loads(await socket.recv())
-            if (not isinstance(acknowledgement, dict)
-                    or acknowledgement.get("id") != 1
-                    or not isinstance(acknowledgement.get("result"), str)
-                    or not acknowledgement["result"]):
-                raise ValueError("invalid Arc subscription acknowledgement")
-            subscription = acknowledgement["result"]
+            subscriptions = set()
+            for index, log_filter in enumerate(self._filters(), start=1):
+                await socket.send(json.dumps({
+                    "jsonrpc": "2.0", "id": index, "method": "eth_subscribe",
+                    "params": ["logs", log_filter]}, separators=(",", ":")))
+                acknowledgement = json.loads(await socket.recv())
+                if (not isinstance(acknowledgement, dict)
+                        or acknowledgement.get("id") != index
+                        or not isinstance(acknowledgement.get("result"), str)
+                        or not acknowledgement["result"]
+                        or acknowledgement["result"] in subscriptions):
+                    raise ValueError("invalid Arc subscription acknowledgement")
+                subscriptions.add(acknowledgement["result"])
             async for raw in socket:
                 document = json.loads(raw)
                 if (not isinstance(document, dict)
@@ -118,9 +161,10 @@ class ArcSwapSubscriber:
                     raise ValueError("unexpected Arc WebSocket message")
                 params = document.get("params")
                 if (not isinstance(params, dict)
-                        or params.get("subscription") != subscription):
+                        or params.get("subscription") not in subscriptions):
                     raise ValueError("Arc subscription identity mismatch")
-                log = validate_arc_swap_log(params.get("result"))
+                log, _wallets = validate_arc_transfer_log(
+                    params.get("result"), self.watchlist)
                 if self._first_transaction_log(log):
                     yield log
 
@@ -208,7 +252,8 @@ class ArcObserver:
     def _receipt_contains_hint(receipt: dict, hint: dict) -> bool:
         expected = (
             hint["transactionHash"].lower(), hint["blockHash"].lower(),
-            number(hint["logIndex"]), R.ARC.v4_manager, ARC_SWAP_TOPIC,
+            number(hint["logIndex"]), address(hint["address"]),
+            hint["topics"][0].lower(),
         )
         for item in receipt.get("logs", []):
             topics = item.get("topics", []) if isinstance(item, dict) else []
@@ -226,7 +271,7 @@ class ArcObserver:
 
     async def observe(self, hint: dict,
                       raw_transaction: dict | None = None) -> list[Signal]:
-        hint = validate_arc_swap_log(hint)
+        hint, _wallets = validate_arc_transfer_log(hint, self.watchlist)
         tx_hash = hint["transactionHash"].lower()
         async with self._lock:
             if tx_hash in self._processed:
@@ -244,9 +289,10 @@ class ArcObserver:
                 raise ArcCandidateRejected("invalid Arc transaction") from exc
             if tx.hash != tx_hash or tx.chain_id != R.ARC.chain_id:
                 raise ArcCandidateRejected("Arc transaction identity mismatch")
-            if tx.sender not in self.watchlist:
-                self._remember(tx_hash)
-                return []
+            # No sender gate: the wallet was matched on the Transfer itself, and a
+            # cross-chain Relay delivery or a router refund is sent by somebody
+            # else entirely. Attribution stays with enrich, which reads each
+            # watched wallet's own balance changes out of the receipt.
 
             self.store.put_candidate(tx)
             try:
@@ -322,16 +368,32 @@ async def arc_backfill_once(rpc: ReadOnlyRpc, store: Store, observer: ArcObserve
                     "to_block": cursor[0], "logs": 0, "rejected": 0}
         start = cursor[0] + 1
         end = min(latest, start + batch_size - 1)
-    raw_logs = await rpc.call("eth_getLogs", [{
-        "fromBlock": hex(start), "toBlock": hex(end),
-        "address": R.ARC.v4_manager, "topics": [ARC_SWAP_TOPIC],
-    }])
-    if not isinstance(raw_logs, list):
-        raise ValueError("invalid Arc eth_getLogs result")
-    logs = sorted(
-        (validate_arc_swap_log(item) for item in raw_logs),
-        key=lambda item: (number(item["blockNumber"]), number(item["logIndex"])),
-    )
+    # Same wallet filter as the subscription, applied server-side: the canonical
+    # lane reads a handful of logs per batch instead of every swap on the chain,
+    # so a batch cannot outgrow the transport's response limit however busy Arc
+    # is, and falling behind never becomes unrecoverable.
+    parties = [wallet_topic(wallet) for wallet in sorted(observer.watchlist)]
+    if not parties:
+        raise ValueError("Arc backfill requires a watchlist")
+    raw_logs = []
+    for topics in ([TRANSFER, parties, None], [TRANSFER, None, parties]):
+        batch = await rpc.call("eth_getLogs", [{
+            "fromBlock": hex(start), "toBlock": hex(end), "topics": topics,
+        }])
+        if not isinstance(batch, list):
+            raise ValueError("invalid Arc eth_getLogs result")
+        raw_logs.extend(batch)
+    seen_positions = set()
+    logs = []
+    for item in raw_logs:
+        validated, _wallets = validate_arc_transfer_log(item, observer.watchlist)
+        # A swap puts the wallet on both sides, so the two directions overlap.
+        position = (number(validated["blockNumber"]), number(validated["logIndex"]))
+        if position in seen_positions:
+            continue
+        seen_positions.add(position)
+        logs.append(validated)
+    logs.sort(key=lambda item: (number(item["blockNumber"]), number(item["logIndex"])))
     rejected = 0
     by_block: dict[int, list[dict]] = {}
     for log in logs:
@@ -395,7 +457,7 @@ async def observe_arc(rpc: ReadOnlyRpc, ws_url: str, store: Store, watchlist: di
         while True:
             try:
                 status("arc_ws_connecting")
-                async for log in ArcSwapSubscriber(ws_url).logs():
+                async for log in ArcWalletSubscriber(ws_url, watchlist).logs():
                     failures = 0
                     try:
                         await observer.observe(log)
