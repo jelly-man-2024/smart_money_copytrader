@@ -1610,10 +1610,13 @@ def parser():
         help="Select an explicitly operator-started bounded trial; never creates or renews one")
     run_parser.add_argument("--legacy-preflight", action="store_true",
         help="Disable process-local preflight reuse; retain independent sign/review RPC checks")
+    run_parser.add_argument("--backfill-interval", type=float, default=1.0,
+        help="Seconds between backfill catch-up scans; higher means fewer RPC calls "
+             "(backfill only tops up the real-time Feed, so a larger value is cheap)")
     run_parser.set_defaults(
         watchlist="data/fomo_watchlist.csv", db="var/observer.sqlite3",
         workers=2, queue_size=256, confirmations=2, backfill_batch=2000,
-        backfill_interval=1.0, relay_auto_associate=True,
+        relay_auto_associate=True,
         paper_config=None, paper_mysql=True,
         paper_cycle_action="auto", paper_cycle_id=None,
         paper_cycle_reason=None, ledger_mysql=True,
