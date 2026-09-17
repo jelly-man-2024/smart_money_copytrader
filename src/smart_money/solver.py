@@ -33,6 +33,11 @@ def _request_identity(request: dict) -> tuple[str, str]:
 
 def relay_delivery_evidence(document: dict, deposit: Signal) -> list[dict]:
     """Validate order/source identity; API success is not destination-chain finality."""
+    if deposit.chain_id != R.CHAIN_ID:
+        # Our own Relay deposits exist only on Robinhood Chain: no other chain
+        # has a verified depository here. Refuse rather than compare against
+        # another chain's address and fail for an unrelated reason.
+        raise ValueError("relay deposits are only evidenced on Robinhood Chain")
     request = _request(document)
     order_id = deposit.evidence.get("order_id")
     if (deposit.behavior != "INTENT_DEPOSIT"
@@ -92,6 +97,20 @@ def relay_delivery_evidence(document: dict, deposit: Signal) -> list[dict]:
     if len(result) != 1:
         raise ValueError("relay destination delivery not uniquely evidenced")
     return result
+
+
+def _funding_normalization(chain, local_input: str, source_currency: str) -> str:
+    """Name the assumption behind treating source funding as the local asset.
+
+    Robinhood converts Solana USDC into USDG, two different assets, which the
+    operator approved. Arc settles in USDC itself at the same six decimals as
+    the source, so there the mapping only renames the asset and keeps the scale.
+    """
+    if local_input == source_currency:
+        return "identity"
+    if chain.chain_id == R.CHAIN_ID:
+        return "solana_usdc_6_to_robinhood_usdg_6_operator_approved"
+    return f"relay_source_currency_to_chain_{chain.chain_id}_settlement_asset"
 
 
 def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
@@ -186,8 +205,11 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
     if len(matching_payments) != 1:
         raise ValueError("relay order output does not uniquely authorize the wallet credit")
 
-    local_input = (R.USDG if (origin_chain, source_currency)
-                   in R.RELAY_USDG_EQUIVALENTS else source_currency)
+    chain = R.chain_for(candidate.chain_id)
+    settlement = chain.settlement_asset
+    local_input = (settlement if settlement is not None
+                   and (origin_chain, source_currency) in chain.relay_usdg_equivalents
+                   else source_currency)
     result = deepcopy(candidate)
     result.behavior = "BUY"
     result.stage = "relay_buy_evidenced"
@@ -203,9 +225,7 @@ def relay_passive_buy(document: dict, candidate: Signal) -> Signal:
         "relay_request_id": request_id, "source_chain_id": str(origin_chain),
         "source_currency": source_currency, "source_tx_hash": source_tx,
         "source_payer": request_user, "local_funding_asset": local_input,
-        "funding_normalization": (
-            "solana_usdc_6_to_robinhood_usdg_6_operator_approved"
-            if local_input == R.USDG and source_currency != R.USDG else "identity"),
+        "funding_normalization": _funding_normalization(chain, local_input, source_currency),
         "destination_tx_hash": candidate.tx_hash,
         "actual_input_debit_raw": str(amount_in),
         "actual_output_credit_raw": str(amount_out),
@@ -228,6 +248,8 @@ def relay_confirmed_sell(document: dict, candidate: Signal) -> Signal:
     equal the local evidence is accepted; several users can share one bundled
     transaction, so the response is filtered rather than assumed unique.
     """
+    if candidate.chain_id != R.CHAIN_ID:
+        raise ValueError("relay sells are only evidenced on Robinhood Chain")
     if (candidate.behavior != "SELL" or candidate.stage != "needs_review"
             or candidate.protocol not in {"0x", "kyber"}
             or candidate.evidence.get("source_orchestrator") != "relay"

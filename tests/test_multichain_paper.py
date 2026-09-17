@@ -44,15 +44,21 @@ class ChainScopedBudgetTests(unittest.TestCase):
 class ChainScopedRouteTests(unittest.TestCase):
     def test_aggregator_routers_only_expose_what_the_chain_has(self):
         self.assertEqual(set(aggregator_routers(R.CHAIN_ID)), {"kyber", "zeroex"})
-        # 0x does not serve Arc, and no Arc Kyber router is registered yet, so Arc
-        # exposes no aggregator rather than borrowing Robinhood's routers.
-        self.assertEqual(aggregator_routers(R.ARC.chain_id), {})
+        # 0x routes Arc (its AllowanceHolder is deployed there with the same
+        # bytecode), but no Arc Kyber router is registered yet, so Arc exposes
+        # 0x only rather than borrowing Robinhood's Kyber router.
+        self.assertEqual(aggregator_routers(R.ARC.chain_id),
+                         {"zeroex": R.ARC.zero_x_allowance_holder})
+        self.assertEqual(R.ARC.zero_x_allowance_holder, R.ZERO_X_ALLOWANCE_HOLDER)
 
     def test_aggregator_route_on_a_chain_without_that_router_is_refused(self):
         definition = aggregator_route_definition(R.USDG, TOKEN, "kyber", R.CHAIN_ID)
         self.assertEqual(definition["router"], R.KYBER_META_AGGREGATION_ROUTER_V2)
         with self.assertRaisesRegex(ValueError, "5042 has no kyber router"):
             aggregator_route_definition(R.ARC.usdc_erc20, TOKEN, "kyber", R.ARC.chain_id)
+        arc_zeroex = aggregator_route_definition(
+            R.ARC.usdc_erc20, TOKEN, "zeroex", R.ARC.chain_id)
+        self.assertEqual(arc_zeroex["router"], R.ARC.zero_x_allowance_holder)
 
     def test_arc_v4_execution_route_uses_the_arc_quoter_contract(self):
         signal = signal_on(R.ARC.chain_id, R.ARC.usdc_erc20)

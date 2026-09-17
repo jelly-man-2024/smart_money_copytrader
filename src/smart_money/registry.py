@@ -30,6 +30,11 @@ class ChainRegistry:
     name: str
     # --- Assets ---
     weth: str | None = None            # canonical wrapped native (RH); Arc has none
+    # A chain's native asset has two scales when its ERC-20 form differs: Arc's
+    # gas asset is USDC at 18 decimals natively and 6 through the enshrined
+    # ERC-20. Robinhood's ETH/WETH are both 18, so its divisor is 1.
+    native_decimals: int = 18
+    native_erc20_decimals: int = 18
     usdg: str | None = None            # RH settlement stablecoin
     usdc_erc20: str | None = None      # Arc enshrined USDC ERC-20 (6 decimals)
     quote_assets: frozenset[str] = frozenset()
@@ -64,6 +69,18 @@ class ChainRegistry:
     okx_approval: str | None = None
     permit2: str | None = None
 
+
+    @property
+    def native_to_erc20_divisor(self) -> int:
+        """Scale factor between the native and ERC-20 forms of the native asset."""
+        if self.native_decimals < self.native_erc20_decimals:
+            raise ValueError(f"chain {self.chain_id} has an inverted native scale")
+        return 10 ** (self.native_decimals - self.native_erc20_decimals)
+
+    @property
+    def settlement_asset(self) -> str | None:
+        """The chain's quote/settlement stablecoin (RH: USDG; Arc: USDC)."""
+        return self.usdg if self.usdg is not None else self.usdc_erc20
 
     @property
     def native_erc20(self) -> str | None:
@@ -133,6 +150,8 @@ ARC = ChainRegistry(
     weth=None,
     usdg=None,
     usdc_erc20="0x3600000000000000000000000000000000000000",
+    native_decimals=18,
+    native_erc20_decimals=6,
     quote_assets=frozenset({NATIVE, "0x3600000000000000000000000000000000000000"}),
     # Arc watchlist audit at block 0x143122e found 18 EIP-7702 delegations,
     # all pointing at the canonical ERC-4337 Simple7702Account deployment;
@@ -156,15 +175,30 @@ ARC = ChainRegistry(
     v4_position_descriptor="0x516b8a945700d6bbfdedaa6dcfc4586ba60b8707",
     known_v4_hook_code_hashes={},
     position_managers=frozenset({"0x6049c9a0e26405c0985f9e3685c87d0ae917f82b"}),
-    # No cross-chain solver on Arc.
-    relay_proxy=None,
-    relay_router=None,
+    # Relay IS deployed on Arc, at the same addresses as Robinhood Chain and
+    # with byte-identical code (verified 2026-09-17 by comparing keccak of
+    # eth_getCode on both chains); Relay's public API lists chain 5042 with
+    # depositEnabled, and lookup_by_destination_hash resolves real Arc
+    # deliveries. The depository at 0x4cd00e38… is NOT the same contract here
+    # (same code length, different hash), so it stays unset until verified.
+    relay_proxy="0xccc88a9d1b4ed6b0eaba998850414b24f1c315be",
+    relay_router="0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
     depository=None,
     ripe_claim=None,
-    relay_usdg_equivalents=frozenset(),
-    # Execution venues: 0x does not list Arc yet; Kyber's aggregator uses the
-    # "arc" chain slug (router address confirmed in Phase 3). OKX not present.
-    zero_x_allowance_holder=None,
+    relay_usdg_equivalents=frozenset({
+        # Relay's Solana chain id and canonical USDC mint. Arc settles in USDC
+        # at six decimals and so does Solana, so this funding normalization is
+        # an identity of scale, not an operator-approved conversion.
+        (792703809, "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+    }),
+    # Execution venues: 0x lists chain 5042 and routes it live (verified
+    # 2026-09-17: /sources returns 16 Arc sources, and 6/6 probed active Arc
+    # tokens quoted with liquidity through Uniswap_V4). AllowanceHolder sits at
+    # the same universal address as on Robinhood Chain AND its bytecode hash
+    # matches, so this is the same contract, not a CREATE2 namesake.
+    # Kyber's aggregator uses the "arc" chain slug (router address confirmed in
+    # Phase 3). OKX not present.
+    zero_x_allowance_holder="0x0000000000001ff3684f28c67538d4d072c22734",
     kyber_router=None,
     kyber_chain_slug="arc",
     okx_router=None,

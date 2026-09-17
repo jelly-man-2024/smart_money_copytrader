@@ -1,5 +1,6 @@
 """Quoting resolves venues from the signal's chain, never from a pinned chain."""
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -80,3 +81,37 @@ class ChainResolutionTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ZeroExChainTests(unittest.IsolatedAsyncioTestCase):
+    """0x serves several chains from one endpoint, so chainId must be per request."""
+
+    def test_query_carries_the_requested_chain_and_its_router(self):
+        from smart_money.zeroex import ZeroExAggregatorClient as Client
+        arc = Client._query(R.ARC.usdc_erc20, TOKEN, "1000000", R.ARC.chain_id)
+        self.assertEqual(arc["chainId"], R.ARC.chain_id)
+        self.assertEqual(Client.router_for(R.ARC.chain_id), R.ARC.zero_x_allowance_holder)
+        rh = Client._query(R.USDG, TOKEN, "1000000", R.CHAIN_ID)
+        self.assertEqual(rh["chainId"], R.CHAIN_ID)
+
+    def test_a_chain_0x_does_not_serve_is_refused_before_the_request(self):
+        from smart_money.zeroex import ZeroExAggregatorClient as Client, ZeroExApiError
+        unserved = R.ChainRegistry(chain_id=7777, name="unserved")
+        with unittest.mock.patch.dict(R.CHAINS, {7777: unserved}):
+            with self.assertRaisesRegex(ZeroExApiError, "no router for chain 7777"):
+                Client._query(R.USDG, TOKEN, "1000000", 7777)
+
+    async def test_live_quoter_asks_0x_about_the_signal_chain(self):
+        from smart_money.quotes import LiveQuoter
+        seen = {}
+
+        class FakeZeroEx:
+            async def route(self, token_in, token_out, amount, *, chain_id):
+                seen["chain_id"] = chain_id
+                raise RuntimeError("stop after the chain is bound")
+
+        quoter = LiveQuoter(SimpleNamespace(call=AsyncMock()), {"zeroex": FakeZeroEx()})
+        signal = swap_signal(R.ARC.chain_id, "zeroex")
+        with self.assertRaises(RuntimeError):
+            await quoter._request_route(signal, "1000000")
+        self.assertEqual(seen["chain_id"], R.ARC.chain_id)

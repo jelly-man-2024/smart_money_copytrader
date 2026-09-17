@@ -18,7 +18,7 @@ from eth_utils import keccak
 from .http_pool import JsonConnectionPool
 from .kyber import KyberRoute, KyberSwapTransaction, _raw_uint
 from .models import address
-from .registry import CHAIN_ID, NATIVE, ZERO_X_ALLOWANCE_HOLDER
+from .registry import NATIVE, ZERO_X_ALLOWANCE_HOLDER, chain_for
 
 SETTLER_REGISTRY = "0x00000000000004533fe15556b1e086bb1a72ceae"
 EXEC_TYPES = ["address", "address", "uint256", "address", "bytes"]
@@ -74,6 +74,14 @@ class ZeroExAggregatorClient:
     name = "zeroex"
     router = ZERO_X_ALLOWANCE_HOLDER
 
+    @staticmethod
+    def router_for(chain_id):
+        """AllowanceHolder on one chain; 0x serves several, this one may not."""
+        router = chain_for(chain_id).zero_x_allowance_holder
+        if router is None:
+            raise ZeroExApiError(f"0x has no router for chain {chain_id}")
+        return router
+
     def __init__(self, api_key, timeout=5.0):
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("0x API key is not configured")
@@ -94,13 +102,15 @@ class ZeroExAggregatorClient:
             raise ZeroExApiError("0x liquidity unavailable")
         return result
 
-    @staticmethod
-    def _query(token_in, token_out, amount):
+    @classmethod
+    def _query(cls, token_in, token_out, amount, chain_id):
         token_in, token_out = address(token_in), address(token_out)
         if NATIVE in {token_in, token_out} or token_in == token_out:
             raise ZeroExApiError("0x requires distinct ERC-20 assets")
         _raw_uint(amount, "input", True)
-        return dict(chainId=CHAIN_ID, sellToken=token_in, buyToken=token_out, sellAmount=amount)
+        cls.router_for(chain_id)  # refuse before asking 0x about an unserved chain
+        return dict(chainId=int(chain_id), sellToken=token_in, buyToken=token_out,
+                    sellAmount=amount)
 
     @staticmethod
     def _parse_route(document, query, observed):
@@ -113,7 +123,8 @@ class ZeroExAggregatorClient:
         gas = int(_raw_uint(tx.get("gas", document.get("gas")), "gas", True))
         digest = hashlib.sha256(json.dumps(document, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return KyberRoute(query["sellToken"], query["buyToken"], query["sellAmount"], output,
-                          gas, ZERO_X_ALLOWANCE_HOLDER, {}, observed, digest)
+                          gas, ZeroExAggregatorClient.router_for(query["chainId"]), {},
+                          observed, digest)
 
     @staticmethod
     def _route(document, query, observed):
@@ -124,13 +135,14 @@ class ZeroExAggregatorClient:
         except (ValueError, TypeError, KeyError):
             raise ZeroExApiError("invalid 0x quote response fields") from None
 
-    async def route(self, token_in, token_out, amount):
-        query = self._query(token_in, token_out, amount)
+    async def route(self, token_in, token_out, amount, *, chain_id):
+        query = self._query(token_in, token_out, amount, chain_id)
         document = await asyncio.to_thread(self._request, "price", query)
         return self._route(document, query, time.time())
 
-    async def quote(self, token_in, token_out, amount, follower, slippage, deadline):
-        query = self._query(token_in, token_out, amount)
+    async def quote(self, token_in, token_out, amount, follower, slippage, deadline,
+                    *, chain_id):
+        query = self._query(token_in, token_out, amount, chain_id)
         follower = address(follower)
         if follower == NATIVE or type(slippage) is not int or not 1 <= slippage <= 2000:
             raise ZeroExApiError("invalid 0x recipient or slippage")
@@ -145,6 +157,7 @@ class ZeroExAggregatorClient:
 
     def _parse_quote(self, document, query, follower, slippage, deadline):
         amount = query["sellAmount"]
+        router = self.router_for(query["chainId"])
         route = self._route(document, query, time.time())
         tx, issues = document.get("transaction"), document.get("issues")
         if not isinstance(tx, dict) or not isinstance(issues, dict):
@@ -153,9 +166,10 @@ class ZeroExAggregatorClient:
                 or issues.get("simulationIncomplete") is not False
                 or issues.get("invalidSourcesPassed", [])):
             raise ZeroExApiError("0x quote has allowance, balance or simulation issues")
-        if address(tx.get("to")) != self.router or str(tx.get("value")) != "0":
+        if address(tx.get("to")) != router or str(tx.get("value")) != "0":
             raise ZeroExApiError("0x transaction target or value mismatch")
-        if document.get("allowanceTarget") is not None and address(document["allowanceTarget"]) != self.router:
+        if (document.get("allowanceTarget") is not None
+                and address(document["allowanceTarget"]) != router):
             raise ZeroExApiError("0x allowance target mismatch")
         decoded = decode_zeroex_swap(tx.get("data"))
         minimum = _raw_uint(document.get("minBuyAmount"), "minimum output", True)
@@ -165,7 +179,7 @@ class ZeroExAggregatorClient:
                 or not int(route.amount_out_raw)*(10000-slippage)//10000 <= int(minimum) <= int(route.amount_out_raw)):
             raise ZeroExApiError("0x calldata does not protect requested swap")
         return ZeroExTransaction(route.input_asset, route.output_asset, amount, route.amount_out_raw,
-            minimum, follower, self.router, tx["data"].lower(), "0", route.gas_estimate,
+            minimum, follower, router, tx["data"].lower(), "0", route.gas_estimate,
             deadline, route.observed_at, route.response_hash, route.response_hash)
 
 

@@ -19,8 +19,9 @@ SUPPORTED_EXECUTION_PROVIDERS = frozenset({"local", *AGGREGATOR_PROVIDERS})
 def aggregator_routers(chain_id: int) -> dict[str, str]:
     """Aggregator routers a chain actually has; a provider it lacks is absent.
 
-    0x does not serve Arc, so Arc exposes only Kyber. Selecting a provider the
-    chain lacks must fail rather than reuse another chain's router address.
+    Selecting a provider the chain lacks must fail rather than reuse another
+    chain's router address, which on these chains can be a different contract
+    at the same address.
     """
     chain = R.chain_for(chain_id)
     routers = {"kyber": chain.kyber_router,

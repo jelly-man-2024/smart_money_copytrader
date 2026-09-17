@@ -99,7 +99,8 @@ class AtomicQuoteTests(unittest.IsolatedAsyncioTestCase):
         document.update(sellToken=TOKEN, buyToken=R.USDG)
         document["transaction"]["data"] = calldata(sell_token=TOKEN, buy_token=R.USDG)
         with patch.object(client, "_request", return_value=document):
-            swap = await client.quote(TOKEN, R.USDG, "10000", FOLLOWER, 300, int(time.time())+120)
+            swap = await client.quote(TOKEN, R.USDG, "10000", FOLLOWER, 300, int(time.time())+120,
+                                 chain_id=R.CHAIN_ID)
         self.assertEqual(swap.input_asset, TOKEN)
         self.assertEqual(swap.output_asset, R.USDG)
         self.assertEqual(swap.amount_in_raw, "10000")
@@ -147,7 +148,8 @@ class AtomicQuoteTests(unittest.IsolatedAsyncioTestCase):
             change(document)
             with patch.object(client, "_request", return_value=document):
                 with self.assertRaises(ValueError):
-                    await client.quote(R.USDG, TOKEN, "10000", FOLLOWER, 300, int(time.time())+120)
+                    await client.quote(R.USDG, TOKEN, "10000", FOLLOWER, 300,
+                                       int(time.time())+120, chain_id=R.CHAIN_ID)
 
     async def test_registry_current_previous_unknown_paused_and_failure(self):
         for current, previous, accepted in [(SETTLER, SMART, True), (SMART, SETTLER, True),

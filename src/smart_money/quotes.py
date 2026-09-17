@@ -257,6 +257,10 @@ class LiveQuoter:
         kwargs = {}
         if signal.protocol == "kyber" and context and context["excluded_sources"]:
             kwargs["excluded_sources"] = context["excluded_sources"]
+        if signal.protocol == "zeroex":
+            # 0x serves several chains from one endpoint, so the chain is part of
+            # the request rather than of the client.
+            kwargs["chain_id"] = signal.chain_id
         key = None
         if self.shared_routes_enabled and context and signal.protocol == "kyber":
             # Share market data, NEVER a decision/authorization or built transaction.
@@ -383,8 +387,9 @@ class LiveQuoter:
             if context is None:
                 raise ValueError("0x executable quote requires a bound operation context")
             context["route_requests"] += 1
-            swap = await self._aggregator("zeroex").quote(signal.token_in, signal.token_out,
-                amount_in_raw, context["binding"][1], context["slippage_bps"], int(time.time())+120)
+            swap = await self._aggregator("zeroex").quote(
+                signal.token_in, signal.token_out, amount_in_raw, context["binding"][1],
+                context["slippage_bps"], int(time.time())+120, chain_id=signal.chain_id)
             context["swaps"][self._quote_key(signal, amount_in_raw)] = swap
             return Quote("zeroex", swap.to, number(header["number"]), header["hash"].lower(),
                 swap.observed_at, signal.token_in, signal.token_out, amount_in_raw,
