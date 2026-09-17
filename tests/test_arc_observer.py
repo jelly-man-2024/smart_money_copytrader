@@ -153,6 +153,15 @@ class ArcDecodeTests(unittest.TestCase):
         self.assertEqual(
             Decoder({WALLET: {}}, chain_id=R.ARC.chain_id).decode(tx), [])
 
+    def test_arc_contract_creation_does_not_false_match_none_fields(self):
+        # A watchlisted wallet deploying a contract (to=None) on Arc must not
+        # false-match None registry fields (Relay/Depository/EntryPoint/WETH),
+        # which are None on Arc, via None == None. It decodes to no signal.
+        tx = Transaction(TX_HASH, WALLET, None, bytes.fromhex("60806040" + "00" * 8),
+                         chain_id=R.ARC.chain_id)
+        self.assertEqual(
+            Decoder({WALLET: {}}, chain_id=R.ARC.chain_id).decode(tx), [])
+
 
 class ArcObserverTests(unittest.IsolatedAsyncioTestCase):
     async def test_receipt_confirmed_arc_swap_is_persisted_read_only(self):

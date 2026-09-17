@@ -99,6 +99,12 @@ class Decoder:
             if budget[0] > 512 or depth > 12:
                 raise ValueError("call graph limit")
             to = address(to) if to else None
+            if to is None:
+                # A contract-creation / null target is never one of the tracked
+                # contract calls. Without this guard, `to == C.<field>` would
+                # false-match on chains where that field is None (Arc has no
+                # Relay/EntryPoint/WETH/Depository/etc.), since None == None.
+                return
             sel, args = data[:4], data[4:]
 
             def child(dest, amount, body, suffix):
@@ -456,7 +462,7 @@ class Decoder:
                 emit(wallet, mode, path + "/decode_error", to, data, "UNKNOWN", op,
                      reasons=["decode_error:" + type(exc).__name__])
 
-        if tx.to == C.entrypoint and tx.data[:4] == bytes.fromhex("765e827f"):
+        if C.entrypoint is not None and tx.to == C.entrypoint and tx.data[:4] == bytes.fromhex("765e827f"):
             try:
                 ops, beneficiary = decode([PACKED_OPS, "address"], tx.data[4:])
                 if len(ops) > 256:
