@@ -65,6 +65,16 @@ class ChainRegistry:
     permit2: str | None = None
 
 
+    @property
+    def native_erc20(self) -> str | None:
+        """ERC-20 form of the chain's native asset.
+
+        Robinhood Chain wraps native ETH as WETH; Arc's native gas asset is USDC
+        itself, exposed as the enshrined ERC-20. A chain that offers neither
+        returns None and cannot quote the native sentinel.
+        """
+        return self.weth if self.weth is not None else self.usdc_erc20
+
 ROBINHOOD = ChainRegistry(
     chain_id=4663,
     name="robinhood",

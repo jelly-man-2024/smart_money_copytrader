@@ -27,9 +27,23 @@ def _selector(signature: str) -> bytes:
     return keccak(text=signature)[:4]
 
 
-def _erc20(asset: str) -> str:
+def _erc20(asset: str, chain: R.ChainRegistry) -> str:
+    """ERC-20 form of an asset on one chain (WETH on RH, enshrined USDC on Arc)."""
     asset = address(asset)
-    return R.WETH if asset == R.NATIVE else asset
+    if asset != R.NATIVE:
+        return asset
+    wrapped = chain.native_erc20
+    if wrapped is None:
+        raise ValueError(f"chain {chain.chain_id} has no ERC-20 native asset")
+    return wrapped
+
+
+def _venue(chain: R.ChainRegistry, field: str) -> str:
+    """Resolve a venue this chain must provide, refusing rather than guessing."""
+    value = getattr(chain, field)
+    if value is None:
+        raise ValueError(f"chain {chain.chain_id} has no {field}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -410,7 +424,9 @@ class LiveQuoter:
         if fee_tiers != (100, 500, 3000, 10000):
             raise ValueError("only the bounded standard V3 fee tiers are supported")
 
-        token_in, token_out = _erc20(signal.token_in), _erc20(signal.token_out)
+        chain = R.chain_for(signal.chain_id)
+        token_in = _erc20(signal.token_in, chain)
+        token_out = _erc20(signal.token_out, chain)
         if token_in == token_out:
             raise ValueError("V3 route assets must differ")
         header = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
@@ -423,7 +439,7 @@ class LiveQuoter:
         for fee in fee_tiers:
             try:
                 raw_pool = await self._call(
-                    R.V3_FACTORY,
+                    _venue(chain, "v3_factory"),
                     _selector("getPool(address,address,uint24)") + encode(
                         ["address", "address", "uint24"],
                         [token_in, token_out, fee]),
@@ -452,7 +468,7 @@ class LiveQuoter:
                     "fee": fee,
                 }]
                 quote_signal = replace(
-                    signal, protocol="v3", contract=R.V3_QUOTER,
+                    signal, protocol="v3", contract=_venue(chain, "v3_quoter"),
                     exact_in=True, amount_out_raw=None, amount_limit_raw=None,
                     evidence=evidence)
                 quote = await self._quote_at(quote_signal, amount_in_raw, header)
@@ -498,15 +514,16 @@ class LiveQuoter:
                          header["hash"].lower(), route.observed_at, signal.token_in,
                          signal.token_out, amount_in_raw, route.amount_out_raw,
                          str(route.gas_estimate))
+        chain = R.chain_for(signal.chain_id)
         if signal.protocol == "v2":
             output, gas = await self._v2(signal, int(amount_in_raw), block_tag)
-            source = R.V2_ROUTER
+            source = _venue(chain, "v2_router")
         elif signal.protocol == "v3":
             output, gas = await self._v3(signal, int(amount_in_raw), block_tag)
-            source = R.V3_QUOTER
+            source = _venue(chain, "v3_quoter")
         else:
             output, gas = await self._v4(signal, int(amount_in_raw), block_tag)
-            source = R.V4_QUOTER
+            source = _venue(chain, "v4_quoter")
         if output <= 0:
             raise ValueError("quoter returned no output")
         return Quote(signal.protocol, source, block_number, header["hash"].lower(), time.time(),
@@ -526,12 +543,14 @@ class LiveQuoter:
         route = signal.evidence.get("route")
         if not isinstance(route, list) or len(route) < 2 or len(route) > 8:
             raise ValueError("bounded V2 route required")
-        route = [_erc20(item) for item in route]
-        if route[0] != _erc20(signal.token_in) or route[-1] != _erc20(signal.token_out):
+        chain = R.chain_for(signal.chain_id)
+        route = [_erc20(item, chain) for item in route]
+        if (route[0] != _erc20(signal.token_in, chain)
+                or route[-1] != _erc20(signal.token_out, chain)):
             raise ValueError("V2 quote route mismatch")
         data = _selector("getAmountsOut(uint256,address[])") + encode(
             ["uint256", "address[]"], [amount, route])
-        values = decode(["uint256[]"], await self._call(R.V2_ROUTER, data, block_tag))[0]
+        values = decode(["uint256[]"], await self._call(_venue(chain, "v2_router"), data, block_tag))[0]
         if len(values) != len(route) or values[0] != amount:
             raise ValueError("invalid V2 quote path result")
         return int(values[-1]), None
@@ -543,27 +562,31 @@ class LiveQuoter:
             if fee is None:
                 raise ValueError("bounded V3 hops required")
             hops = [{"token_in": signal.token_in, "token_out": signal.token_out, "fee": fee}]
+        chain = R.chain_for(signal.chain_id)
         path = bytearray()
-        expected = _erc20(signal.token_in)
+        expected = _erc20(signal.token_in, chain)
         path.extend(bytes.fromhex(expected[2:]))
         for hop in hops:
-            token_in, token_out, fee = _erc20(hop["token_in"]), _erc20(hop["token_out"]), int(hop["fee"])
+            token_in = _erc20(hop["token_in"], chain)
+            token_out = _erc20(hop["token_out"], chain)
+            fee = int(hop["fee"])
             if token_in != expected or not 0 <= fee < 2 ** 24:
                 raise ValueError("V3 quote path mismatch")
             path.extend(fee.to_bytes(3, "big"))
             path.extend(bytes.fromhex(token_out[2:]))
             expected = token_out
-        if expected != _erc20(signal.token_out):
+        if expected != _erc20(signal.token_out, chain):
             raise ValueError("V3 quote output mismatch")
         data = _selector("quoteExactInput(bytes,uint256)") + encode(
             ["bytes", "uint256"], [bytes(path), amount])
-        raw = await self._call(R.V3_QUOTER, data, block_tag)
+        raw = await self._call(_venue(chain, "v3_quoter"), data, block_tag)
         if len(raw) < 32:
             raise ValueError("invalid V3 quote result")
         # Quoter v1 returns one word; Quoter v2's first return word is also amountOut.
         return int.from_bytes(raw[:32], "big"), None
 
     async def _v4(self, signal: Signal, amount: int, block_tag: str) -> tuple[int, int]:
+        chain = R.chain_for(signal.chain_id)
         key = signal.evidence.get("pool_key")
         hops = signal.evidence.get("v4_hops")
         if hops:
@@ -591,7 +614,7 @@ class LiveQuoter:
             params_type = f"(address,{V4_PATH_KEY}[],uint128)"
             data = _selector(f"quoteExactInput({params_type})") + encode(
                 [params_type], [(signal.token_in, path, amount)])
-            raw = await self._call(R.V4_QUOTER, data, block_tag)
+            raw = await self._call(_venue(chain, "v4_quoter"), data, block_tag)
             output, gas = decode(["uint256", "uint256"], raw)
             return int(output), int(gas)
         if not isinstance(key, list) or len(key) != 5:
@@ -605,6 +628,6 @@ class LiveQuoter:
         params = (key, signal.token_in == key[0], amount, bytes.fromhex(hook_data[2:]))
         data = _selector(f"quoteExactInputSingle(({POOL_KEY},bool,uint128,bytes))") + encode(
             [f"({POOL_KEY},bool,uint128,bytes)"], [params])
-        raw = await self._call(R.V4_QUOTER, data, block_tag)
+        raw = await self._call(_venue(chain, "v4_quoter"), data, block_tag)
         output, gas = decode(["uint256", "uint256"], raw)
         return int(output), int(gas)
