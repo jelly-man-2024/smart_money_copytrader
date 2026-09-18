@@ -577,8 +577,12 @@ async def observe_arc(rpc: ReadOnlyRpc, ws_url: str, store: Store, watchlist: di
         if on_status is not None:
             on_status(event, details)
 
-    observer = ArcObserver(rpc, store, watchlist, on_signal,
-                           relay_client=relay_client, on_status=status)
+    # ArcObserver reports as on_status(event, details_dict) while `status` above
+    # takes keywords, so the two contracts are bridged here. Without this every
+    # status the observer itself raises — the Relay attribution branch, which only
+    # fires when a watched wallet receives tokens with no outflow — is a TypeError.
+    observer = ArcObserver(rpc, store, watchlist, on_signal, relay_client=relay_client,
+                           on_status=lambda event, details: status(event, **details))
 
     async def subscribe_forever() -> None:
         failures = 0

@@ -419,6 +419,7 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
                 intent_status="not_attributed", execution_status="success",
                 evidence={"recipient_count": len(recipients), "watched_recipients": watched_recipients,
                           "swap_event_count": swap_count, "block_hash": receipt.get("blockHash")},
+                chain_id=tx.chain_id,
             ))
         else:
             for wallet in watched_recipients:
@@ -429,5 +430,6 @@ def enrich(tx: Transaction, signals: list[Signal], receipt: dict, watchlist: dic
                     intent_status="not_attributed", execution_status="success",
                     evidence={"wallet_erc20_deltas_raw": deltas(logs, wallet), "swap_event_count": swap_count,
                               "block_hash": receipt.get("blockHash")},
+                    chain_id=tx.chain_id,
                 ))
     return signals

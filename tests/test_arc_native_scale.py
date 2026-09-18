@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from eth_utils import keccak
+
 from smart_money import registry as R
 from smart_money.arc_observer import ArcObserver
 from smart_money.models import Signal
@@ -118,3 +120,36 @@ class QuoteScaleGuardTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IncomingTransferChainTests(unittest.TestCase):
+    """A signal must carry the chain of the transaction it came from."""
+
+    def test_incoming_transfer_signals_keep_the_arc_chain(self):
+        from smart_money.models import Transaction
+        from smart_money.receipts import enrich
+        wallet = "0x89909912c58e2182d92b1a8638d6ff8d965e173b"
+        token = "0x1b10319b6b535042ef6d2428be915527eabc5957"
+        transfer = ("0x" + keccak(text="Transfer(address,address,uint256)").hex())
+        tx = Transaction(
+            hash="0x" + "a1" * 32, sender="0x" + "bb" * 20, to="0x" + "cc" * 20,
+            data=b"\x01\x02\x03\x04", value=0, chain_id=R.ARC.chain_id,
+            observation_source="arc_wallet_transfer_subscription")
+        receipt = {
+            "status": "0x1", "blockNumber": hex(21469454), "blockHash": "0x" + "dd" * 32,
+            "transactionHash": tx.hash,
+            "logs": [{
+                "address": token, "logIndex": "0x1f", "blockHash": "0x" + "dd" * 32,
+                "transactionHash": tx.hash, "removed": False,
+                "topics": [transfer, "0x" + "00" * 12 + "ee" * 20,
+                           "0x" + "00" * 12 + wallet[2:]],
+                "data": "0x" + (10 ** 18).to_bytes(32, "big").hex(),
+            }],
+        }
+        signals = enrich(tx, [], receipt, {wallet: {"handle": "arc-test"}}, {}, {})
+        self.assertTrue(signals, "an incoming transfer to a watched wallet is observed")
+        for signal in signals:
+            # Stamped 4663 by default, an Arc observation selects the Robinhood
+            # relationship for the same wallet, which runs live.
+            self.assertEqual(signal.chain_id, R.ARC.chain_id)
+            self.assertTrue(signal.event_id.startswith(f"{R.ARC.chain_id}:"))
