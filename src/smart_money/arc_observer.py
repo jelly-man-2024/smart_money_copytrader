@@ -15,6 +15,7 @@ against its canonical receipt before any signal is persisted.
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 from collections import deque
 from collections.abc import AsyncIterator, Callable
@@ -41,6 +42,12 @@ MAX_CACHED_BLOCKS = 64
 # The cursor is named for what it now scans; an older "arc_v4" cursor is left
 # behind rather than resumed, because it indexed a different filter.
 ARC_CURSOR = "arc_wallet_transfers"
+# A Relay order is often not settled yet when its destination credit lands, so
+# attribution is deferred and retried rather than dropped. "Not settled yet" is
+# missing evidence, never evidence of a non-purchase, so an exhausted retry
+# leaves the delivery in needs_review and copies nothing.
+MAX_RELAY_RETRY_ATTEMPTS = 20
+RELAY_RETRY_DEADLINE_SECONDS = 900.0
 
 
 class ArcCandidateRejected(ValueError):
@@ -191,6 +198,9 @@ class ArcObserver:
         self._processed: set[str] = set()
         self._block_order: deque[tuple[int, str]] = deque()
         self._block_transactions: dict[tuple[int, str], dict[str, dict]] = {}
+        # tx_hash -> {"hint": validated log, "attempts": int, "first_seen": float}
+        self._relay_pending: dict[str, dict] = {}
+        self._relay_pending_now = False
 
     def _remember(self, tx_hash: str) -> None:
         if tx_hash in self._processed:
@@ -382,6 +392,7 @@ class ArcObserver:
         except RelayNotReady:
             # The order is not settled in Relay's view yet. Leave the signal for
             # review; backfill re-reads the transaction from canonical state.
+            self._relay_pending_now = True
             self._status("arc_relay_lookup_pending", source_event_id=signal.event_id)
             return signal
         except (RelayApiError, RpcError, ValueError) as exc:
@@ -396,6 +407,7 @@ class ArcObserver:
                       raw_transaction: dict | None = None) -> list[Signal]:
         hint, _wallets = validate_arc_transfer_log(hint, self.watchlist)
         tx_hash = hint["transactionHash"].lower()
+        self._relay_pending_now = False
         async with self._lock:
             if tx_hash in self._processed:
                 return []
@@ -443,6 +455,15 @@ class ArcObserver:
                 for signal in final:
                     if self.store.put(signal) and self.on_signal is not None:
                         self.on_signal(signal)
+                if self._relay_pending_now:
+                    # Leave the candidate open and unremembered: retry_pending_relay
+                    # re-reads it from canonical state once Relay has settled, and
+                    # store.put then upgrades needs_review to relay_buy_evidenced.
+                    entry = self._relay_pending.setdefault(
+                        tx_hash, {"hint": hint, "attempts": 0, "first_seen": time.time()})
+                    entry["attempts"] += 1
+                    return final
+                self._relay_pending.pop(tx_hash, None)
                 self.store.complete_candidate(
                     tx.hash, number(receipt["blockNumber"]), receipt["blockHash"])
                 self._remember(tx_hash)
@@ -454,6 +475,40 @@ class ArcObserver:
             except Exception as exc:
                 self.store.fail_candidate(tx.hash, type(exc).__name__)
                 raise
+
+
+    async def retry_pending_relay(self) -> dict:
+        """Re-attribute deliveries whose Relay order had not settled yet.
+
+        Called from the backfill loop, because the scan cursor has already moved
+        past these blocks and would never revisit them. Each retry re-reads the
+        transaction from canonical state, so a settled order upgrades the stored
+        signal; giving up leaves it in needs_review and copies nothing.
+        """
+        retried = resolved = abandoned = 0
+        for tx_hash, entry in list(self._relay_pending.items()):
+            expired = (time.time() - entry["first_seen"] > RELAY_RETRY_DEADLINE_SECONDS
+                       or entry["attempts"] >= MAX_RELAY_RETRY_ATTEMPTS)
+            if expired:
+                self._relay_pending.pop(tx_hash, None)
+                self._remember(tx_hash)
+                abandoned += 1
+                self._status("arc_relay_retry_exhausted", source_tx_hash=tx_hash,
+                             attempts=entry["attempts"])
+                continue
+            retried += 1
+            try:
+                await self.observe(entry["hint"])
+            except (ArcCandidateRejected, RpcError, ArcCanonicalMismatch) as exc:
+                entry["attempts"] += 1
+                self._status("arc_relay_retry_error", source_tx_hash=tx_hash,
+                             error_type=type(exc).__name__)
+                continue
+            if tx_hash not in self._relay_pending:
+                resolved += 1
+                self._status("arc_relay_retry_resolved", source_tx_hash=tx_hash)
+        return {"retried": retried, "resolved": resolved, "abandoned": abandoned,
+                "pending": len(self._relay_pending)}
 
 
 def _block_identity(block: object, expected_number: int) -> tuple[str, str]:
@@ -625,6 +680,9 @@ async def observe_arc(rpc: ReadOnlyRpc, ws_url: str, store: Store, watchlist: di
                 failures = 0
                 if progress["initialized"] or progress["logs"]:
                     status("arc_backfill_progress", **progress)
+                retries = await observer.retry_pending_relay()
+                if retries["retried"] or retries["abandoned"]:
+                    status("arc_relay_retry_sweep", **retries)
                 await asyncio.sleep(backfill_interval)
             except asyncio.CancelledError:
                 raise
