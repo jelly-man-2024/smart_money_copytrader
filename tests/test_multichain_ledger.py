@@ -128,3 +128,24 @@ class BudgetBucketValidationTests(unittest.TestCase):
             with self.subTest(bucket=bucket, limit=limit):
                 with self.assertRaisesRegex(ValueError, "invalid paper budget"):
                     store.configure_paper_budget(scope, bucket, limit)
+
+
+class LedgerBudgetBucketScopeTests(unittest.TestCase):
+    """The ledger's own bucket check must recognise every chain's assets."""
+
+    def test_each_chain_settlement_asset_maps_to_its_bucket(self):
+        from smart_money.store import _paper_budget_buckets
+        self.assertIn("USDG", _paper_budget_buckets(R.USDG))
+        self.assertIn("ETH_WETH", _paper_budget_buckets(R.WETH))
+        # Arc's USDC was unknown here, so an Arc proposal was refused with
+        # input_asset_budget_bucket_mismatch after every other gate had passed.
+        self.assertIn("USDC", _paper_budget_buckets(R.ARC.usdc_erc20))
+
+    def test_an_unrelated_token_belongs_to_no_bucket(self):
+        from smart_money.store import _paper_budget_buckets
+        self.assertEqual(_paper_budget_buckets("0x" + "11" * 20), frozenset())
+
+    def test_the_shared_native_sentinel_is_accepted_for_either_chain(self):
+        from smart_money.store import _paper_budget_buckets
+        buckets = _paper_budget_buckets(R.NATIVE)
+        self.assertEqual(buckets, frozenset({"ETH_WETH", "USDC"}))

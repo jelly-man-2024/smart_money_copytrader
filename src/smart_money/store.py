@@ -50,13 +50,25 @@ def _execution_plan_integrity(plan_id: str, proposal_id: str, follower_wallet: s
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def _paper_budget_bucket(asset: str) -> str | None:
+def _paper_budget_buckets(asset: str) -> frozenset[str]:
+    """Buckets this asset can belong to, across every configured chain.
+
+    Proposals carry no chain id, and the same address means a different asset
+    per chain while the native sentinel is shared, so a single answer is not
+    available here. Callers use this to reject a bucket that no chain would
+    assign to the asset, which is the integrity property they actually need;
+    which chain a proposal belongs to is already fixed by its ledger scope.
+    """
     asset = asset.lower()
-    if asset == R.USDG:
-        return "USDG"
-    if asset in {R.NATIVE, R.WETH}:
-        return "ETH_WETH"
-    return None
+    buckets = set()
+    for chain in R.CHAINS.values():
+        if chain.usdg is not None and asset == chain.usdg:
+            buckets.add("USDG")
+        if chain.usdc_erc20 is not None and asset in {R.NATIVE, chain.usdc_erc20}:
+            buckets.add("USDC")
+        if chain.weth is not None and asset in {R.NATIVE, chain.weth}:
+            buckets.add("ETH_WETH")
+    return frozenset(buckets)
 
 
 class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
@@ -987,7 +999,7 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
         amount = proposal["amount_in_raw"]
         if not isinstance(amount, str) or not amount.isdecimal() or int(amount) <= 0:
             raise ValueError("invalid proposal amount")
-        if _paper_budget_bucket(proposal["input_asset"]) != proposal["budget_bucket"]:
+        if proposal["budget_bucket"] not in _paper_budget_buckets(proposal["input_asset"]):
             return False, "input_asset_budget_bucket_mismatch"
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -1421,7 +1433,7 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
         amount = proposal["amount_in_raw"]
         if not isinstance(amount, str) or not amount.isdecimal() or int(amount) <= 0:
             raise ValueError("invalid sell amount")
-        if _paper_budget_bucket(proposal["output_asset"]) != proposal["budget_bucket"]:
+        if proposal["budget_bucket"] not in _paper_budget_buckets(proposal["output_asset"]):
             return False, "sell_output_budget_bucket_mismatch"
         try:
             self.connection.execute("BEGIN IMMEDIATE")
@@ -1444,7 +1456,7 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             allocations = []
             remaining = int(amount)
             for lot_id, token_remaining, principal_asset in lots:
-                if _paper_budget_bucket(principal_asset) != proposal["budget_bucket"]:
+                if proposal["budget_bucket"] not in _paper_budget_buckets(principal_asset):
                     continue
                 reserved = sum(int(row[0]) for row in self.connection.execute(
                     """SELECT token_amount_raw FROM paper_position_reservations
@@ -1748,7 +1760,7 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
                     WHERE cycle_id=? AND wallet=? AND bucket=?""",
                     (str(int(budget[0]) - principal), lot[2], proposal[2], lot[3]))
                 same_principal_bucket = (
-                    _paper_budget_bucket(fill["fee_asset"]) == lot[3])
+                    lot[3] in _paper_budget_buckets(fill["fee_asset"]))
                 fee_in_principal = fee if same_principal_bucket else 0
                 pnl = proceeds - principal - fee_in_principal
                 self.connection.execute("""INSERT INTO paper_realized_pnl(
