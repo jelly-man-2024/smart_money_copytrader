@@ -12,10 +12,26 @@ from .key_source import LiveDatabaseSigner
 from .models import address, number
 from .registry import (
     CHAIN_ID, KYBER_META_AGGREGATION_ROUTER_V2, NATIVE, USDG, V2_ROUTER, V3_ROUTER,
+    chain_for,
 )
 
 USDG_BUDGET_APPROVAL_MULTIPLIER = 200
-APPROVAL_SPENDERS = frozenset({V2_ROUTER, V3_ROUTER, KYBER_META_AGGREGATION_ROUTER_V2})
+def approval_spenders(chain_id: int) -> frozenset[str]:
+    """Contracts this chain may be asked to approve, resolved from its registry.
+
+    0x is deliberately absent on every chain: its allowance is granted by the
+    reviewed one-off operator path, not by this one, and the live executor skips
+    approvals for 0x accordingly. A chain that deploys none of these allows no
+    approval at all.
+    """
+    chain = chain_for(chain_id)
+    return frozenset(spender for spender in (
+        chain.v2_router, chain.v3_router, chain.kyber_router,
+    ) if spender is not None)
+
+
+# Robinhood-chain alias kept for existing call sites and tests.
+APPROVAL_SPENDERS = approval_spenders(CHAIN_ID)
 
 
 @dataclass(frozen=True)
@@ -43,7 +59,10 @@ async def approve_relationship_token(
             or policy.relationship_id is None):
         raise ValueError("relationship is not eligible for token approval")
     token, spender = address(token), address(spender)
-    if token == NATIVE or spender not in APPROVAL_SPENDERS:
+    # A policy without an explicit chain means Robinhood Chain, matching the
+    # relationship dataclass default.
+    chain_id = getattr(policy, "chain_id", CHAIN_ID)
+    if token == NATIVE or spender not in approval_spenders(chain_id):
         raise ValueError("token or spender is not eligible for approval")
     if (not isinstance(amount_raw, str) or not amount_raw.isdecimal()
             or int(amount_raw) <= 0 or int(amount_raw) >= 2 ** 256):
@@ -92,7 +111,7 @@ async def approve_relationship_token(
     if number(simulation) != 1:
         raise ValueError("token approval simulation did not return true")
     transaction = {
-        "chainId": CHAIN_ID, "nonce": nonce, "to": to_checksum_address(token),
+        "chainId": chain_id, "nonce": nonce, "to": to_checksum_address(token),
         "value": 0, "data": approval_data, "gas": gas_limit,
         "maxFeePerGas": max_fee, "maxPriorityFeePerGas": 0, "type": 2,
     }

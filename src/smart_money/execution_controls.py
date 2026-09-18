@@ -75,7 +75,11 @@ def _risk_acceptance(follower_wallet: str | None, relationship_id: str | None,
         raise PermissionError(
             "enabled mainnet relationship is stale or does not match execution")
     return {
-        "version": 1, "chain_id": CHAIN_ID, "follower_wallet": follower,
+        # The acceptance records the chain the relationship actually copies on,
+        # not a fixed one: it is the evidence a signature and a broadcast are
+        # checked against.
+        "version": 1, "chain_id": getattr(policy, "chain_id", CHAIN_ID),
+        "follower_wallet": follower,
         "relationship_id": relationship_id,
         "config_snapshot_hash": config_snapshot_hash,
         "accepted_at": accepted_at.isoformat(timespec="microseconds"),
