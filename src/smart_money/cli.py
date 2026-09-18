@@ -11,8 +11,11 @@ import time
 
 import websockets
 
+from dataclasses import replace
+
 from .account_state import prestate_implementations
 from .arc_observer import observe_arc
+from .arc_pool_safety import ArcPoolSafetyPolicy, verify_arc_exit_via_aggregator
 from .approval import (
     approve_relationship_token, approve_relationship_usdg,
     confirm_relationship_token_approval,
@@ -122,6 +125,185 @@ async def arc_monitor(args):
             await task
     finally:
         rpc.close()
+        store.close()
+
+
+async def arc_paper(args):
+    """Arc (5042) paper lane: observe -> exit gate -> decide -> paper fill.
+
+    This lane has no signing or broadcasting surface. It builds a PaperExecutor
+    and never a live pipeline, and it refuses to start while any Arc
+    relationship is not in paper mode, so a configuration slip cannot quietly
+    turn it into a live one. Policies are selected by wallet AND chain, because
+    the same smart wallet is also copied live on Robinhood Chain.
+    """
+    load_endpoint_env()
+    rpc_url = os.environ.get("ARC_RPC_URL")
+    ws_url = os.environ.get("ARC_WS_URL")
+    if not rpc_url or not ws_url:
+        raise ValueError("ARC_RPC_URL and ARC_WS_URL are required")
+    api_key = os.environ.get("0X_API_KEY")
+    if not api_key:
+        raise ValueError("0X_API_KEY is required: Arc executes through 0x")
+    paper_config = load_mysql_paper_config()
+    policies = tuple(policy for policy in paper_config.relationships
+                     if policy.chain_id == ARC.chain_id)
+    if not policies:
+        raise ValueError("no enabled relationship copies Arc")
+    not_paper = sorted(policy.relationship_id for policy in policies
+                       if policy.run_mode != "paper")
+    if not_paper:
+        raise ValueError(
+            f"Arc lane cannot execute; relationships {not_paper} are not paper mode")
+    arc_config = replace(paper_config, relationships=policies)
+    safety = ArcPoolSafetyPolicy(
+        max_tax_bps=args.max_tax_bps,
+        max_round_trip_loss_bps=args.max_round_trip_loss_bps,
+        probe_amount_raw=args.probe_amount_raw)
+
+    store = MySqlStore()
+    rpc = ReadOnlyRpc(rpc_url)
+    zeroex = ZeroExAggregatorClient(api_key)
+    quoter = LiveQuoter(rpc, {"zeroex": zeroex})
+    relay_client = None if args.no_relay else RelayPublicClient()
+    stats = Counter()
+    engines, executors = {}, {}
+    cycle_id, cycle_created = prepare_runtime_budget_cycle(
+        store, arc_config, args.paper_cycle_action,
+        args.paper_cycle_id, args.paper_cycle_reason)
+    for policy in policies:
+        executors[policy.ledger_scope] = PaperExecutor(
+            store, quoter, policy.quote_policy, policy.route_definitions)
+        for mode in (policy.trigger_mode, *policy.shadow_trigger_modes):
+            engines[(mode, policy.ledger_scope)] = PaperEngine(
+                store, quoter, policy.quote_policy, policy.strategy_version, mode,
+                policy.allowed_protocols, policy.allowed_assets, policy.allowed_routes,
+                {policy.wallet: policy.label},
+                {policy.wallet: {"follower_wallet": policy.follower_wallet,
+                                 "relationship_id": policy.relationship_id,
+                                 "operation_claims": False,
+                                 "ledger_scope": policy.ledger_scope}},
+                policy.snapshot_hash,
+                execution_routes=policy.route_definitions,
+                shadow_only=mode != policy.trigger_mode,
+                execution_providers=policy.execution_providers)
+    watchlist = monitoring_watchlist(args.watchlist, arc_config)
+
+    async def exit_gate(signal):
+        """Refuse a token 0x will not quote a sell for: bought in, cannot get out."""
+        verdict = await verify_arc_exit_via_aggregator(
+            zeroex, signal.token_out, chain_id=ARC.chain_id, policy=safety)
+        stats["arc_exit_gate_accepted" if verdict["accepted"]
+              else "arc_exit_gate_rejected"] += 1
+        report("arc_exit_gate", source_event_id=signal.event_id,
+               smart_wallet=signal.wallet, **verdict, live_trading=False)
+        return verdict["accepted"]
+
+    async def decide(signal):
+        selected = arc_config.policies_for(signal.wallet, signal.chain_id)
+        if not selected:
+            return
+        if signal.behavior in {"BUY", "TOKEN_SWAP"} and not await exit_gate(signal):
+            return
+        for policy in selected:
+            if signal.behavior in {"BUY", "TOKEN_SWAP"}:
+                bucket = (budget_bucket(signal.token_in, signal.chain_id)
+                          if signal.token_in else None)
+                rule = policy.buy_rules.get(bucket)
+                if rule is None:
+                    continue
+                method = "buy"
+            elif signal.behavior == "SELL":
+                rule, method = policy.sell_rule, "sell"
+            else:
+                return
+            for mode in (policy.trigger_mode, *policy.shadow_trigger_modes):
+                engine = engines[(mode, policy.ledger_scope)]
+                ready = ((mode == "receipt_success" and signal.execution_status == "success")
+                         or (mode == "feed_intent" and signal.stage == "intent")
+                         or (mode == "swap_evidenced" and signal.stage in {
+                             "swap_evidenced", "needs_review", "failed"})
+                         or (mode in {"relay_sell_evidenced", "relay_buy_evidenced"}
+                             and signal.stage in {mode, "needs_review", "failed"})
+                         or (mode == "evidenced" and signal.stage in {
+                             "swap_evidenced", "relay_sell_evidenced",
+                             "relay_buy_evidenced", "needs_review", "failed"}))
+                if not ready:
+                    continue
+                decision = (await engine.propose_buy(signal, rule) if method == "buy"
+                            else await engine.propose_sell(signal, rule))
+                stats["paper_decisions"] += 1
+                stats["paper_accepted" if decision.accepted else "paper_rejected"] += 1
+                report("paper_decision", decision_id=decision.decision_id,
+                       source_event_id=signal.event_id, trigger_mode=mode,
+                       relationship_id=policy.relationship_id, chain_id=signal.chain_id,
+                       shadow_only=engine.shadow_only, accepted=decision.accepted,
+                       reason=decision.reason, proposal_id=decision.proposal_id,
+                       live_trading=False)
+                if decision.accepted and decision.proposal_id and not engine.shadow_only:
+                    execution = await executors[policy.ledger_scope].execute(
+                        signal, decision.proposal_id)
+                    stats["paper_filled" if execution.status == "filled"
+                          else "paper_fill_cancelled"] += 1
+                    report("paper_execution", proposal_id=execution.proposal_id,
+                           status=execution.status, reason=execution.reason,
+                           fill_id=execution.fill_id, chain_id=signal.chain_id,
+                           paper_only=True, live_trading=False)
+
+    # Decisions are serialized through a bounded queue: the observer stays
+    # responsive, and one slow decision can never interleave with another.
+    queue = asyncio.Queue(maxsize=256)
+
+    def on_signal(signal):
+        try:
+            queue.put_nowait(signal)
+        except asyncio.QueueFull:
+            stats["decision_queue_drops"] += 1
+            report("arc_decision_queue_full", source_event_id=signal.event_id,
+                   live_trading=False)
+
+    async def decide_forever():
+        while True:
+            signal = await queue.get()
+            try:
+                await decide(signal)
+            except Exception as exc:
+                stats["decision_errors"] += 1
+                report("arc_decision_error", source_event_id=signal.event_id,
+                       error_type=type(exc).__name__, live_trading=False)
+            finally:
+                queue.task_done()
+
+    def status(event, details):
+        report(event, **details, chain_id=ARC.chain_id, live_trading=False)
+
+    report("arc_paper_started", chain_id=ARC.chain_id,
+           relationships=[policy.relationship_id for policy in policies],
+           smart_wallets=len(watchlist), cycle_id=cycle_id,
+           cycle_created=cycle_created, max_tax_bps=safety.max_tax_bps,
+           max_round_trip_loss_bps=safety.max_round_trip_loss_bps,
+           probe_amount_raw=str(safety.probe_amount_raw),
+           paper_only=True, live_trading=False)
+    consumer = asyncio.create_task(decide_forever())
+    try:
+        task = observe_arc(
+            rpc, ws_url, store, watchlist, on_signal, status,
+            backfill_interval=args.backfill_interval,
+            backfill_batch=args.backfill_batch,
+            relay_client=relay_client)
+        if args.seconds:
+            try:
+                await asyncio.wait_for(task, timeout=args.seconds)
+            except asyncio.TimeoutError:
+                await queue.join()
+                report("arc_paper_duration_complete", seconds=args.seconds,
+                       counters=dict(stats), live_trading=False)
+        else:
+            await task
+    finally:
+        consumer.cancel()
+        rpc.close()
+        zeroex.close()
         store.close()
 
 
@@ -597,7 +779,7 @@ async def monitor(args):
             proposal = store.paper_proposal(proposal_id)
             signal = store.signal(proposal["source_event_id"])
             attribution = proposal.get("attribution", {})
-            matching = [policy for policy in paper_config.policies_for(signal.wallet)] \
+            matching = [policy for policy in paper_config.policies_for(signal.wallet, signal.chain_id)] \
                 if signal is not None else []
             matching = [policy for policy in matching
                         if policy.relationship_id == attribution.get("relationship_id")
@@ -962,7 +1144,7 @@ async def monitor(args):
     async def paper_observe(signal, policies=None):
         if not paper_config or signal.wallet not in paper_config.wallets:
             return
-        selected = (paper_config.policies_for(signal.wallet)
+        selected = (paper_config.policies_for(signal.wallet, signal.chain_id)
                     if policies is None else policies)
         for policy in selected:
             if signal.behavior in {"BUY", "TOKEN_SWAP"}:
@@ -1062,7 +1244,7 @@ async def monitor(args):
     async def safe_paper_observe(signal):
         if not paper_config or signal.wallet not in paper_config.wallets:
             return
-        policies = paper_config.policies_for(signal.wallet)
+        policies = paper_config.policies_for(signal.wallet, signal.chain_id)
         results = await asyncio.gather(
             *(observe_policy(signal, policy) for policy in policies),
             return_exceptions=True,
@@ -1546,7 +1728,7 @@ async def paper_mark(args):
             position = store.paper_position(lot_id)
             source = store.signal(position["source_event_id"])
             attribution = position.get("attribution", {})
-            matching = [policy for policy in config.policies_for(source.wallet)] \
+            matching = [policy for policy in config.policies_for(source.wallet, source.chain_id)] \
                 if source is not None else []
             matching = [policy for policy in matching
                         if policy.relationship_id == attribution.get("relationship_id")
@@ -1648,6 +1830,27 @@ def parser():
     arc_parser.add_argument(
         "--backfill-batch", type=int, default=500,
         help="Maximum Arc blocks per catch-up scan")
+    arc_paper_parser = commands.add_parser(
+        "arc-paper",
+        help="Copy Arc smart money in PAPER mode; no signing or broadcasting exists here")
+    arc_paper_parser.add_argument("--watchlist", default="data/fomo_watchlist.csv")
+    arc_paper_parser.add_argument(
+        "--no-relay", action="store_true",
+        help="skip Relay order lookups for cross-chain deliveries")
+    arc_paper_parser.add_argument(
+        "--seconds", type=float, default=0, help="Duration; 0 runs until interrupted")
+    arc_paper_parser.add_argument("--backfill-interval", type=float, default=15.0)
+    arc_paper_parser.add_argument("--backfill-batch", type=int, default=500)
+    arc_paper_parser.add_argument(
+        "--paper-cycle-action", choices=("reuse", "reset", "auto"), default="reuse")
+    arc_paper_parser.add_argument("--paper-cycle-id")
+    arc_paper_parser.add_argument("--paper-cycle-reason")
+    # Exit-gate thresholds. Arc meme tokens commonly carry a transaction tax and
+    # a sell side that will not route at all, so both are operator-tunable.
+    arc_paper_parser.add_argument("--max-tax-bps", type=int, default=500)
+    arc_paper_parser.add_argument("--max-round-trip-loss-bps", type=int, default=1500)
+    arc_paper_parser.add_argument("--probe-amount-raw", type=int, default=1_000_000,
+                                  help="Exit-gate probe size in Arc USDC raw units")
     monitor_source = monitor_parser.add_mutually_exclusive_group()
     monitor_source.add_argument("--paper-config")
     monitor_source.add_argument("--paper-mysql", action="store_true",
@@ -1772,6 +1975,22 @@ def main():
             with runtime_instance_lock(
                     "var/sm-copy-arc.instance.lock", "var/sm-copy-arc.pid"):
                 asyncio.run(arc_monitor(args))
+        elif args.command == "arc-paper":
+            if (args.seconds < 0 or not 0.5 <= args.backfill_interval <= 60
+                    or not 1 <= args.backfill_batch <= 2000):
+                raise ValueError("invalid Arc paper limits")
+            if args.paper_cycle_action == "reset" and (
+                    not args.paper_cycle_id or not args.paper_cycle_reason):
+                raise ValueError("paper reset requires cycle id and reason")
+            if args.paper_cycle_action != "reset" and (
+                    args.paper_cycle_id or args.paper_cycle_reason):
+                raise ValueError("only a paper reset accepts cycle id and reason")
+            # Its own lock: this lane writes the shared ledger under Arc-only
+            # scopes and must not be started twice, but it is not the Robinhood
+            # feed and does not contend with it.
+            with runtime_instance_lock(
+                    "var/sm-copy-arc-paper.instance.lock", "var/sm-copy-arc-paper.pid"):
+                asyncio.run(arc_paper(args))
         elif args.command in {"monitor", "run"}:
             if (args.seconds < 0 or not 1 <= args.workers <= 8 or not 1 <= args.queue_size <= 10000
                     or args.confirmations < 0 or not 1 <= args.backfill_batch <= MAX_RANGE_BLOCKS

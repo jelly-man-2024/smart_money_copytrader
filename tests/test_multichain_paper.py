@@ -10,6 +10,7 @@ from smart_money.paper import (
 HASH = "0x" + "33" * 32
 WALLET = "0x3004ab92565deeea0a2eaa27e40e297bb457e1a6"
 TOKEN = "0x1111111111111111111111111111111111111111"
+SMART = "0x89909912c58e2182d92b1a8638d6ff8d965e173b"
 
 
 def signal_on(chain_id, token_in, **kwargs):
@@ -208,3 +209,51 @@ class MySqlRelationshipLoadingTests(unittest.TestCase):
         rows[1]["allowed_assets"] = rows[0]["allowed_assets"]
         with self.assertRaisesRegex(ValueError, "duplicate enabled"):
             self.load(rows)
+
+
+class ChainScopedPolicyLookupTests(unittest.TestCase):
+    """The same smart wallet on two chains must never share a policy."""
+
+    def config(self):
+        from smart_money.paper_config import PaperConfig, WalletPaperPolicy
+        from smart_money.paper import AmountRule
+        from smart_money.quotes import QuotePolicy
+
+        def policy(rel, chain, run_mode, bucket, asset):
+            return WalletPaperPolicy(
+                wallet=SMART, label="s", follower_wallet=WALLET, relationship_id=rel,
+                run_mode=run_mode, budget_limits={bucket: "5000000"},
+                buy_rules={bucket: AmountRule("fixed", fixed_amount_raw="100000")},
+                sell_rule=AmountRule("proportional", ratio_ppm=1_000_000),
+                strategy_version=f"v-{rel}", trigger_mode="evidenced",
+                shadow_trigger_modes=(), quote_policy=QuotePolicy(),
+                allowed_protocols=frozenset({"v4"}), allowed_assets=frozenset({asset}),
+                allowed_routes=frozenset(), route_definitions=(), snapshot_hash="h" * 64,
+                execution_providers=("zeroex",), chain_id=chain)
+
+        relationships = (policy("9", R.CHAIN_ID, "mainnet_live", "USDG", R.USDG),
+                         policy("10", R.ARC.chain_id, "paper", "USDC", R.ARC.usdc_erc20))
+        return PaperConfig(
+            strategy_version="v", trigger_mode="evidenced", shadow_trigger_modes=(),
+            quote_policy=QuotePolicy(), allowed_protocols=frozenset({"v4"}),
+            allowed_assets=frozenset(), allowed_routes=frozenset(), route_definitions=(),
+            wallets={SMART: relationships[0]}, relationships=relationships,
+            snapshot_hash="h" * 64)
+
+    def test_a_signal_selects_only_its_own_chain_policy(self):
+        config = self.config()
+        arc = config.policies_for(SMART, R.ARC.chain_id)
+        self.assertEqual([p.relationship_id for p in arc], ["10"])
+        # The decisive property: an Arc signal must not reach the live RH policy.
+        self.assertNotIn("mainnet_live", [p.run_mode for p in arc])
+        rh = config.policies_for(SMART, R.CHAIN_ID)
+        self.assertEqual([p.relationship_id for p in rh], ["9"])
+
+    def test_chain_id_is_required_not_defaulted(self):
+        with self.assertRaises(TypeError):
+            self.config().policies_for(SMART)
+        with self.assertRaises(ValueError):
+            self.config().policies_for(SMART, "4663")
+
+    def test_unknown_chain_selects_nothing(self):
+        self.assertEqual(self.config().policies_for(SMART, 999999), ())

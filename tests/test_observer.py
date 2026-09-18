@@ -3360,7 +3360,7 @@ class SafetyTests(unittest.TestCase):
             path.write_text(json.dumps(multi))
             converted = load_paper_config(path)
         self.assertEqual(len(converted.relationships), 2)
-        self.assertEqual(len(converted.policies_for('0x' + '22' * 20)), 2)
+        self.assertEqual(len(converted.policies_for('0x' + '22' * 20, R.CHAIN_ID)), 2)
         self.assertNotEqual(converted.relationships[0].ledger_scope,
                             converted.relationships[1].ledger_scope)
 

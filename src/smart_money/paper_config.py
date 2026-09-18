@@ -88,9 +88,19 @@ class PaperConfig:
     relationships: tuple[WalletPaperPolicy, ...]
     snapshot_hash: str
 
-    def policies_for(self, smart_wallet: str) -> tuple[WalletPaperPolicy, ...]:
+    def policies_for(self, smart_wallet: str, chain_id: int) -> tuple[WalletPaperPolicy, ...]:
+        """Policies for this wallet ON THIS CHAIN.
+
+        The same smart wallet is routinely copied on more than one chain, and
+        those relationships differ in run mode, settlement asset and budget. The
+        chain is therefore required rather than defaulted: selecting by wallet
+        alone would let a signal from one chain drive another chain's policy.
+        """
         wallet = address(smart_wallet)
-        return tuple(policy for policy in self.relationships if policy.wallet == wallet)
+        if type(chain_id) is not int:
+            raise ValueError("policy lookup requires a chain id")
+        return tuple(policy for policy in self.relationships
+                     if policy.wallet == wallet and policy.chain_id == chain_id)
 
 
 def _route_key(value: dict, protocols: set[str], assets: set[str]) -> str:
