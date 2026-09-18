@@ -74,6 +74,38 @@ class JsonConnectionPool:
         for item in slots:
             self._slots.put_nowait(item)
 
+    def warm(self) -> bool:
+        """Open a connection without sending anything.
+
+        A first send otherwise pays the TLS handshake inside whatever deadline
+        the caller is holding. This only establishes the socket: it exposes no
+        request, and a failure here is not the caller's problem, because the
+        real request will surface it.
+        """
+        if self._closed:
+            return False
+        try:
+            connection = self._slots.get(timeout=self.timeout)
+        except queue.Empty:
+            return False
+        try:
+            if connection is None or connection.sock is None:
+                cls = (http.client.HTTPSConnection if self.url.scheme == "https"
+                       else http.client.HTTPConnection)
+                kwargs = {"context": self._tls} if self.url.scheme == "https" else {}
+                connection = cls(self.url.hostname, self.url.port,
+                                 timeout=self.timeout, **kwargs)
+                connection.connect()
+            connection._smcopy_last_used = time.monotonic()
+            return True
+        except Exception:
+            if connection is not None:
+                connection.close()
+            connection = None
+            return False
+        finally:
+            self._slots.put_nowait(connection)
+
     def request(self, method="GET", *, path=None, body=None, headers=None,
                 before_send=None, deadline=None, idempotent=False):
         """One HTTP call. With idempotent=True a single stale-reused-connection

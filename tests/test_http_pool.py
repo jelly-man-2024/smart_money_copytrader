@@ -264,3 +264,35 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(.005)
             self.assertTrue(connection.closed)
             self.assertEqual(pool._slots.qsize(), 1)
+
+
+class WarmTests(unittest.TestCase):
+    def test_warm_opens_a_connection_without_sending_a_request(self):
+        connection = Connection()
+        with patch('http.client.HTTPSConnection', return_value=connection) as factory:
+            pool = JsonConnectionPool('https://example.invalid', capacity=1)
+            self.addCleanup(pool.close)
+            self.assertTrue(pool.warm())
+            factory.assert_called_once()
+            self.assertIsNotNone(connection.sock)
+            self.assertEqual(connection.requests, 0)   # nothing was sent
+            self.assertEqual(list(pool.timings), [])   # and nothing was timed
+            # The next request reuses what warming opened.
+            self.assertEqual(pool.request(), {'ok': True})
+            factory.assert_called_once()
+            self.assertEqual([t['reused'] for t in pool.timings], [True])
+
+    def test_a_failed_warm_is_not_an_error_and_leaves_the_pool_usable(self):
+        broken, good = Connection(), Connection()
+        broken.connect = Mock(side_effect=TimeoutError('secret-url'))
+        with patch('http.client.HTTPSConnection', side_effect=[broken, good]):
+            pool = JsonConnectionPool('https://example.invalid', capacity=1)
+            self.addCleanup(pool.close)
+            self.assertFalse(pool.warm())
+            self.assertTrue(broken.closed)
+            self.assertEqual(pool.request(), {'ok': True})
+
+    def test_warm_on_a_closed_pool_reports_failure(self):
+        pool = JsonConnectionPool('https://example.invalid', capacity=1)
+        pool.close()
+        self.assertFalse(pool.warm())

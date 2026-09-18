@@ -529,6 +529,33 @@ def relay_associate(args):
         store.close()
 
 
+def relay_requeue_pending(args):
+    """Re-queue the strict-channel candidates behind open early lots still pending.
+
+    Until 2026-09-18 a failed Relay lookup was terminal in the strict channel, so a
+    delivery whose lookup failed once stayed ``needs_review`` and the early lot it
+    funded stayed ``pending`` forever, freezing every sell of that token for the
+    relationship. This sends only those candidates back through the normal worker,
+    which re-runs the Relay attribution and the early-lot reconciliation exactly as
+    a live delivery would. Without ``--confirm`` it only reports what it would do.
+    This command copies nothing and calls no network endpoint itself.
+    """
+    require_existing_sqlite(args)
+    store = runtime_store(args)
+    try:
+        hashes = store.pending_early_source_tx_hashes()
+        statuses = store.candidate_statuses(hashes)
+        eligible = [h for h in hashes if statuses.get(h) in {"complete", "failed"}]
+        requeued = (store.requeue_candidates(eligible, "operator_requeue_pending_early_lot")
+                    if args.confirm else 0)
+        report("relay_requeue_pending", pending_source_transactions=len(hashes),
+               eligible=len(eligible), requeued=requeued, confirmed=bool(args.confirm),
+               skipped_states={h: statuses.get(h, "missing") for h in hashes if h not in eligible},
+               live_trading=False)
+    finally:
+        store.close()
+
+
 def paper_cycle(args):
     config = runtime_paper_config(args)
     store = runtime_store(args)
@@ -971,6 +998,11 @@ async def monitor(args):
                 report("live_approval_confirmed", proposal_id=proposal_id,
                        relationship_id=policy.relationship_id,
                        live_trading=True, **confirmation)
+        # Warm the broadcast connection BEFORE preflight. The ticket that gates
+        # the send lives for two seconds from preflight, and a cold TLS handshake
+        # to a chain's RPC can eat most of that on its own.
+        if hasattr(broadcaster, "warm"):
+            await asyncio.to_thread(broadcaster.warm)
         stage = "prepare"
         try:
             try:
@@ -1363,6 +1395,7 @@ async def monitor(args):
                         timings.observe("native_trace_rpc_ms", time.monotonic() - native_started)
                     final_signals = enrich(tx, signals, receipt, watchlist, pool_checks, native_checks)
                     defer_completion = False
+                    defer_reason = "relay_request_not_ready"
                     for signal in final_signals:
                         signal.fresh = bool(tx.timestamp and health.healthy() and time.time() - tx.timestamp <= DEFAULT_FEED_MAX_AGE_SECONDS)
                         signal.evidence["account_state_source"] = "transaction_prestate_trace"
@@ -1434,10 +1467,22 @@ async def monitor(args):
                                 defer_completion = True
                                 continue
                             except (RelayApiError, RpcError, ValueError) as exc:
+                                # Failing to obtain an attribution is not evidence
+                                # that the delivery was not a purchase: a rate-limited
+                                # or failed lookup and a half-written order all land
+                                # here. Until 2026-09-18 this was terminal, so early
+                                # lots whose delivery hit one stayed pending for good
+                                # and froze every sell of that token. Queue the
+                                # candidate for the same bounded retry as an
+                                # unpublished order; exhaustion still leaves the
+                                # delivery unattributed and copies nothing.
                                 stats["relay_lookup_errors"] += 1
-                                report("relay_buy_auto_association_rejected",
+                                defer_completion = True
+                                defer_reason = "relay_lookup_failed"
+                                report("relay_buy_auto_association_deferred",
                                        source_event_id=signal.event_id,
                                        error_type=type(exc).__name__, live_trading=False)
+                                continue
                         if (relay_client is not None
                                 and signal.behavior == "SELL"
                                 and signal.stage == "needs_review"
@@ -1478,10 +1523,14 @@ async def monitor(args):
                                 defer_completion = True
                                 continue
                             except (RelayApiError, RpcError, ValueError) as exc:
+                                # Same bounded retry as the passive BUY lookup above.
                                 stats["relay_lookup_errors"] += 1
-                                report("relay_sell_confirmation_rejected",
+                                defer_completion = True
+                                defer_reason = "relay_lookup_failed"
+                                report("relay_sell_confirmation_deferred",
                                        source_event_id=signal.event_id,
                                        error_type=type(exc).__name__, live_trading=False)
+                                continue
                         route_before = observed.evidence.get("local_execution_route")
                         await safe_paper_observe(observed)
                         route_after = observed.evidence.get("local_execution_route")
@@ -1513,10 +1562,11 @@ async def monitor(args):
                             stats["receipt_relay_buy_evidenced"] += 1
                     stats["receipts"] += 1
                     if defer_completion:
-                        attempts, delay = store.retry_candidate(
-                            tx.hash, "relay_request_not_ready")
+                        attempts, delay = store.retry_candidate(tx.hash, defer_reason)
                         if delay is None:
                             stats["candidate_retry_exhausted"] += 1
+                            report("relay_lookup_retry_exhausted", tx_hash=tx.hash,
+                                   reason=defer_reason, attempts=attempts, live_trading=False)
                         else:
                             stats["candidate_retries"] += 1
                     else:
@@ -2038,6 +2088,12 @@ def parser():
     relay_associate_parser.add_argument("--document", required=True)
     relay_associate_parser.add_argument("--db", default="var/observer.sqlite3")
     relay_associate_parser.add_argument("--ledger-mysql", action="store_true")
+    relay_requeue_parser = commands.add_parser(
+        "relay-requeue-pending",
+        help="Re-queue strict-channel candidates behind pending early lots; dry run without --confirm")
+    relay_requeue_parser.add_argument("--confirm", action="store_true")
+    relay_requeue_parser.add_argument("--db", default="var/observer.sqlite3")
+    relay_requeue_parser.add_argument("--ledger-mysql", action="store_true")
     trial_start_parser = commands.add_parser("early-trial-start",
         help="Operator-only: initialize a bounded window while the emergency stop remains active")
     trial_start_parser.add_argument("--trial-id", required=True)
@@ -2170,6 +2226,8 @@ def main():
                 sort_keys=True))
         elif args.command == "relay-associate":
             relay_associate(args)
+        elif args.command == "relay-requeue-pending":
+            relay_requeue_pending(args)
         elif args.command == "relationships-import":
             inserted, skipped = import_watchlist_relationships(
                 args.follower_wallet, args.follower_label, args.watchlist, args.template)

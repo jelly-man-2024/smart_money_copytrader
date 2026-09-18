@@ -49,6 +49,10 @@ class MainnetBroadcaster:
         self.transport = JsonConnectionPool(self.endpoint, capacity=1, timeout=self.timeout,
                                             max_bytes=1024*1024)
 
+    def warm(self) -> bool:
+        """Best-effort: establish the connection before a send needs it."""
+        return self.transport.warm()
+
     def close(self):
         self.transport.close()
 
