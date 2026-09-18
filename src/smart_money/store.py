@@ -1912,6 +1912,46 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
         )
         self.connection.commit()
 
+    def candidate_statuses(self, tx_hashes: list[str]) -> dict[str, str]:
+        statuses = {}
+        for tx_hash in tx_hashes:
+            row = self.connection.execute(
+                "SELECT status FROM candidates WHERE tx_hash=?", (tx_hash,)).fetchone()
+            if row is not None:
+                statuses[tx_hash] = row[0]
+        return statuses
+
+    def requeue_candidates(self, tx_hashes: list[str], reason: str) -> int:
+        """Send finished candidates back through the worker with a fresh retry budget.
+
+        Only ``complete``/``failed`` rows are touched, so a candidate the dispatcher
+        currently owns is never stolen. The worker re-derives every signal from the
+        receipt, so re-processing cannot double-copy: the operation claim and the
+        stage-ranked signal upsert stay in force.
+        """
+        requeued = 0
+        for tx_hash in tx_hashes:
+            cursor = self.connection.execute(
+                """UPDATE candidates SET status='retry', attempts=0, next_attempt_at=0,
+                   last_error=?, updated_at=CURRENT_TIMESTAMP
+                   WHERE tx_hash=? AND status IN ('complete','failed')""",
+                (reason, tx_hash),
+            )
+            requeued += cursor.rowcount
+        self.connection.commit()
+        return requeued
+
+    def pending_early_source_tx_hashes(self) -> list[str]:
+        """Source transactions of open early lots still waiting for strict evidence."""
+        hashes = set()
+        for (payload,) in self.connection.execute(
+                "SELECT attribution_payload FROM paper_positions WHERE status='open'").fetchall():
+            attribution = json.loads(payload)
+            tx_hash = attribution.get("source_tx_hash")
+            if attribution.get("source_position_status") == "pending" and isinstance(tx_hash, str):
+                hashes.add(tx_hash.lower())
+        return sorted(hashes)
+
     def candidate_counts(self) -> dict[str, int]:
         counts = {status: count for status, count in self.connection.execute(
             "SELECT status,COUNT(*) FROM candidates GROUP BY status"

@@ -1773,3 +1773,42 @@ Simple7702Account/BaseAccount。Arc 自调用现在只在该交易 `prestateTrac
 真实 Arc Swap 冒烟窗口仍未捕获 watchlist 候选，因此当前覆盖是链上账户形态盘点、跨链运行时代码
 比对与合成的正/负解码测试，不宣称已有真实 watchlist Swap calldata 样本。后续应持续只读观察并在
 首次命中后保存脱敏公开链证据夹具，再补回放测试。
+
+## 2026-09-18：Robinhood 严格通道 Relay 查询失败改为有界重试（原因一修复）
+
+分支 `fix/robinhood-relay-lookup-retry`。背景见 `docs/feedback/image5.png`、`image6.png`。
+
+**现象。** 账本中 18 个早跟通道 lot 的 `source_position_status` 停在 `pending`，按比例卖出时
+`store.py` / `early_decision.py` 要求同（关系，币）下所有 lot 均为 confirmed，于是 15 组、56/179
+个未平仓 lot（成本 5.37/17.17 USDG）只能买不能卖，50 条卖出决策被拒为
+`source_position_basis_unconfirmed`。
+
+**根因。** 这 18 笔源交易在严格通道里的被动到账信号停在 `needs_review`
+（`recipient_is_not_proof_of_order_ownership`），日志均为
+`relay_buy_auto_association_rejected error_type=RelayApiError`。`cli.py` 的 worker 只把
+`RelayNotReady` 交给 `retry_candidate` 重试，`RelayApiError`/`RpcError`/`ValueError` 被当成永久拒绝，
+候选直接 `complete`。事后只读复查 Relay：18/18 订单可读、`status=success`、orderId 与早跟通道记录
+的 `copy_operation_order_id` 一致，说明失败是瞬时的（限流、连接失败或订单未落库时的非 200）。
+Robinhood 各次运行日志里 Relay 关联失败率约 22%（成功 566，拒绝 156）。提交 7ebf8ad 已在
+`arc_observer.py` 修了同类问题，但没有改 Robinhood 严格通道。
+
+**改动。**
+- `cli.py` worker：被动 BUY 关联与 Relay 卖出确认两处，`RelayApiError`/`RpcError`/`ValueError`
+  现在与 `RelayNotReady` 一样 `defer_completion`，候选以 `relay_lookup_failed` 进入既有的有界重试
+  （`MAX_CANDIDATE_ATTEMPTS`=8，退避 1→60 秒）；事件改为
+  `relay_buy_auto_association_deferred` / `relay_sell_confirmation_deferred`，重试耗尽时新增
+  `relay_lookup_retry_exhausted` 事件。耗尽后到账仍不归属、不复制，语义不变。
+- 新增 `sm-copy relay-requeue-pending [--ledger-mysql|--db] [--confirm]`：找出仍 pending 的早跟 lot
+  的源交易，把其 `complete`/`failed` 候选重置为 `retry`（attempts 归零）。不带 `--confirm` 只报告。
+  命令本身不调用网络、不复制；重新处理走正常 worker，Relay 归属成功后 `store.put` 的
+  `_reconcile_early_source_signal` 会把 lot 翻成 confirmed；操作已被 claim，不会二次跟买。
+- 新增/扩展测试：`tests/test_relay_lookup_filter.py`（失败查询进入重试而非拒绝）、
+  `tests/test_relay_requeue_pending.py`（dry-run 不写、只重排 pending lot 的源交易、恢复链闭环）。
+  全量 654 项 unittest 通过（12 项跳过）。
+
+**上线步骤（未执行）。** 1) 以本分支代码重启 `sm-copy run`；2) 先 `relay-requeue-pending --ledger-mysql`
+看 dry-run 数字，再加 `--confirm`；3) 观察 `relay_buy_auto_associated` 与 lot 状态，
+`pending_early_source_tx_hashes` 应归零。
+
+**未处理的设计问题。** 一个 pending lot 冻结同币全部 confirmed lot 的规则未改；原因三
+（`adverse_price_deviation_exceeded` 对卖单）由操作员另行决定。

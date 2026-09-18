@@ -18,7 +18,7 @@ from smart_money.models import Transaction
 from smart_money.receipts import (
     APPROVAL, DEPOSIT_RECORDED, SWAPS, TRANSFER, direct_token_transfer_evidence, enrich,
 )
-from smart_money.relay_api import RelayNotReady
+from smart_money.relay_api import RelayApiError, RelayNotReady
 from smart_money.store import Store
 
 SENDER, WALLET, TOKEN, OPERATOR = ("0x" + byte * 20 for byte in ("11", "22", "33", "44"))
@@ -136,13 +136,15 @@ class TransferFilterTests(unittest.TestCase):
 
 
 class MonitorFilterTests(unittest.IsolatedAsyncioTestCase):
-    async def run_monitor(self, *, unknown=False, transfer_from=False, mixed=False, enabled=True):
+    async def run_monitor(self, *, unknown=False, transfer_from=False, mixed=False, enabled=True,
+                          relay_error=None):
         tx, receipt = sample(transfer_from)
         if transfer_from:
             receipt["logs"].append(log(APPROVAL, recipient=OPERATOR))
         if unknown:
             receipt["logs"].append(log("0x"+"cc"*32))
-        relay = MagicMock(lookup_by_destination_hash=AsyncMock(side_effect=RelayNotReady("not indexed")))
+        relay = MagicMock(lookup_by_destination_hash=AsyncMock(
+            side_effect=relay_error or RelayNotReady("not indexed")))
         class Rpc:
             async def call(self, method, params=None):
                 if method == "eth_chainId":
@@ -197,6 +199,7 @@ class MonitorFilterTests(unittest.IsolatedAsyncioTestCase):
                 db.close()
             finished = next(c.kwargs for c in report.call_args_list if c.args[0] == "monitor_finished")
             skips = [c for c in report.call_args_list if c.args[0] == "relay_lookup_skipped"]
+            self.events = [c.args[0] for c in report.call_args_list]
             return relay, rows, state, inclusions, finished["counters"], skips
 
     async def test_skips_query_persists_signal_and_completes_candidate(self):
@@ -228,6 +231,30 @@ class MonitorFilterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(skips, [])
         self.assertEqual(len(rows), 1)
         self.assertNotIn("relay_lookup_skipped", rows[0]["evidence"])
+
+    async def test_failed_relay_lookup_defers_instead_of_rejecting(self):
+        # A rate-limited/failed lookup or a half-written order is not evidence
+        # that the delivery was not a purchase. Until 2026-09-18 it was terminal:
+        # the candidate completed, the delivery stayed needs_review and the early
+        # lot it funded stayed pending forever. It now takes the bounded retry.
+        for error in (RelayApiError("Relay HTTP status 429"),
+                      RelayApiError("Relay lookup failed: OSError"),
+                      ValueError("relay order output does not uniquely authorize the wallet credit")):
+            with self.subTest(error=error):
+                relay, rows, state, inclusions, counts, skips = await self.run_monitor(
+                    unknown=True, relay_error=error)
+                relay.lookup_by_destination_hash.assert_awaited_once_with(TXHASH)
+                self.assertEqual(state, ("retry", "relay_lookup_failed"))
+                self.assertEqual(inclusions, 0)
+                self.assertEqual(counts["candidate_retries"], 1)
+                self.assertEqual(counts["relay_lookup_errors"], 1)
+                self.assertEqual(counts["relay_lookup_pending"], 0)
+                self.assertIn("relay_buy_auto_association_deferred", self.events)
+                self.assertNotIn("relay_buy_auto_association_rejected", self.events)
+                self.assertNotIn("relay_lookup_retry_exhausted", self.events)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual((rows[0]["behavior"], rows[0]["stage"]),
+                                 ("INCOMING_TRANSFER", "needs_review"))
 
     async def test_other_pending_signal_still_defers_completion(self):
         relay, rows, state, inclusions, counts, skips = await self.run_monitor(mixed=True)
