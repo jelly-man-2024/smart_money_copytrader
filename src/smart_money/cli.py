@@ -21,6 +21,10 @@ from .approval import (
     confirm_relationship_token_approval,
 )
 from .backfill import MAX_RANGE_BLOCKS, BlockScanner, ReorgDetected, relevant
+
+# Tracking polls once a second, so this waits about a minute before deciding a
+# broadcast the node accepted is never going to be mined.
+DROPPED_BROADCAST_ATTEMPTS = 60
 from .broadcast import MainnetBroadcaster
 from .zeroex import ZeroExAggregatorClient, ZeroExApiError
 from .config import load_endpoint_env
@@ -914,6 +918,27 @@ async def monitor(args):
                         continue
                     return
                 stats["live_pending"] += observation.status == "observed_pending"
+                if (observation.status == "not_observed"
+                        and attempts >= DROPPED_BROADCAST_ATTEMPTS):
+                    # A node can accept a broadcast and still drop the
+                    # transaction before it is mined, so tracking would wait
+                    # forever on something that will never land while its nonce
+                    # stays reserved. The evidence required to release it is the
+                    # same as after a failed send — absent from chain AND the
+                    # nonce not consumed — and it is never re-sent.
+                    outcome = await verify_broadcast_outcome(
+                        proposal_id, observation.tx_hash, policy.follower_wallet,
+                        chain_rpcs[policy.chain_id])
+                    if outcome == "not_broadcast":
+                        released = store.reconcile_unbroadcast_after_send_failure(
+                            proposal_id,
+                            "broadcast_accepted_but_transaction_absent_chain_verified")
+                        stats["live_dropped_released"] += 1
+                        report("live_execution_dropped_released",
+                               proposal_id=proposal_id, tx_hash=observation.tx_hash,
+                               released=released, attempts=attempts, live_trading=True)
+                        if released:
+                            return
             except Exception as exc:
                 stats["live_errors"] += 1
                 errors += 1
