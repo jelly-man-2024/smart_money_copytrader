@@ -440,7 +440,8 @@ class PaperEngine:
                     or self.execution_providers.index("kyber") < self.execution_providers.index("zeroex")):
                 raise
             signal.evidence["local_execution_route"] = aggregator_route_definition(
-                quote_signal.token_in, quote_signal.token_out, "kyber")
+                quote_signal.token_in, quote_signal.token_out, "kyber",
+                signal.chain_id)
             self.store.put(signal)
             quote_signal = execution_quote_signal(signal, self.execution_routes, quote_signal.token_out)
             bundle = await self.quoter.quote_with_reference(quote_signal, amount)
@@ -612,7 +613,7 @@ class PaperEngine:
                     if provider not in self._available_aggregators():
                         raise ValueError("configured aggregator unavailable")
                     signal.evidence["local_execution_route"] = aggregator_route_definition(
-                        signal.token_in, principal_asset, provider)
+                        signal.token_in, principal_asset, provider, signal.chain_id)
                 quote_signal = execution_quote_signal(
                     signal, self.execution_routes, principal_asset)
             except ValueError:
@@ -632,7 +633,8 @@ class PaperEngine:
                     # The attributed lots exist but carry no reusable local route;
                     # the configured aggregator can still sell the exact holding.
                     route = aggregator_route_definition(
-                        signal.token_in, principal_asset, aggregators[0])
+                        signal.token_in, principal_asset, aggregators[0],
+                        signal.chain_id)
                 signal.evidence["local_execution_route"] = route
                 quote_signal = execution_quote_signal(
                     signal, self.execution_routes, principal_asset)
