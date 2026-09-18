@@ -396,7 +396,12 @@ class ArcObserver:
             self._status("arc_relay_lookup_pending", source_event_id=signal.event_id)
             return signal
         except (RelayApiError, RpcError, ValueError) as exc:
-            self._status("arc_relay_association_rejected",
+            # Failing to obtain an attribution is not evidence that the delivery
+            # was not a purchase: a rate-limited lookup, a transport failure or a
+            # half-written order all land here. Queue it like a pending order and
+            # let the bounded retry decide; exhaustion still leaves it unattributed.
+            self._relay_pending_now = True
+            self._status("arc_relay_association_deferred",
                          source_event_id=signal.event_id, error_type=type(exc).__name__)
             return signal
         self._status("arc_relay_buy_associated", source_event_id=associated.event_id,

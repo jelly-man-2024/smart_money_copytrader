@@ -126,14 +126,19 @@ class ArcRelayAssociationTests(unittest.IsolatedAsyncioTestCase):
                          ("EXTERNAL_DELIVERY_CANDIDATE", "needs_review"))
         self.assertEqual([name for name, _ in events], ["arc_relay_lookup_pending"])
 
-    async def test_a_rejected_order_never_promotes_the_signal(self):
+    async def test_a_failed_lookup_never_promotes_the_signal_and_is_deferred(self):
+        # A rate-limited or half-written lookup is missing evidence, not evidence
+        # that the delivery was not a purchase, so it is queued for a bounded
+        # retry. The signal itself is still never promoted on this pass.
         events = []
         client = AsyncMock()
         client.lookup_by_destination_hash.side_effect = RelayApiError("mismatch")
-        signal = await observer(client, lambda e, d: events.append((e, d))) \
-            ._associate_relay_delivery(credit_only_signal(), transaction(), receipt())
+        subject = observer(client, lambda e, d: events.append((e, d)))
+        signal = await subject._associate_relay_delivery(
+            credit_only_signal(), transaction(), receipt())
         self.assertEqual(signal.stage, "needs_review")
-        self.assertEqual([name for name, _ in events], ["arc_relay_association_rejected"])
+        self.assertEqual([name for name, _ in events], ["arc_relay_association_deferred"])
+        self.assertTrue(subject._relay_pending_now)
 
     async def test_an_order_for_another_wallet_is_refused(self):
         client = AsyncMock()
