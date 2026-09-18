@@ -884,8 +884,12 @@ async def monitor(args):
                     stats[f"live_{observation.status}"] += 1
                     if observation.status == "confirmed":
                         try:
+                            # Read the receipt from the chain the copy ran on:
+                            # another chain's node simply does not have it, and
+                            # settlement then fails on a trade that did land.
                             settlement = await settle_confirmed_execution(
-                                store, rpc, proposal_id, observation.tx_hash)
+                                store, chain_rpcs[policy.chain_id], proposal_id,
+                                observation.tx_hash)
                             stats["live_settled"] += 1
                             report("live_execution_settled", **settlement,
                                    live_trading=True)
