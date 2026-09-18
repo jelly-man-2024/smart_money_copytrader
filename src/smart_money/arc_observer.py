@@ -33,7 +33,7 @@ from .pools import verify_signal_pools
 from .receipts import TRANSFER, direct_token_transfer_evidence, enrich
 from .relay_api import RelayApiError, RelayNotReady
 from .rpc import ReadOnlyRpc, RpcError
-from .solver import relay_passive_buy
+from .solver import relay_confirmed_sell, relay_passive_buy
 from .store import Store
 
 
@@ -367,6 +367,39 @@ class ArcObserver:
         }
         return signal
 
+    async def _close_relay_sell(self, signal: Signal) -> Signal:
+        """Close a decoded sale whose proceeds left the chain through Relay.
+
+        The receipt proves the wallet debited a token and deposited the chain's
+        settlement asset under one order; it cannot prove the debit was a sale
+        rather than a transfer. Relay's own request states what was sold and for
+        how much, and relay_confirmed_sell accepts it only when the user, order,
+        origin deposit, sold currency and input transaction all match the local
+        evidence. A lookup that is not ready is deferred like a pending buy, not
+        rejected: missing evidence is not evidence of a non-sale.
+        """
+        if (self.relay_client is None or signal.behavior != "SELL"
+                or signal.stage != "needs_review"
+                or signal.protocol not in {"0x", "kyber"}
+                or signal.evidence.get("source_orchestrator") != "relay"
+                or "relay_sell_evidence_not_uniquely_closed" not in signal.reasons):
+            return signal
+        try:
+            document = await self.relay_client.lookup_requests_by_hash(signal.tx_hash)
+            confirmed = relay_confirmed_sell(document, signal)
+        except RelayNotReady:
+            self._relay_pending_now = True
+            self._status("arc_relay_sell_pending", source_event_id=signal.event_id)
+            return signal
+        except (RelayApiError, RpcError, ValueError) as exc:
+            self._relay_pending_now = True
+            self._status("arc_relay_sell_deferred", source_event_id=signal.event_id,
+                         error_type=type(exc).__name__)
+            return signal
+        self._status("arc_relay_sell_confirmed", source_event_id=confirmed.event_id,
+                     relay_order_id=confirmed.evidence.get("relay_order_id"))
+        return confirmed
+
     async def _associate_relay_delivery(self, signal: Signal, tx: Transaction,
                                         receipt: dict) -> Signal:
         """Turn a credit with no local debit into a BUY when Relay orchestrated it.
@@ -469,6 +502,7 @@ class ArcObserver:
                 final = [self._normalize_native_scale(item) for item in final]
                 final = [await self._associate_relay_delivery(item, tx, receipt)
                          for item in final]
+                final = [await self._close_relay_sell(item) for item in final]
                 for signal in final:
                     if self.store.put(signal) and self.on_signal is not None:
                         self.on_signal(signal)
