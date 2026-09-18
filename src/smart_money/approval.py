@@ -19,14 +19,18 @@ USDG_BUDGET_APPROVAL_MULTIPLIER = 200
 def approval_spenders(chain_id: int) -> frozenset[str]:
     """Contracts this chain may be asked to approve, resolved from its registry.
 
-    0x is deliberately absent on every chain: its allowance is granted by the
-    reviewed one-off operator path, not by this one, and the live executor skips
-    approvals for 0x accordingly. A chain that deploys none of these allows no
+    0x used to be excluded here, its one allowance granted by a reviewed one-off
+    operator path. That does not survive copytrading: a sell needs an allowance
+    for whichever token was just bought, and there is no operator in that loop.
+    0x is therefore approved by the same bounded mechanism as every other
+    router — a sell approves at most the attributable position, a buy at most
+    the proposal's input — and a chain that deploys none of these allows no
     approval at all.
     """
     chain = chain_for(chain_id)
     return frozenset(spender for spender in (
         chain.v2_router, chain.v3_router, chain.kyber_router,
+        chain.zero_x_allowance_holder,
     ) if spender is not None)
 
 

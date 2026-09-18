@@ -933,7 +933,7 @@ async def monitor(args):
         chain_rpc = chain_rpcs[policy.chain_id]
         chain = chain_for(policy.chain_id)
         early_options = {"early_intent": early_intent} if early_intent is not None else {}
-        if quote_signal.token_in != NATIVE and early_intent is None and quote_signal.protocol != "zeroex":
+        if quote_signal.token_in != NATIVE and early_intent is None:
             spender = {"v2": chain.v2_router, "v3": chain.v3_router,
                        **aggregator_routers(policy.chain_id)}.get(quote_signal.protocol)
             if spender is None:

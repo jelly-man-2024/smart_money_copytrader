@@ -59,11 +59,13 @@ class ChainBoundExecutionTests(unittest.TestCase):
             self.addCleanup(rh.close)
             self.assertEqual(rh.endpoint, "https://rh.invalid/rpc")
 
-    def test_arc_cannot_auto_approve_anything(self):
-        # 0x is excluded everywhere, and Arc registers no other approvable router,
-        # so the live path can never grant an Arc allowance on its own.
-        self.assertEqual(approval_spenders(R.ARC.chain_id), frozenset())
-        self.assertNotIn(R.ZERO_X_ALLOWANCE_HOLDER, approval_spenders(R.CHAIN_ID))
+    def test_arc_can_only_ever_approve_the_one_router_it_has(self):
+        # Arc registers no v2, v3 or Kyber router, so 0x is the only spender it
+        # can approve at all; each approval is still bounded by the position or
+        # the proposal, never unlimited.
+        self.assertEqual(approval_spenders(R.ARC.chain_id),
+                         frozenset({R.ARC.zero_x_allowance_holder}))
+        self.assertIn(R.ZERO_X_ALLOWANCE_HOLDER, approval_spenders(R.CHAIN_ID))
 
 
 if __name__ == "__main__":

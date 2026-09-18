@@ -46,7 +46,12 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tx['to'].lower(), z.USDG)
         spender, amount = decode(['address','uint256'], bytes.fromhex(tx['data'][10:]))
         self.assertEqual((spender,amount),(z.SPENDER,10000000))
-        self.assertNotIn(z.SPENDER, APPROVAL_SPENDERS)
+        # This operator path once held the ONLY route to a 0x allowance. Copy
+        # trading broke that: a sell needs an allowance for whichever token was
+        # just bought, with no operator in the loop, so the executor now grants
+        # 0x allowances through the bounded relationship path as well. This
+        # script remains for a deliberate standing grant like the first one.
+        self.assertIn(z.SPENDER, APPROVAL_SPENDERS)
         self.allowance=10000000
         tx,result=await z.inspect(self.policy,self.rpc)
         self.assertIsNone(tx)
