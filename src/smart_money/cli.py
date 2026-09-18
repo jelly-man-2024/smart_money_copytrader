@@ -1161,8 +1161,8 @@ async def monitor(args):
                 stats["live_broadcast"] += 1
                 report("live_execution_send_recovered", proposal_id=proposal_id,
                        outcome="broadcast_confirmed_onchain", tx_hash=reviewed.signed_tx_hash,
-                       error_type=type(exc).__name__, relationship_id=policy.relationship_id,
-                       live_trading=True)
+                       error_type=type(exc).__name__, error=str(exc)[:200],
+                       relationship_id=policy.relationship_id, live_trading=True)
                 task = asyncio.create_task(track_live(policy, proposal_id))
                 live_tracking_tasks.add(task)
                 task.add_done_callback(live_tracking_tasks.discard)
@@ -1172,10 +1172,13 @@ async def monitor(args):
                 # everything (no re-send) so the follower's nonce line stays intact.
                 released = store.reconcile_unbroadcast_after_send_failure(
                     proposal_id, f"send_failed_chain_verified_unbroadcast: {type(exc).__name__}")
+                # The type alone left a send failure undiagnosable; the message
+                # names which gate refused, and carries no secret.
                 report("live_execution_send_recovered", proposal_id=proposal_id,
                        outcome="released_unbroadcast" if released else "release_returned_false",
                        tx_hash=reviewed.signed_tx_hash, error_type=type(exc).__name__,
-                       relationship_id=policy.relationship_id, live_trading=True)
+                       error=str(exc)[:200], relationship_id=policy.relationship_id,
+                       live_trading=True)
                 if released:
                     return
             # uncertain, or release unexpectedly returned False -> conservative latch.
