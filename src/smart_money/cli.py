@@ -45,6 +45,7 @@ from .native_flows import verify_native_flows
 from .kyber import KyberAggregatorClient
 from .paper import (
     AGGREGATOR_PROVIDERS, AGGREGATOR_ROUTERS, PaperEngine, PaperExecutor,
+    aggregator_routers,
     PaperValuator, budget_bucket, execution_quote_signal, scope_reason,
 )
 from .paper_config import load_paper_config
@@ -52,8 +53,8 @@ from .pools import discover_v3_execution_route, verify_signal_pools
 from .quotes import LiveQuoter
 from .receipts import direct_token_transfer_evidence, enrich
 from .registry import (
-    ARC, CHAIN_ID, ENTRYPOINT, NATIVE, USDG, V2_ROUTER, V3_ROUTER, delegation,
-    load_watchlist, snapshot_delegations,
+    ARC, CHAIN_ID, ENTRYPOINT, NATIVE, USDG, V2_ROUTER, V3_ROUTER, chain_for,
+    delegation, load_watchlist, snapshot_delegations,
 )
 from .rpc import ReadOnlyRpc, RpcError, CancelledBeforeSigningRpcError
 from .relay_api import RelayApiError, RelayNotReady, RelayPublicClient
@@ -678,6 +679,9 @@ async def monitor(args):
             healthy=health.healthy)
     paper_executor = None
     live_pipelines = {}
+    # Per-chain RPC readers and broadcasters, filled in once the
+    # relationships are known; the Robinhood reader is the one above.
+    chain_rpcs, broadcasters = {CHAIN_ID: rpc}, {}
     live_tracking_tasks = set()
     live_wallet_locks = {}
     if paper_config:
@@ -717,25 +721,37 @@ async def monitor(args):
                    live_trading=False)
         paper_executor = {}
         relationship_gate = MySqlRelationshipGate() if live_policies else None
-        broadcaster = MainnetBroadcaster() if live_policies else None
+        # One RPC and one broadcaster per chain. A relationship's chain decides
+        # which it gets, so a plan built on one chain can never be preflighted,
+        # signed against, or broadcast to another chain's node.
+        for policy in paper_config.relationships:
+            if policy.chain_id not in chain_rpcs:
+                endpoint = os.environ.get(chain_for(policy.chain_id).rpc_env)
+                if not endpoint:
+                    raise ValueError(
+                        f"chain {policy.chain_id} has no configured RPC endpoint")
+                chain_rpcs[policy.chain_id] = ReadOnlyRpc(endpoint)
+            if policy.run_mode != "paper" and policy.chain_id not in broadcasters:
+                broadcasters[policy.chain_id] = MainnetBroadcaster(chain_id=policy.chain_id)
         for policy in paper_config.relationships:
             if policy.run_mode == "paper":
                 paper_executor[policy.ledger_scope] = PaperExecutor(
                     store, quoter, policy.quote_policy, policy.route_definitions)
             else:
+                chain_rpc = chain_rpcs[policy.chain_id]
                 preparer = ExecutionPreparer(
-                    store, quoter, rpc, policy.quote_policy,
+                    store, quoter, chain_rpc, policy.quote_policy,
                     policy.allowed_protocols, policy.allowed_assets,
                     policy.allowed_routes, policy.snapshot_hash,
                     single_preflight=not getattr(args, "legacy_preflight", False))
                 signer = LiveExecutionSigner(
-                    store, quoter, rpc, policy.quote_policy, policy.snapshot_hash,
+                    store, quoter, chain_rpc, policy.quote_policy, policy.snapshot_hash,
                     relationship_gate=relationship_gate)
                 reviewer = LivePreBroadcastReviewer(
-                    store, quoter, rpc, policy.quote_policy, relationship_gate)
+                    store, quoter, chain_rpc, policy.quote_policy, relationship_gate)
                 live_pipelines[policy.ledger_scope] = (
-                    preparer, signer, reviewer, broadcaster,
-                    ReadOnlyExecutionTracker(store, rpc),
+                    preparer, signer, reviewer, broadcasters[policy.chain_id],
+                    ReadOnlyExecutionTracker(store, chain_rpc),
                 )
             for mode in (policy.trigger_mode, *policy.shadow_trigger_modes):
                 paper_engines[(mode, policy.ledger_scope)] = PaperEngine(
@@ -875,16 +891,19 @@ async def monitor(args):
             await asyncio.sleep(1)
         report("live_tracking_timeout", proposal_id=proposal_id, live_trading=True)
 
-    async def verify_broadcast_outcome(proposal_id, signed_hash, follower_wallet):
+    async def verify_broadcast_outcome(proposal_id, signed_hash, follower_wallet,
+                                       chain_rpc=None):
         """After a broadcast send error, chain-check whether the signed tx reached
         the network. Returns 'broadcast', 'not_broadcast', or 'uncertain'. Read-only
         — it NEVER re-sends. 'not_broadcast' requires BOTH the tx absent from chain
         AND the follower pending nonce not advanced past the reserved nonce; any
         query failure or contradiction returns 'uncertain' (caller fault-latches)."""
         try:
-            if await rpc.call("eth_getTransactionByHash", [signed_hash]) is not None:
+            reader = chain_rpc if chain_rpc is not None else rpc
+            if await reader.call("eth_getTransactionByHash", [signed_hash]) is not None:
                 return "broadcast"
-            pending = number(await rpc.call("eth_getTransactionCount", [follower_wallet, "pending"]))
+            pending = number(await reader.call(
+                "eth_getTransactionCount", [follower_wallet, "pending"]))
             reservation = store.execution_nonce_reservation(proposal_id)
         except Exception:
             return "uncertain"
@@ -906,15 +925,17 @@ async def monitor(args):
                 raise ValueError("aggregator execution is not enabled for this relationship")
             report("route_provider_selected", proposal_id=proposal_id,
                    provider=quote_signal.protocol,
-                   router=AGGREGATOR_ROUTERS[quote_signal.protocol],
+                   router=aggregator_routers(policy.chain_id)[quote_signal.protocol],
                    relationship_id=policy.relationship_id, live_trading=True)
         elif quote_signal.protocol not in {"v2", "v3", "v4"}:
             raise ValueError("live execution route is not a verified V2/V3/V4 path")
         preparer, signer, reviewer, broadcaster, _ = live_pipelines[policy.ledger_scope]
+        chain_rpc = chain_rpcs[policy.chain_id]
+        chain = chain_for(policy.chain_id)
         early_options = {"early_intent": early_intent} if early_intent is not None else {}
         if quote_signal.token_in != NATIVE and early_intent is None and quote_signal.protocol != "zeroex":
-            spender = {"v2": V2_ROUTER, "v3": V3_ROUTER, **AGGREGATOR_ROUTERS}.get(
-                quote_signal.protocol)
+            spender = {"v2": chain.v2_router, "v3": chain.v3_router,
+                       **aggregator_routers(policy.chain_id)}.get(quote_signal.protocol)
             if spender is None:
                 raise ValueError("live token input route has no verified approval spender")
             if proposal["attribution"].get("source_behavior") == "SELL":
@@ -923,17 +944,17 @@ async def monitor(args):
                 if int(approval_amount) < int(proposal["amount_in_raw"]):
                     raise ValueError("attributed approval bound is below proposal input")
                 approval = await approve_relationship_token(
-                    policy, rpc, relationship_gate, broadcaster,
+                    policy, chain_rpc, relationship_gate, broadcaster,
                     quote_signal.token_in, approval_amount, spender,
                     minimum_required_raw=proposal["amount_in_raw"])
             elif quote_signal.token_in == USDG and spender in {
                     V3_ROUTER, *AGGREGATOR_ROUTERS.values()}:
                 approval = await approve_relationship_usdg(
-                    policy, rpc, relationship_gate, broadcaster,
+                    policy, chain_rpc, relationship_gate, broadcaster,
                     minimum_required_raw=proposal["amount_in_raw"], spender=spender)
             else:
                 approval = await approve_relationship_token(
-                    policy, rpc, relationship_gate, broadcaster,
+                    policy, chain_rpc, relationship_gate, broadcaster,
                     quote_signal.token_in, proposal["amount_in_raw"], spender)
             if approval is not None and approval.submitted:
                 stats["live_approval_broadcast"] += 1
@@ -943,7 +964,7 @@ async def monitor(args):
                        previous_allowance_raw=approval.previous_allowance_raw,
                        relationship_id=policy.relationship_id, live_trading=True)
                 confirmation = await confirm_relationship_token_approval(
-                    rpc, approval, policy.follower_wallet)
+                    chain_rpc, approval, policy.follower_wallet)
                 stats["live_approval_confirmed"] += 1
                 report("live_approval_confirmed", proposal_id=proposal_id,
                        relationship_id=policy.relationship_id,
@@ -1099,7 +1120,8 @@ async def monitor(args):
             # blindly fault-latch. Chain-verify whether the signed tx actually
             # reached the network; NEVER re-send (double-broadcast guard).
             outcome = await verify_broadcast_outcome(
-                proposal_id, reviewed.signed_tx_hash, policy.follower_wallet)
+                proposal_id, reviewed.signed_tx_hash, policy.follower_wallet,
+                chain_rpcs[policy.chain_id])
             if outcome == "broadcast":
                 # It landed despite the send error — record and track like success.
                 stats["live_broadcast"] += 1
@@ -1645,6 +1667,55 @@ async def monitor(args):
         except Exception:
             await deployment_monitor.close()
             raise
+    # Arc ingestion runs inside this same process rather than beside it: the
+    # decision path already selects policies by wallet AND chain, and execution
+    # already resolves its RPC, targets and broadcaster per chain, so a second
+    # chain needs a second source, not a second copytrader.
+    arc_tasks = []
+    if getattr(args, "arc", False):
+        arc_policies = [policy for policy in (paper_config.relationships if paper_config else ())
+                        if policy.chain_id == ARC.chain_id]
+        if not arc_policies:
+            raise ValueError("--arc requires an enabled relationship on chain 5042")
+        arc_ws_url = os.environ.get("ARC_WS_URL")
+        if not arc_ws_url:
+            raise ValueError("ARC_WS_URL is required for Arc ingestion")
+        arc_queue = asyncio.Queue(maxsize=256)
+
+        def arc_on_signal(signal):
+            try:
+                arc_queue.put_nowait(signal)
+            except asyncio.QueueFull:
+                stats["arc_queue_drops"] += 1
+                report("arc_decision_queue_full", source_event_id=signal.event_id)
+
+        def arc_status(event, details):
+            report(event, **details, chain_id=ARC.chain_id)
+
+        async def arc_decider():
+            # Serialized: one Arc decision at a time, never interleaved.
+            while True:
+                signal = await arc_queue.get()
+                try:
+                    await safe_paper_observe(signal)
+                except Exception as exc:
+                    stats["arc_decision_errors"] += 1
+                    report("arc_decision_error", source_event_id=signal.event_id,
+                           error_type=type(exc).__name__)
+                finally:
+                    arc_queue.task_done()
+
+        report("arc_ingestion_started", chain_id=ARC.chain_id,
+               relationships=[policy.relationship_id for policy in arc_policies],
+               live_trading=any(policy.run_mode != "paper" for policy in arc_policies))
+        arc_tasks = [
+            asyncio.create_task(observe_arc(
+                chain_rpcs[ARC.chain_id], arc_ws_url, store, watchlist,
+                arc_on_signal, arc_status,
+                backfill_interval=max(args.backfill_interval, 1.0),
+                backfill_batch=500, relay_client=RelayPublicClient())),
+            asyncio.create_task(arc_decider()),
+        ]
     workers = [asyncio.create_task(worker()) for _ in range(args.workers)]
     dispatch_task = asyncio.create_task(supervise_critical_task(
         "dispatcher", dispatcher_iteration, stats, critical_fail_closed))
@@ -1661,7 +1732,7 @@ async def monitor(args):
                live_trading=bool(live_pipelines))
         # Waiting on every core task (not only the receiver) turns the silent
         # death of the dispatcher, heartbeat or a worker into a loud exit.
-        core_tasks = [receiver, dispatch_task, beat, *workers]
+        core_tasks = [receiver, dispatch_task, beat, *workers, *arc_tasks]
         done, _ = await asyncio.wait(
             core_tasks, timeout=args.seconds if args.seconds > 0 else None,
             return_when=asyncio.FIRST_COMPLETED)
@@ -1673,7 +1744,7 @@ async def monitor(args):
         except asyncio.TimeoutError:
             report("drain_timeout", unfinished=queue.qsize())
     finally:
-        for task in [receiver, dispatch_task, backfill_task, beat, *workers]:
+        for task in [receiver, dispatch_task, backfill_task, beat, *workers, *arc_tasks]:
             task.cancel()
         for task in live_tracking_tasks:
             task.cancel()
@@ -1692,13 +1763,16 @@ async def monitor(args):
             relay_client.close()
         if hasattr(rpc, "close"):
             rpc.close()
+        for chain_id, chain_rpc in list(chain_rpcs.items()):
+            if chain_id != CHAIN_ID and hasattr(chain_rpc, "close"):
+                chain_rpc.close()
         if paper_config:
             for client in quoter.aggregators.values():
                 if hasattr(client, "close"):
                     client.close()
-            if live_pipelines:
-                if hasattr(broadcaster, "close"):
-                    broadcaster.close()
+            for sender in broadcasters.values():
+                if hasattr(sender, "close"):
+                    sender.close()
         store.close()
         report("monitor_finished", counters=dict(stats), candidate_states=candidate_states,
                early_feed_counters=dict(early_lane.stats) if early_lane else {},
@@ -1877,6 +1951,9 @@ def parser():
     run_parser.add_argument(
         "--seconds", type=float, default=0,
         help="Duration; 0 runs until interrupted")
+    run_parser.add_argument(
+        "--arc", action="store_true",
+        help="Also ingest Arc (chain 5042) in this process for its relationships")
     run_parser.add_argument(
         "--early-feed-evidence", action="store_true",
         help="Enable in-process evidence lane only, not early execution")
