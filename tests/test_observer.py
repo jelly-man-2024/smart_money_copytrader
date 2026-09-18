@@ -4637,6 +4637,16 @@ class AggregatorExecutionTests(unittest.TestCase):
                          (R.KYBER_META_AGGREGATION_ROUTER_V2, 'kyber', '0',
                           swap.minimum_amount_out_raw, 4102444800))
         plan.validate(frozenset({R.KYBER_META_AGGREGATION_ROUTER_V2}), now=100.5)
+        # The plan is signed for the signal's chain. Defaulting to Robinhood
+        # signed an Arc copy for the wrong chain id, and only the broadcaster's
+        # chain binding caught it, after the transaction had been signed.
+        self.assertEqual(plan.chain_id, signal.chain_id)
+        from dataclasses import replace as _replace
+        arc_plan = build_aggregator_execution_plan(
+            _replace(signal, chain_id=R.ARC.chain_id), self.FOLLOWER, '2',
+            'proposal-agg', quote, floor, swap, 600000, '200', '0',
+            frozenset({'kyber'}), frozenset({R.USDG}), frozenset())
+        self.assertEqual(arc_plan.chain_id, R.ARC.chain_id)
         rounding_floor = str(int(swap.minimum_amount_out_raw) + 1)
         self.assertEqual(build_aggregator_execution_plan(
             signal, self.FOLLOWER, '2', 'proposal-agg', quote, rounding_floor, swap,

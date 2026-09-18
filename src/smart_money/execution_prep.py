@@ -188,6 +188,7 @@ def build_execution_plan(signal, follower_wallet: str, relationship_id: str,
         max_priority_fee_per_gas=max_priority_fee_per_gas,
         quote_observed_at=quote.observed_at, quote_block_number=quote.block_number,
         quote_block_hash=quote.block_hash, deadline=deadline,
+        chain_id=signal.chain_id,
     )
 
 
@@ -289,6 +290,9 @@ def _validated_aggregator_plan(signal, follower, relationship_id, proposal_id, q
         max_priority_fee_per_gas=max_priority_fee_per_gas,
         quote_observed_at=quote.observed_at, quote_block_number=quote.block_number,
         quote_block_hash=quote.block_hash, deadline=swap.deadline,
+        # The plan carries the signal's chain: it decides which chain the
+        # transaction is signed for and which chain's node may accept it.
+        chain_id=signal.chain_id,
         execution_provider=signal.protocol,
         allowance_spender=target,
     )
