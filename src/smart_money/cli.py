@@ -25,6 +25,11 @@ from .backfill import MAX_RANGE_BLOCKS, BlockScanner, ReorgDetected, relevant
 # Tracking polls once a second, so this waits about a minute before deciding a
 # broadcast the node accepted is never going to be mined.
 DROPPED_BROADCAST_ATTEMPTS = 60
+
+# How much of an attributable position to approve for its eventual exit. A
+# bounded multiple keeps the standing allowance in proportion to what the
+# relationship actually holds while letting several buys share one approval.
+EXIT_ALLOWANCE_MULTIPLE = 10
 from .broadcast import MainnetBroadcaster
 from .zeroex import ZeroExAggregatorClient, ZeroExApiError
 from .config import load_endpoint_env
@@ -869,6 +874,53 @@ async def monitor(args):
                    status=execution.status, reason=execution.reason,
                    fill_id=execution.fill_id, paper_only=True, live_trading=False)
 
+    async def ensure_exit_allowance(policy, proposal_id):
+        """Approve the token we just bought, while nothing is waiting on it.
+
+        A sell cannot even be quoted through an aggregator until that token is
+        approved, and doing it at exit time costs an extra confirmation exactly
+        when the price is moving away. Granting it right after a buy settles
+        moves that cost off the exit path entirely; a later sell then quotes in
+        one round trip. The allowance is a bounded multiple of the position this
+        relationship can actually attribute, never unlimited, and a failure here
+        is reported and left alone: the buy already settled, and the executor
+        still approves at sell time if this never happened.
+        """
+        if policy.run_mode == "paper" or relationship_gate is None:
+            return
+        proposal = store.paper_proposal(proposal_id)
+        token = (proposal or {}).get("output_asset")
+        spender = aggregator_routers(policy.chain_id).get(
+            next((name for name in policy.execution_providers
+                  if name in AGGREGATOR_PROVIDERS), ""))
+        if not token or spender is None:
+            return
+        position = store.paper_open_position_amount(policy.ledger_scope, token)
+        if int(position) <= 0:
+            return
+        target = str(int(position) * EXIT_ALLOWANCE_MULTIPLE)
+        try:
+            approval = await approve_relationship_token(
+                policy, chain_rpcs[policy.chain_id], relationship_gate,
+                broadcasters[policy.chain_id], token, target, spender,
+                minimum_required_raw=position)
+            if approval.submitted:
+                stats["exit_allowance_broadcast"] += 1
+                confirmation = await confirm_relationship_token_approval(
+                    chain_rpcs[policy.chain_id], approval, policy.follower_wallet)
+                stats["exit_allowance_confirmed"] += 1
+                report("exit_allowance_confirmed", proposal_id=proposal_id,
+                       asset=token, spender=spender, amount_raw=target,
+                       previous_allowance_raw=approval.previous_allowance_raw,
+                       relationship_id=policy.relationship_id,
+                       live_trading=True, **(confirmation or {}))
+        except Exception as exc:
+            stats["exit_allowance_errors"] += 1
+            report("exit_allowance_failed", proposal_id=proposal_id, asset=token,
+                   spender=spender, error_type=type(exc).__name__,
+                   error=str(exc)[:200], relationship_id=policy.relationship_id,
+                   live_trading=True)
+
     async def track_live(policy, proposal_id):
         tracker = live_pipelines[policy.ledger_scope][4]
         previous = None
@@ -897,6 +949,8 @@ async def monitor(args):
                             stats["live_settled"] += 1
                             report("live_execution_settled", **settlement,
                                    live_trading=True)
+                            if settlement.get("side") == "BUY":
+                                await ensure_exit_allowance(policy, proposal_id)
                         except Exception as exc:
                             stats["live_errors"] += 1
                             if early_trial_id:
