@@ -217,38 +217,51 @@ async def arc_paper(args):
                 rule, method = policy.sell_rule, "sell"
             else:
                 return
-            for mode in (policy.trigger_mode, *policy.shadow_trigger_modes):
-                engine = engines[(mode, policy.ledger_scope)]
-                ready = ((mode == "receipt_success" and signal.execution_status == "success")
-                         or (mode == "feed_intent" and signal.stage == "intent")
-                         or (mode == "swap_evidenced" and signal.stage in {
-                             "swap_evidenced", "needs_review", "failed"})
-                         or (mode in {"relay_sell_evidenced", "relay_buy_evidenced"}
-                             and signal.stage in {mode, "needs_review", "failed"})
-                         or (mode == "evidenced" and signal.stage in {
-                             "swap_evidenced", "relay_sell_evidenced",
-                             "relay_buy_evidenced", "needs_review", "failed"}))
-                if not ready:
-                    continue
-                decision = (await engine.propose_buy(signal, rule) if method == "buy"
-                            else await engine.propose_sell(signal, rule))
-                stats["paper_decisions"] += 1
-                stats["paper_accepted" if decision.accepted else "paper_rejected"] += 1
-                report("paper_decision", decision_id=decision.decision_id,
-                       source_event_id=signal.event_id, trigger_mode=mode,
-                       relationship_id=policy.relationship_id, chain_id=signal.chain_id,
-                       shadow_only=engine.shadow_only, accepted=decision.accepted,
-                       reason=decision.reason, proposal_id=decision.proposal_id,
-                       live_trading=False)
-                if decision.accepted and decision.proposal_id and not engine.shadow_only:
-                    execution = await executors[policy.ledger_scope].execute(
-                        signal, decision.proposal_id)
-                    stats["paper_filled" if execution.status == "filled"
-                          else "paper_fill_cancelled"] += 1
-                    report("paper_execution", proposal_id=execution.proposal_id,
-                           status=execution.status, reason=execution.reason,
-                           fill_id=execution.fill_id, chain_id=signal.chain_id,
-                           paper_only=True, live_trading=False)
+            # 0x builds an executable quote only inside a bound operation
+            # context, which carries the follower, the config snapshot and the
+            # quote's age and slippage. Without it every Arc buy was rejected as
+            # quote_unavailable before any price was ever fetched.
+            with quoter.execution_context(
+                    signal.event_id, policy.follower_wallet, policy.snapshot_hash,
+                    policy.quote_policy.max_age_seconds,
+                    policy.quote_policy.max_slippage_bps) as context:
+                for mode in (policy.trigger_mode, *policy.shadow_trigger_modes):
+                    engine = engines[(mode, policy.ledger_scope)]
+                    ready = ((mode == "receipt_success" and signal.execution_status == "success")
+                             or (mode == "feed_intent" and signal.stage == "intent")
+                             or (mode == "swap_evidenced" and signal.stage in {
+                                 "swap_evidenced", "needs_review", "failed"})
+                             or (mode in {"relay_sell_evidenced", "relay_buy_evidenced"}
+                                 and signal.stage in {mode, "needs_review", "failed"})
+                             or (mode == "evidenced" and signal.stage in {
+                                 "swap_evidenced", "relay_sell_evidenced",
+                                 "relay_buy_evidenced", "needs_review", "failed"}))
+                    if not ready:
+                        continue
+                    decision = (await engine.propose_buy(signal, rule) if method == "buy"
+                                else await engine.propose_sell(signal, rule))
+                    stats["paper_decisions"] += 1
+                    stats["paper_accepted" if decision.accepted else "paper_rejected"] += 1
+                    report("paper_decision", decision_id=decision.decision_id,
+                           source_event_id=signal.event_id, trigger_mode=mode,
+                           relationship_id=policy.relationship_id, chain_id=signal.chain_id,
+                           shadow_only=engine.shadow_only, accepted=decision.accepted,
+                           reason=decision.reason, proposal_id=decision.proposal_id,
+                           live_trading=False)
+                    if decision.accepted and decision.proposal_id and not engine.shadow_only:
+                        execution = await executors[policy.ledger_scope].execute(
+                            signal, decision.proposal_id)
+                        stats["paper_filled" if execution.status == "filled"
+                              else "paper_fill_cancelled"] += 1
+                        report("paper_execution", proposal_id=execution.proposal_id,
+                               status=execution.status, reason=execution.reason,
+                               fill_id=execution.fill_id, chain_id=signal.chain_id,
+                               paper_only=True, live_trading=False)
+                report("execution_quote_requests", source_event_id=signal.event_id,
+                       relationship_id=policy.relationship_id,
+                       route_requests=context["route_requests"],
+                       build_requests=context["build_requests"],
+                       quote_reuses=context["quote_reuses"], live_trading=False)
 
     # Decisions are serialized through a bounded queue: the observer stays
     # responsive, and one slow decision can never interleave with another.
