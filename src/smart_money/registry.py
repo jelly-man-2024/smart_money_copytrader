@@ -160,8 +160,14 @@ ARC = ChainRegistry(
     # Arc watchlist audit at block 0x143122e found 18 EIP-7702 delegations,
     # all pointing at the canonical ERC-4337 Simple7702Account deployment;
     # its 3,639-byte runtime exactly matched Ethereum at the same address.
-    # There is no observed Arc EntryPoint/Relay ingestion path in this phase.
-    entrypoint=None,
+    # The EntryPoint was first recorded as absent because its Arc code hash
+    # differs from Robinhood's. That test is wrong when a chain id is an
+    # immutable: the two runtimes are 21,738 bytes each and differ in exactly
+    # 34 bytes — a 32-byte EIP-712 domain separator and a two-byte chain id,
+    # reading 0x13b2 (5042) here and 0x1237 (4663) there. Same contract.
+    # Verified 2026-09-18, after a watched wallet's sell arrived as a
+    # UserOperation and could not be decoded without it.
+    entrypoint="0x4337084d9e255ff0702461cf8895ce9e3b5ff108",
     simple_account="0xe6cae83bde06e4c305530e199d7217f42808555b",
     metamask_account=None,
     # Uniswap v4 dominates Arc volume; v2/v3 addresses are added if a decoded
@@ -183,11 +189,15 @@ ARC = ChainRegistry(
     # with byte-identical code (verified 2026-09-17 by comparing keccak of
     # eth_getCode on both chains); Relay's public API lists chain 5042 with
     # depositEnabled, and lookup_by_destination_hash resolves real Arc
-    # deliveries. The depository at 0x4cd00e38… is NOT the same contract here
-    # (same code length, different hash), so it stays unset until verified.
+    # deliveries. The depository at 0x4cd00e38… was read as a DIFFERENT contract
+    # (same length, different hash) and left unset; that reading was wrong for
+    # the same reason as the EntryPoint above — 8,628 bytes each, 34 differing,
+    # two of them the chain id. A watched wallet's cross-chain sell was then
+    # observed depositing Arc USDC into it, which is exactly the evidence
+    # relay_confirmed_sell consumes. Registered 2026-09-18.
     relay_proxy="0xccc88a9d1b4ed6b0eaba998850414b24f1c315be",
     relay_router="0xb92fe925dc43a0ecde6c8b1a2709c170ec4fff4f",
-    depository=None,
+    depository="0x4cd00e387622c35bddb9b4c962c136462338bc31",
     ripe_claim=None,
     relay_usdg_equivalents=frozenset({
         # Relay's Solana chain id and canonical USDC mint. Arc settles in USDC

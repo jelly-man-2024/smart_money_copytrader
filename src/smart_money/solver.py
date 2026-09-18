@@ -248,8 +248,12 @@ def relay_confirmed_sell(document: dict, candidate: Signal) -> Signal:
     equal the local evidence is accepted; several users can share one bundled
     transaction, so the response is filtered rather than assumed unique.
     """
-    if candidate.chain_id != R.CHAIN_ID:
-        raise ValueError("relay sells are only evidenced on Robinhood Chain")
+    # A relay sell is evidenced by a deposit into that chain's own depository,
+    # so a chain without a verified one cannot close this attribution at all.
+    chain = R.chain_for(candidate.chain_id)
+    if chain.depository is None or chain.settlement_asset is None:
+        raise ValueError(
+            f"chain {chain.chain_id} has no verified relay depository")
     if (candidate.behavior != "SELL" or candidate.stage != "needs_review"
             or candidate.protocol not in {"0x", "kyber"}
             or candidate.evidence.get("source_orchestrator") != "relay"
@@ -260,8 +264,9 @@ def relay_confirmed_sell(document: dict, candidate: Signal) -> Signal:
     order_id = str(candidate.evidence.get("relay_deposit_order_id", "")).lower()
     if len(order_id) != 66 or not order_id.startswith("0x"):
         raise ValueError("relay sell has no deposit order id")
-    if not candidate.token_in or candidate.token_out != R.USDG:
-        raise ValueError("relay sell must debit one token into the USDG deposit")
+    if not candidate.token_in or candidate.token_out != chain.settlement_asset:
+        raise ValueError(
+            "relay sell must debit one token into the chain's settlement deposit")
     deltas = candidate.evidence.get("wallet_erc20_deltas_raw", {})
     try:
         debit = -int(deltas.get(candidate.token_in, "0"))
@@ -307,7 +312,7 @@ def relay_confirmed_sell(document: dict, candidate: Signal) -> Signal:
         raise ValueError("relay origin amount is invalid") from None
     expected_origin = {
         "chainId": candidate.chain_id, "currency": candidate.token_out,
-        "depositor": candidate.wallet, "depository": R.DEPOSITORY,
+        "depositor": candidate.wallet, "depository": chain.depository,
         "transactionId": candidate.tx_hash,
     }
     if deposit_amount <= 0 or any(

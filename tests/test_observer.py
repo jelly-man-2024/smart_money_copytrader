@@ -5130,7 +5130,7 @@ class RelaySellConfirmationTests(unittest.TestCase):
             "moved more than": dict(evidence={"wallet_erc20_deltas_raw": {
                 self.SOLD: "-" + self.DEBIT, TOKEN: "5"}}),
             "not an unclosed": dict(reasons=["wallet_exchange_flows_not_closed"]),
-            "must debit one token into the USDG": dict(token_out=TOKEN),
+            "into the chain's settlement deposit": dict(token_out=TOKEN),
         }
         for message, overrides in cases.items():
             with self.subTest(message):

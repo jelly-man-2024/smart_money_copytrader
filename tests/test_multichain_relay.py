@@ -1,5 +1,6 @@
 """Relay attribution resolves the funding asset on the delivering chain."""
 import unittest
+import unittest.mock
 
 from smart_money import registry as R
 from smart_money.models import Signal
@@ -22,8 +23,12 @@ class RelayChainScopeTests(unittest.TestCase):
         # Verified on-chain 2026-09-17: same addresses, byte-identical code.
         self.assertEqual(R.ARC.relay_proxy, R.ROBINHOOD.relay_proxy)
         self.assertEqual(R.ARC.relay_router, R.ROBINHOOD.relay_router)
-        # The depository is NOT the same contract on Arc, so it stays unset.
-        self.assertIsNone(R.ARC.depository)
+        # The depository was read as a different contract because its code hash
+        # differs. It is the same contract: the runtimes differ in 34 bytes, two
+        # of which are the chain id itself, so the hashes cannot match while the
+        # contract is identical. Comparing hashes alone was the wrong test.
+        self.assertEqual(R.ARC.depository, R.ROBINHOOD.depository)
+        self.assertEqual(R.ARC.entrypoint, R.ROBINHOOD.entrypoint)
 
     def test_settlement_asset_is_per_chain(self):
         self.assertEqual(R.ROBINHOOD.settlement_asset, R.USDG)
@@ -46,14 +51,22 @@ class RelayChainScopeTests(unittest.TestCase):
         # No mapping at all stays an identity on every chain.
         self.assertEqual(_funding_normalization(R.ARC, SOLANA_USDC, SOLANA_USDC), "identity")
 
-    def test_our_own_relay_flows_refuse_other_chains_explicitly(self):
-        # These describe deposits WE make; only Robinhood has a verified
-        # depository, so they must refuse by chain rather than by a stray
-        # address comparison against another chain's contracts.
+    def test_our_own_deposit_flow_still_refuses_other_chains_explicitly(self):
+        # relay_delivery_evidence describes a deposit WE make, which needs more
+        # than a verified address, so it stays Robinhood-only for now.
         with self.assertRaisesRegex(ValueError, "only evidenced on Robinhood"):
             relay_delivery_evidence({}, signal_on(R.ARC.chain_id))
-        with self.assertRaisesRegex(ValueError, "only evidenced on Robinhood"):
+
+    def test_a_relay_sell_is_gated_by_that_chain_having_a_depository(self):
+        # Arc has a verified depository now, so the chain gate no longer refuses
+        # it; the signal's own shape does.
+        with self.assertRaisesRegex(ValueError, "not an unclosed successful relay sell"):
             relay_confirmed_sell({}, signal_on(R.ARC.chain_id))
+        # A chain without one cannot evidence a relay sell at all.
+        bare = R.ChainRegistry(chain_id=7777, name="bare")
+        with unittest.mock.patch.dict(R.CHAINS, {7777: bare}):
+            with self.assertRaisesRegex(ValueError, "no verified relay depository"):
+                relay_confirmed_sell({}, signal_on(7777))
 
 
 class NativeScaleTests(unittest.TestCase):
