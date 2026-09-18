@@ -100,3 +100,31 @@ class LegacyLedgerUpgradeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BudgetBucketValidationTests(unittest.TestCase):
+    """A chain's own bucket must be configurable, and a bogus one must not be."""
+
+    def store(self):
+        from smart_money.store import Store
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        store.start_paper_budget_cycle("cycle-1", "test")
+        return store
+
+    def test_every_declared_bucket_is_accepted(self):
+        from smart_money.paper import BUDGET_BUCKETS
+        store = self.store()
+        scope = "relationship:" + "a" * 64
+        for bucket in sorted(BUDGET_BUCKETS):
+            with self.subTest(bucket=bucket):
+                store.configure_paper_budget(scope, bucket, "5000000")
+                self.assertEqual(store.paper_budget(scope, bucket)["limit_raw"], "5000000")
+
+    def test_unknown_bucket_and_bad_limit_are_refused(self):
+        store = self.store()
+        scope = "relationship:" + "b" * 64
+        for bucket, limit in (("USDT", "5000000"), ("USDC", "0"), ("USDC", "-1"), ("USDC", "x")):
+            with self.subTest(bucket=bucket, limit=limit):
+                with self.assertRaisesRegex(ValueError, "invalid paper budget"):
+                    store.configure_paper_budget(scope, bucket, limit)

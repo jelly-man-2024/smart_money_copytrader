@@ -9,6 +9,7 @@ import time
 from . import registry as R
 from .models import Signal, Transaction, address
 from .copy_operation import CopyOperationStore, attribution_operation_key
+from .paper import BUDGET_BUCKETS
 from .early_feed_lane import EarlyFeedJobStore
 from .source_position import SourcePositionStore
 
@@ -105,9 +106,12 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             closed_at TEXT)""")
         self.connection.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_active_paper_budget_cycle
             ON paper_budget_cycles(status) WHERE status='active'""")
-        self.connection.execute("""CREATE TABLE IF NOT EXISTS paper_budgets (
+        # The allowed buckets are derived from BUDGET_BUCKETS rather than spelled
+        # out, so adding a chain's bucket cannot leave this constraint behind.
+        buckets = ",".join(f"'{bucket}'" for bucket in sorted(BUDGET_BUCKETS))
+        self.connection.execute(f"""CREATE TABLE IF NOT EXISTS paper_budgets (
             cycle_id TEXT NOT NULL, wallet TEXT NOT NULL,
-            bucket TEXT NOT NULL CHECK(bucket IN ('USDG','ETH_WETH')),
+            bucket TEXT NOT NULL CHECK(bucket IN ({buckets})),
             limit_raw TEXT NOT NULL, reserved_raw TEXT NOT NULL DEFAULT '0',
             invested_raw TEXT NOT NULL DEFAULT '0',
             chain_id INTEGER NOT NULL DEFAULT 4663,
@@ -955,7 +959,10 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
         if cycle_id is None:
             raise ValueError("no active paper budget cycle")
         wallet = wallet.lower()
-        if bucket not in {"USDG", "ETH_WETH"} or not limit_raw.isdecimal() or int(limit_raw) <= 0:
+        # Buckets are chain-scoped and defined once in paper.BUDGET_BUCKETS; a
+        # literal here silently excluded Arc's USDC bucket after it was added.
+        if (bucket not in BUDGET_BUCKETS or not limit_raw.isdecimal()
+                or int(limit_raw) <= 0):
             raise ValueError("invalid paper budget")
         old = self.connection.execute("""SELECT reserved_raw,invested_raw FROM paper_budgets
             WHERE cycle_id=? AND wallet=? AND bucket=?""",
