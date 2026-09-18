@@ -7,7 +7,7 @@ from eth_account import Account
 import pymysql
 
 from .models import address
-from .registry import CHAIN_ID
+from .registry import CHAIN_ID, CHAINS
 from .execution_controls import (
     OFFLINE_TEST_MODE, require_mainnet_signing_enabled,
     require_offline_signing_enabled,
@@ -165,7 +165,10 @@ def _validate_transaction(transaction: dict) -> None:
                "maxFeePerGas", "maxPriorityFeePerGas", "type"}
     if not isinstance(transaction, dict) or set(transaction) - allowed:
         raise ValueError("invalid signing transaction fields")
-    if transaction.get("chainId") != CHAIN_ID:
+    # A signer must refuse a chain this build does not know, but pinning it to
+    # one chain meant a correctly configured second chain could not be signed at
+    # all. The process controls above, not this check, are what authorize signing.
+    if transaction.get("chainId") not in CHAINS:
         raise ValueError("signing transaction chain mismatch")
     for name in ("nonce", "value", "gas", "maxFeePerGas", "maxPriorityFeePerGas"):
         if not isinstance(transaction.get(name), int) or transaction[name] < 0:
