@@ -17,7 +17,7 @@ from hexbytes import HexBytes
 
 from .execution_controls import require_mainnet_broadcast_enabled, _stop_controls
 from .models import address
-from .registry import CHAIN_ID
+from .registry import CHAIN_ID, chain_for
 from .preflight_ticket import fingerprint
 from eth_utils import to_checksum_address
 
@@ -32,8 +32,14 @@ class BroadcastResult:
 class MainnetBroadcaster:
     """Expose only eth_sendRawTransaction after all live controls are rechecked."""
 
-    def __init__(self, endpoint: str | None = None, timeout: float = 10.0):
-        self.endpoint = endpoint or os.environ.get("ROBINHOOD_RPC_URL")
+    def __init__(self, endpoint: str | None = None, timeout: float = 10.0,
+                 chain_id: int = CHAIN_ID):
+        # One broadcaster serves exactly one chain: its endpoint and the chain it
+        # accepts signed transactions for are fixed together, so a transaction can
+        # never be sent to the wrong chain's RPC.
+        self.chain = chain_for(chain_id)
+        self.chain_id = self.chain.chain_id
+        self.endpoint = endpoint or os.environ.get(self.chain.rpc_env)
         parsed = urllib.parse.urlparse(self.endpoint or "")
         if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
             raise ValueError("mainnet broadcaster requires an HTTPS RPC endpoint")
@@ -82,7 +88,7 @@ class MainnetBroadcaster:
             chain_id = int(decoded["chainId"])
         except Exception:
             raise ValueError("signed transaction cannot be independently verified") from None
-        if recovered != address(follower_wallet) or chain_id != CHAIN_ID:
+        if recovered != address(follower_wallet) or chain_id != self.chain_id:
             raise ValueError("signed transaction sender or chain mismatch")
         require_mainnet_broadcast_enabled(
             follower_wallet, relationship_id, config_snapshot_hash)

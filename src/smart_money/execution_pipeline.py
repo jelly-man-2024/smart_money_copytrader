@@ -13,7 +13,7 @@ from eth_utils import keccak, to_checksum_address
 from hexbytes import HexBytes
 
 from .execution_prep import (
-    EXECUTION_TARGETS, ReadOnlyExecutionPreflight, UnsignedExecutionPlan,
+    ReadOnlyExecutionPreflight, UnsignedExecutionPlan, execution_targets,
     build_aggregator_execution_plan, build_execution_plan,
     build_early_aggregator_execution_plan,
     simulate_aggregator_execution,
@@ -188,7 +188,7 @@ class ExecutionPreparer:
                 # Check funds/allowance/fee budget before the extra simulation.
                 # This read-only preflight does not reserve a nonce.
                 retry_preflight = await ReadOnlyExecutionPreflight(
-                    self.rpc, EXECUTION_TARGETS,
+                    self.rpc, execution_targets(retry_plan.chain_id),
                     self.quote_policy.max_gas_cost_wei,
                     max_quote_age_seconds=self.quote_policy.max_age_seconds).check(retry_plan)
                 validate()
@@ -304,7 +304,8 @@ class ExecutionPreparer:
 
             if self.single_preflight:
                 preflight = await ReadOnlyExecutionPreflight(
-                    self.rpc, EXECUTION_TARGETS, self.quote_policy.max_gas_cost_wei,
+                    self.rpc, execution_targets(plan.chain_id),
+                    self.quote_policy.max_gas_cost_wei,
                     max_quote_age_seconds=self.quote_policy.max_age_seconds).check(plan)
             plan, simulation = await self._simulate_with_gas_retry(
                 plan, validate_retry, allow_retry=retry_evidence is None)
@@ -321,7 +322,7 @@ class ExecutionPreparer:
             )
         if preflight is None:
             preflight = await ReadOnlyExecutionPreflight(
-                self.rpc, EXECUTION_TARGETS,
+                self.rpc, execution_targets(plan.chain_id),
                 self.quote_policy.max_gas_cost_wei,
                 max_quote_age_seconds=self.quote_policy.max_age_seconds).check(plan, now)
         preflight.update(simulation)
@@ -437,7 +438,8 @@ class OfflineExecutionSigner:
                 ticket.assert_fresh()
             except ValueError:
                 original_plan = UnsignedExecutionPlan(**row["unsigned_plan"])
-                preflight = await ReadOnlyExecutionPreflight(self.rpc, EXECUTION_TARGETS,
+                preflight = await ReadOnlyExecutionPreflight(
+                    self.rpc, execution_targets(original_plan.chain_id),
                     self.quote_policy.max_gas_cost_wei,
                     max_quote_age_seconds=self.quote_policy.max_age_seconds).check(original_plan)
                 if original_plan.execution_provider in AGGREGATOR_PROVIDERS:

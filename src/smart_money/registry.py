@@ -28,6 +28,8 @@ class ChainRegistry:
 
     chain_id: int
     name: str
+    # Which allowlisted environment variable carries this chain's HTTPS RPC.
+    rpc_env: str = ""
     # --- Assets ---
     weth: str | None = None            # canonical wrapped native (RH); Arc has none
     # A chain's native asset has two scales when its ERC-20 form differs: Arc's
@@ -95,6 +97,7 @@ class ChainRegistry:
 ROBINHOOD = ChainRegistry(
     chain_id=4663,
     name="robinhood",
+    rpc_env="ROBINHOOD_RPC_URL",
     weth="0x0bd7d308f8e1639fab988df18a8011f41eacad73",
     usdg="0x5fc5360d0400a0fd4f2af552add042d716f1d168",
     quote_assets=frozenset({
@@ -143,6 +146,7 @@ ROBINHOOD = ChainRegistry(
 ARC = ChainRegistry(
     chain_id=5042,
     name="arc",
+    rpc_env="ARC_RPC_URL",
     # Arc has no wrapped native and no separate stablecoin: USDC is the native
     # gas token (18 decimals) and is also exposed as an enshrined ERC-20 at the
     # address below (6 decimals). Both forms share one balance; the ERC-20 form

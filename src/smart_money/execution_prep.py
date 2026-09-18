@@ -14,19 +14,39 @@ from eth_abi.exceptions import DecodingError
 from .kyber import KyberSwapTransaction, decode_kyber_swap
 from .zeroex import ZeroExTransaction, decode_zeroex_swap, verify_settler
 from .models import address, number
-from .paper import AGGREGATOR_PROVIDERS, AGGREGATOR_ROUTERS, scope_reason
+from .paper import (
+    AGGREGATOR_PROVIDERS, AGGREGATOR_ROUTERS, aggregator_routers, scope_reason)
 from .quotes import Quote
 from .registry import (
-    CHAIN_ID, KNOWN_V4_HOOK_CODE_HASHES, NATIVE, UNIVERSAL_ROUTER,
-    V2_ROUTER, V3_ROUTER, WETH,
+    CHAIN_ID, CHAINS, KNOWN_V4_HOOK_CODE_HASHES, NATIVE, UNIVERSAL_ROUTER,
+    V2_ROUTER, V3_ROUTER, WETH, chain_for,
 )
 from .rpc import RpcError
 from .simulation_diagnostics import AggregatorSimulationError, simulation_failure
 
 POOL_KEY = "(address,address,uint24,int24,address)"
-LOCAL_EXECUTION_TARGETS = frozenset({V2_ROUTER, V3_ROUTER, UNIVERSAL_ROUTER})
-AGGREGATOR_EXECUTION_TARGETS = frozenset(AGGREGATOR_ROUTERS.values())
-EXECUTION_TARGETS = LOCAL_EXECUTION_TARGETS | AGGREGATOR_EXECUTION_TARGETS
+def local_execution_targets(chain_id: int) -> frozenset[str]:
+    """Routers this chain deploys itself; a chain without one allows none."""
+    chain = chain_for(chain_id)
+    return frozenset(target for target in
+                     (chain.v2_router, chain.v3_router, chain.universal_router)
+                     if target is not None)
+
+
+def aggregator_execution_targets(chain_id: int) -> frozenset[str]:
+    return frozenset(aggregator_routers(chain_id).values())
+
+
+def execution_targets(chain_id: int) -> frozenset[str]:
+    """Every contract a plan on this chain may target. Resolved per chain, because
+    the same address is a different contract across these two chains."""
+    return local_execution_targets(chain_id) | aggregator_execution_targets(chain_id)
+
+
+# Robinhood-chain aliases kept for existing call sites and tests.
+LOCAL_EXECUTION_TARGETS = local_execution_targets(CHAIN_ID)
+AGGREGATOR_EXECUTION_TARGETS = aggregator_execution_targets(CHAIN_ID)
+EXECUTION_TARGETS = execution_targets(CHAIN_ID)
 
 
 def _uint(value: str, name: str) -> int:
@@ -353,13 +373,15 @@ class UnsignedExecutionPlan:
         now = time.time() if now is None else now
         follower, target = address(self.follower_wallet), address(self.to)
         address(self.input_asset)
-        if target not in allowed_targets or self.chain_id != CHAIN_ID:
+        if target not in allowed_targets or self.chain_id not in CHAINS:
             raise ValueError("execution target or chain is not allowed")
+        routers = aggregator_routers(self.chain_id)
         if self.execution_provider != "local" and (
                 self.execution_provider not in AGGREGATOR_PROVIDERS
-                or target != AGGREGATOR_ROUTERS[self.execution_provider]):
+                or target != routers.get(self.execution_provider)):
             raise ValueError("execution provider does not match the plan target")
-        if self.execution_provider == "local" and target in AGGREGATOR_EXECUTION_TARGETS:
+        if (self.execution_provider == "local"
+                and target in aggregator_execution_targets(self.chain_id)):
             raise ValueError("local execution plan targets an aggregator router")
         if self.allowance_spender is not None and address(self.allowance_spender) != target:
             raise ValueError("unverified allowance spender")
