@@ -89,14 +89,23 @@ class JsonConnectionPool:
         except queue.Empty:
             return False
         try:
-            if connection is None or connection.sock is None:
+            # A pooled connection can be long dead while its socket object still
+            # exists. Warming must apply the same idle rule a request does and
+            # must NOT stamp a connection it did not open: stamping one blindly
+            # marked a stale connection as fresh, which defeated the idle drop
+            # and handed the next send a closed socket.
+            last_used = getattr(connection, "_smcopy_last_used", None)
+            if (connection is None or connection.sock is None or last_used is None
+                    or time.monotonic() - last_used > self._idle_reuse_timeout):
+                if connection is not None:
+                    connection.close()
                 cls = (http.client.HTTPSConnection if self.url.scheme == "https"
                        else http.client.HTTPConnection)
                 kwargs = {"context": self._tls} if self.url.scheme == "https" else {}
                 connection = cls(self.url.hostname, self.url.port,
                                  timeout=self.timeout, **kwargs)
                 connection.connect()
-            connection._smcopy_last_used = time.monotonic()
+                connection._smcopy_last_used = time.monotonic()
             return True
         except Exception:
             if connection is not None:

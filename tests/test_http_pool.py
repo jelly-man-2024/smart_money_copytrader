@@ -296,3 +296,33 @@ class WarmTests(unittest.TestCase):
         pool = JsonConnectionPool('https://example.invalid', capacity=1)
         pool.close()
         self.assertFalse(pool.warm())
+
+
+class WarmStalenessTests(unittest.TestCase):
+    def test_warming_replaces_a_connection_that_sat_past_the_idle_window(self):
+        stale, fresh = Connection(), Connection()
+        with patch('http.client.HTTPSConnection', side_effect=[stale, fresh]) as factory:
+            pool = JsonConnectionPool('https://example.invalid', capacity=1,
+                                      idle_reuse_timeout=5.0)
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.request(), {'ok': True})
+            stale._smcopy_last_used -= 60          # sat between two trades
+            self.assertTrue(pool.warm())
+            self.assertTrue(stale.closed)          # dead socket discarded
+            self.assertEqual(factory.call_count, 2)
+            # The send that follows uses the connection warming actually opened.
+            self.assertEqual(pool.request(), {'ok': True})
+            self.assertEqual(factory.call_count, 2)
+
+    def test_warming_never_refreshes_a_connection_it_did_not_open(self):
+        # Stamping a connection warming only inspected would defeat the idle
+        # drop: the next request would reuse a socket the server had closed.
+        connection = Connection()
+        with patch('http.client.HTTPSConnection', return_value=connection):
+            pool = JsonConnectionPool('https://example.invalid', capacity=1,
+                                      idle_reuse_timeout=5.0)
+            self.addCleanup(pool.close)
+            self.assertEqual(pool.request(), {'ok': True})
+            stamped = connection._smcopy_last_used
+            self.assertTrue(pool.warm())
+            self.assertEqual(connection._smcopy_last_used, stamped)
