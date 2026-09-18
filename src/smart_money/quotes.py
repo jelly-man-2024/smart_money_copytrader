@@ -68,6 +68,11 @@ class Quote:
         return result
 
 
+# A cap of 10 000 bps can never be exceeded (both ratios are bounded by it), so
+# it is the explicit way to switch a sell-side price check off in configuration.
+PRICE_CHECK_DISABLED_BPS = 10_000
+
+
 @dataclass(frozen=True)
 class QuotePolicy:
     max_age_seconds: float = 2.0
@@ -76,6 +81,16 @@ class QuotePolicy:
     max_slippage_bps: int = 300
     max_gas_cost_wei: str = "10000000000000000"
     min_amount_out_raw: str = "1"
+    # Sell-side overrides. ``None`` inherits the buy-side value, so existing
+    # configurations behave exactly as before. Set the two caps to
+    # PRICE_CHECK_DISABLED_BPS to stop refusing an exit because the smart wallet's
+    # own trade already moved the pool (adverse deviation measures our quote
+    # against THEIR fill; price impact measures our own order's footprint), and
+    # use the absolute proceeds floor, in the settlement asset's raw units, to
+    # keep dust and drained pools from being sold for less than the gas they cost.
+    sell_max_adverse_deviation_bps: int | None = None
+    sell_max_price_impact_bps: int | None = None
+    sell_min_amount_out_raw: str | None = None
 
     def __post_init__(self):
         if not 0 < self.max_age_seconds <= 60:
@@ -90,40 +105,77 @@ class QuotePolicy:
             raise ValueError("invalid maximum gas cost")
         if not self.min_amount_out_raw.isdecimal() or int(self.min_amount_out_raw) <= 0:
             raise ValueError("invalid minimum output")
+        for name in ("sell_max_adverse_deviation_bps", "sell_max_price_impact_bps"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)
+                                      or not 0 <= value <= 10_000):
+                raise ValueError(f"invalid {name}")
+        if self.sell_min_amount_out_raw is not None and (
+                not isinstance(self.sell_min_amount_out_raw, str)
+                or not self.sell_min_amount_out_raw.isdecimal()
+                or int(self.sell_min_amount_out_raw) <= 0):
+            raise ValueError("invalid sell minimum output")
+
+    def adverse_deviation_cap_bps(self, side: str | None) -> int:
+        if side == "SELL" and self.sell_max_adverse_deviation_bps is not None:
+            return self.sell_max_adverse_deviation_bps
+        return self.max_adverse_deviation_bps
+
+    def price_impact_cap_bps(self, side: str | None) -> int:
+        if side == "SELL" and self.sell_max_price_impact_bps is not None:
+            return self.sell_max_price_impact_bps
+        return self.max_price_impact_bps
+
+    def output_floor(self, side: str | None) -> tuple[int, str]:
+        """Minimum acceptable output and the rejection reason for falling under it."""
+        if side == "SELL" and self.sell_min_amount_out_raw is not None:
+            return int(self.sell_min_amount_out_raw), "sell_proceeds_below_floor"
+        return int(self.min_amount_out_raw), "quote_has_insufficient_output"
 
 
 def validate_quote(signal: Signal, quote: Quote, policy: QuotePolicy,
                    now: float | None = None) -> tuple[bool, str | None, dict]:
     now = time.time() if now is None else now
-    evidence = {"quote_age_ms": str(max(0, int((now - quote.observed_at) * 1000)))}
+    side = signal.behavior
+    evidence = {"quote_age_ms": str(max(0, int((now - quote.observed_at) * 1000))),
+                "price_check_side": side}
     if now < quote.observed_at or now - quote.observed_at > policy.max_age_seconds:
         return False, "quote_missing_or_expired", evidence
     if quote.input_asset != signal.token_in or quote.output_asset != signal.token_out:
         return False, "quote_asset_mismatch", evidence
-    if int(quote.amount_out_raw) < int(policy.min_amount_out_raw):
-        return False, "quote_has_insufficient_output", evidence
+    floor, floor_reason = policy.output_floor(side)
+    if int(quote.amount_out_raw) < floor:
+        return False, floor_reason, evidence
+    adverse_cap = policy.adverse_deviation_cap_bps(side)
+    evidence["adverse_deviation_cap_bps"] = str(adverse_cap)
     target_in = signal.evidence.get("actual_input_debit_raw")
     target_out = signal.evidence.get("actual_output_credit_raw")
     if not (isinstance(target_in, str) and target_in.isdecimal() and int(target_in) > 0
             and isinstance(target_out, str) and target_out.isdecimal() and int(target_out) > 0):
-        if (signal.stage != "intent" or signal.exact_in is not True
-                or not isinstance(signal.amount_in_raw, str)
-                or not signal.amount_in_raw.isdecimal() or int(signal.amount_in_raw) <= 0
-                or not isinstance(signal.amount_limit_raw, str)
-                or not signal.amount_limit_raw.isdecimal() or int(signal.amount_limit_raw) <= 0):
-            return False, "source_execution_price_missing", evidence
-        scaled_minimum = ((int(signal.amount_limit_raw) * int(quote.amount_in_raw)
-                           + int(signal.amount_in_raw) - 1) // int(signal.amount_in_raw))
-        evidence["source_price_basis"] = "intent_exact_in_minimum"
-        evidence["scaled_source_minimum_out_raw"] = str(scaled_minimum)
-        if int(quote.amount_out_raw) < scaled_minimum:
-            return False, "intent_price_limit_not_met", evidence
-        return True, None, evidence
+        intent_limit_known = (
+            signal.stage == "intent" and signal.exact_in is True
+            and isinstance(signal.amount_in_raw, str)
+            and signal.amount_in_raw.isdecimal() and int(signal.amount_in_raw) > 0
+            and isinstance(signal.amount_limit_raw, str)
+            and signal.amount_limit_raw.isdecimal() and int(signal.amount_limit_raw) > 0)
+        if intent_limit_known:
+            scaled_minimum = ((int(signal.amount_limit_raw) * int(quote.amount_in_raw)
+                               + int(signal.amount_in_raw) - 1) // int(signal.amount_in_raw))
+            evidence["source_price_basis"] = "intent_exact_in_minimum"
+            evidence["scaled_source_minimum_out_raw"] = str(scaled_minimum)
+            if int(quote.amount_out_raw) < scaled_minimum:
+                return False, "intent_price_limit_not_met", evidence
+            return True, None, evidence
+        if side == "SELL" and adverse_cap >= PRICE_CHECK_DISABLED_BPS:
+            # The source fill price only feeds a check this sell does not run.
+            evidence["source_price_comparison"] = "skipped_sell_adverse_deviation_disabled"
+            return True, None, evidence
+        return False, "source_execution_price_missing", evidence
     denominator = int(target_out) * int(quote.amount_in_raw)
     difference = denominator - int(quote.amount_out_raw) * int(target_in)
     adverse_bps = max(0, difference * 10_000 // denominator)
     evidence["adverse_price_deviation_bps"] = str(adverse_bps)
-    if adverse_bps > policy.max_adverse_deviation_bps:
+    if adverse_bps > adverse_cap:
         return False, "adverse_price_deviation_exceeded", evidence
     return True, None, evidence
 
@@ -133,22 +185,31 @@ def assess_quote(signal: Signal, quote: Quote, reference: Quote, policy: QuotePo
     allowed, reason, evidence = validate_quote(signal, quote, policy, now)
     if not allowed:
         return allowed, reason, evidence
-    return assess_market_quote(quote, reference, policy, gas_price_wei, now, evidence)
+    return assess_market_quote(quote, reference, policy, gas_price_wei, now, evidence,
+                               side=signal.behavior)
 
 
 def assess_market_quote(quote: Quote, reference: Quote, policy: QuotePolicy,
                         gas_price_wei: str, now: float | None = None,
-                        evidence: dict | None = None) -> tuple[bool, str | None, dict]:
-    """Assess an executable quote without requiring a source-wallet execution price."""
+                        evidence: dict | None = None,
+                        side: str | None = None) -> tuple[bool, str | None, dict]:
+    """Assess an executable quote without requiring a source-wallet execution price.
+
+    ``side`` selects the sell-side policy overrides; ``None`` keeps the buy-side
+    caps, which is what every caller without a source signal used before.
+    """
     now = time.time() if now is None else now
     evidence = dict(evidence or {})
+    if side is not None:
+        evidence.setdefault("price_check_side", side)
     if now < reference.observed_at or now - reference.observed_at > policy.max_age_seconds:
         return False, "reference_quote_missing_or_expired", evidence
     evidence.setdefault("quote_age_ms", str(max(0, int((now - quote.observed_at) * 1000))))
     if now < quote.observed_at or now - quote.observed_at > policy.max_age_seconds:
         return False, "quote_missing_or_expired", evidence
-    if int(quote.amount_out_raw) < int(policy.min_amount_out_raw):
-        return False, "quote_has_insufficient_output", evidence
+    floor, floor_reason = policy.output_floor(side)
+    if int(quote.amount_out_raw) < floor:
+        return False, floor_reason, evidence
     if (reference.protocol != quote.protocol or reference.block_hash != quote.block_hash
             or reference.input_asset != quote.input_asset
             or reference.output_asset != quote.output_asset):
@@ -159,8 +220,10 @@ def assess_market_quote(quote: Quote, reference: Quote, policy: QuotePolicy,
         return False, "invalid_reference_quote", evidence
     denominator = ref_out * full_in
     impact = max(0, (denominator - full_out * ref_in) * 10_000 // denominator)
+    impact_cap = policy.price_impact_cap_bps(side)
     evidence["estimated_price_impact_bps"] = str(impact)
-    if impact > policy.max_price_impact_bps:
+    evidence["price_impact_cap_bps"] = str(impact_cap)
+    if impact > impact_cap:
         return False, "price_impact_exceeded", evidence
     if not isinstance(gas_price_wei, str) or not gas_price_wei.isdecimal():
         return False, "gas_price_missing", evidence

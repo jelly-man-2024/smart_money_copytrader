@@ -1812,3 +1812,35 @@ Robinhood 各次运行日志里 Relay 关联失败率约 22%（成功 566，拒�
 
 **未处理的设计问题。** 一个 pending lot 冻结同币全部 confirmed lot 的规则未改；原因三
 （`adverse_price_deviation_exceeded` 对卖单）由操作员另行决定。
+
+## 2026-09-19：卖出侧价格检查改为回款下限（原因三）
+
+同一分支 `fix/robinhood-relay-lookup-retry`。操作员决定：跟单卖出时不再因为
+`adverse_price_deviation_exceeded`（我方报价对聪明钱成交价的不利偏离）和
+`price_impact_exceeded`（我方整单对 1/100 参考报价的冲击）否决离场，改用绝对回款下限。
+
+**依据。** 账本 242 笔偏离拒绝中 49 笔卖单，去重 27 笔：从对方成交区块到我方报价中位 2.8 秒
+（Robinhood 约 0.1 秒一块，21 块），与被接受的卖单一致；偏离 5%–19% 是对方自己几百到几千美元订单
+在浅池子里造成的价格冲击，不是延时，也不是参考报价取整（取整只会把冲击压成 0）。
+卖出的目的在于离场，用"比对方卖得差多少"否决离场，会让我们抱着一个池子已经被砸过的币不动。
+但完全不设门槛会把粉尘仓位和已抽干的池子按接近零的价格卖出并白付 gas（真实例子：回款 $0.00065）。
+
+**改动。**
+- `QuotePolicy` 新增三个可选字段，缺省 `None` = 沿用买入侧值，现有配置行为不变：
+  `sell_max_adverse_deviation_bps`、`sell_max_price_impact_bps`（设为 10000 即关闭，因两项比率
+  上限本身就是 10000）、`sell_min_amount_out_raw`（结算资产原始单位的回款下限，触发原因
+  `sell_proceeds_below_floor`）。
+- `validate_quote` / `assess_market_quote` 按 `signal.behavior` 取卖出侧上限；卖出侧偏离检查关闭时
+  不再要求源成交价（`source_execution_price_missing` 只对买入和未关闭的卖出成立）。两项 bps 仍写入
+  `risk` 证据（含 `*_cap_bps`、`price_check_side`）供事后审计。早跟通道的
+  `intent_price_limit_not_met`（对方自己的限价折算）不属于这两项，保持不变。
+- `paper.py` 中"输出资产与源不同"的两处 `assess_market_quote` 调用传入 `side`；持仓 `mark` 未改。
+- 买入侧三项检查原样保留。`paper_config` 接受这三个可选字段。
+- 测试 `tests/test_sell_price_checks.py`；全量 675 项 unittest 通过（12 项跳过）。
+
+**配置（未执行）。** `var/enable_sell_price_floor_20260919.py`（var/ 不入库）：dry-run 打印六个
+Robinhood 关系当前值；`--confirm` 用一条 UPDATE 写入
+`sell_max_adverse_deviation_bps=10000, sell_max_price_impact_bps=10000, sell_min_amount_out_raw="10000"`
+并在同一语句里刷新 `live_risk_accepted_at`/`updated_at`，随后只读重新解析配置。须在进程停止时执行
+（快照哈希会变）。回款下限 10000 = 0.01 USDG 是初始值：当前每笔 gas 约 0.00002 ETH，仓位 0.1 USDG，
+比例卖出的单笔回款多在 $0.01–$0.3；调高下限会挡掉更多小额离场，由操作员权衡。Arc 关系 10 未包含。

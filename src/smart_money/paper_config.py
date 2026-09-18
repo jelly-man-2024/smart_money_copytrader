@@ -196,6 +196,9 @@ def parse_paper_config(document: dict) -> PaperConfig:
     quote_fields = {
         "max_age_seconds", "max_adverse_deviation_bps", "max_price_impact_bps",
         "max_slippage_bps", "max_gas_cost_wei", "min_amount_out_raw",
+        # Optional sell-side overrides; absent means inherit the buy-side value.
+        "sell_max_adverse_deviation_bps", "sell_max_price_impact_bps",
+        "sell_min_amount_out_raw",
     }
     _fields(quote_values, quote_fields, set(), "quote policy")
     try:

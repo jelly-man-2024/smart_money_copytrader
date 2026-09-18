@@ -650,7 +650,7 @@ class PaperEngine:
                 signal, quote, reference, self.quote_policy, gas_price, now)
         else:
             accepted, reason, risk = assess_market_quote(
-                quote, reference, self.quote_policy, gas_price, now)
+                quote, reference, self.quote_policy, gas_price, now, side=signal.behavior)
             risk["source_price_comparison"] = "not_comparable_output_asset_changed"
         quote_payload = {
             "quote": quote.to_dict(), "reference_quote": reference.to_dict(),
@@ -727,7 +727,7 @@ class PaperExecutor:
                     signal, quote, reference, self.quote_policy, gas_price, now)
             else:
                 accepted, reason, risk = assess_market_quote(
-                    quote, reference, self.quote_policy, gas_price, now)
+                    quote, reference, self.quote_policy, gas_price, now, side=signal.behavior)
                 risk["source_price_comparison"] = "not_comparable_output_asset_changed"
         except (RpcError, ValueError):
             self.store.cancel_paper_proposal(proposal_id, "fill_requote_unavailable")
