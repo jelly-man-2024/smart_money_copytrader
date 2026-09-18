@@ -909,11 +909,14 @@ async def monitor(args):
                 confirmation = await confirm_relationship_token_approval(
                     chain_rpcs[policy.chain_id], approval, policy.follower_wallet)
                 stats["exit_allowance_confirmed"] += 1
+                # The confirmation is nested rather than splatted: it carries
+                # its own asset/spender keys, and merging them collided with
+                # the ones named here.
                 report("exit_allowance_confirmed", proposal_id=proposal_id,
                        asset=token, spender=spender, amount_raw=target,
                        previous_allowance_raw=approval.previous_allowance_raw,
                        relationship_id=policy.relationship_id,
-                       live_trading=True, **(confirmation or {}))
+                       confirmation=confirmation, live_trading=True)
         except Exception as exc:
             stats["exit_allowance_errors"] += 1
             report("exit_allowance_failed", proposal_id=proposal_id, asset=token,
