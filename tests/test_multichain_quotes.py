@@ -115,3 +115,48 @@ class ZeroExChainTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await quoter._request_route(signal, "1000000")
         self.assertEqual(seen["chain_id"], R.ARC.chain_id)
+
+
+class PerChainReaderTests(unittest.IsolatedAsyncioTestCase):
+    """A quote must read the chain it is quoting, never another one."""
+
+    async def test_gas_price_and_header_come_from_the_signal_chain(self):
+        from smart_money.quotes import LiveQuoter
+        seen = []
+
+        def reader(chain_id, gas_price):
+            rpc = SimpleNamespace()
+
+            async def call(method, params=None):
+                seen.append((chain_id, method))
+                if method == "eth_getBlockByNumber":
+                    return {"number": "0x10", "hash": "0x" + "22" * 32}
+                if method == "eth_gasPrice":
+                    return hex(gas_price)
+                raise AssertionError(method)
+            rpc.call = call
+            return rpc
+
+        # Robinhood gas is ~0.055 gwei and Arc's ~20 gwei: reading the wrong one
+        # produced a max fee far below the network's and abandoned every plan.
+        quoter = LiveQuoter(reader(R.CHAIN_ID, 55_000_000), {},
+                            chain_rpcs={R.CHAIN_ID: reader(R.CHAIN_ID, 55_000_000),
+                                        R.ARC.chain_id: reader(R.ARC.chain_id, 20_100_000_000)})
+        signal = swap_signal(R.ARC.chain_id, "v4", evidence={
+            "pool_key": [R.ARC.usdc_erc20, TOKEN, 3000, 60, R.NATIVE], "hook_data": "0x"})
+        with self.assertRaises(Exception):
+            await quoter.quote_with_reference(signal, "1000000")
+        self.assertTrue(seen, "the quoter read something")
+        self.assertEqual({chain for chain, _ in seen}, {R.ARC.chain_id})
+
+    async def test_a_chain_the_quoter_was_not_given_is_refused(self):
+        from smart_money.quotes import LiveQuoter
+        quoter = LiveQuoter(SimpleNamespace(call=AsyncMock()), {},
+                            chain_rpcs={R.CHAIN_ID: SimpleNamespace(call=AsyncMock())})
+        with self.assertRaisesRegex(ValueError, "no RPC configured for chain 5042"):
+            quoter._rpc_for(R.ARC.chain_id)
+
+    def test_a_single_chain_quoter_keeps_its_only_reader(self):
+        from smart_money.quotes import LiveQuoter
+        rpc = SimpleNamespace(call=AsyncMock())
+        self.assertIs(LiveQuoter(rpc)._rpc_for(R.ARC.chain_id), rpc)

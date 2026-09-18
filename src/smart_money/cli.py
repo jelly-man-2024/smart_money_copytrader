@@ -705,22 +705,6 @@ async def monitor(args):
         report("paper_cycle_initialized" if cycle_created else "paper_cycle_reused",
                cycle_id=cycle_id, wallets=len(paper_config.relationships),
                automatic=args.paper_cycle_action == "auto", live_trading=False)
-        aggregators = {}
-        for policy in paper_config.relationships:
-            for provider in policy.execution_providers:
-                if provider == "kyber" and provider not in aggregators:
-                    aggregators[provider] = KyberAggregatorClient()
-                elif provider == "zeroex" and provider not in aggregators:
-                    aggregators[provider] = ZeroExAggregatorClient(os.environ.get("0X_API_KEY"))
-        quoter = LiveQuoter(rpc, aggregators)
-        if aggregators:
-            report("execution_providers_ready", providers=sorted(aggregators),
-                   relationships=sum(1 for policy in paper_config.relationships
-                                     if any(p in aggregators
-                                            for p in policy.execution_providers)),
-                   live_trading=False)
-        paper_executor = {}
-        relationship_gate = MySqlRelationshipGate() if live_policies else None
         # One RPC and one broadcaster per chain. A relationship's chain decides
         # which it gets, so a plan built on one chain can never be preflighted,
         # signed against, or broadcast to another chain's node.
@@ -733,6 +717,24 @@ async def monitor(args):
                 chain_rpcs[policy.chain_id] = ReadOnlyRpc(endpoint)
             if policy.run_mode != "paper" and policy.chain_id not in broadcasters:
                 broadcasters[policy.chain_id] = MainnetBroadcaster(chain_id=policy.chain_id)
+        aggregators = {}
+        for policy in paper_config.relationships:
+            for provider in policy.execution_providers:
+                if provider == "kyber" and provider not in aggregators:
+                    aggregators[provider] = KyberAggregatorClient()
+                elif provider == "zeroex" and provider not in aggregators:
+                    aggregators[provider] = ZeroExAggregatorClient(os.environ.get("0X_API_KEY"))
+        # The quoter reads headers, gas prices and contracts per chain: a fee
+        # built from another chain's gas price is off by orders of magnitude.
+        quoter = LiveQuoter(rpc, aggregators, chain_rpcs=chain_rpcs)
+        if aggregators:
+            report("execution_providers_ready", providers=sorted(aggregators),
+                   relationships=sum(1 for policy in paper_config.relationships
+                                     if any(p in aggregators
+                                            for p in policy.execution_providers)),
+                   live_trading=False)
+        paper_executor = {}
+        relationship_gate = MySqlRelationshipGate() if live_policies else None
         for policy in paper_config.relationships:
             if policy.run_mode == "paper":
                 paper_executor[policy.ledger_scope] = PaperExecutor(

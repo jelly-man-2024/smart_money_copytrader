@@ -185,8 +185,13 @@ AGGREGATOR_PROTOCOLS = frozenset({"kyber", "zeroex"})
 
 
 class LiveQuoter:
-    def __init__(self, rpc, aggregators: dict | None = None):
+    def __init__(self, rpc, aggregators: dict | None = None,
+                 chain_rpcs: dict | None = None):
+        # One quoter can serve several chains, but it must never read a block
+        # header, a gas price or a contract from the wrong one: fees and blocks
+        # differ by orders of magnitude between them.
         self.rpc = rpc
+        self._chain_rpcs = dict(chain_rpcs or {})
         self.aggregators = dict(aggregators or {})
         self._context = ContextVar("execution_quote_context", default=None)
         self.shared_routes_enabled = False
@@ -220,6 +225,16 @@ class LiveQuoter:
         return hashlib.sha256(json.dumps(
             [signal.to_dict(), amount], sort_keys=True, separators=(",", ":")
         ).encode()).hexdigest()
+
+    def _rpc_for(self, chain_id: int):
+        """The reader for this chain. A multi-chain quoter refuses a chain it was
+        not given rather than silently falling back to another chain's node."""
+        if not self._chain_rpcs:
+            return self.rpc
+        try:
+            return self._chain_rpcs[chain_id]
+        except KeyError:
+            raise ValueError(f"no RPC configured for chain {chain_id}") from None
 
     def _quotable_protocols(self) -> frozenset[str]:
         return frozenset({"v2", "v3", "v4"} | set(self.aggregators))
@@ -352,7 +367,8 @@ class LiveQuoter:
             raise ValueError("signal is not a supported quotable swap")
         if not amount_in_raw.isdecimal() or int(amount_in_raw) <= 0:
             raise ValueError("invalid quote input amount")
-        header = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
+        header = await self._rpc_for(signal.chain_id).call(
+            "eth_getBlockByNumber", ["latest", False])
         if not isinstance(header, dict) or not isinstance(header.get("hash"), str):
             raise ValueError("quote block header missing")
         return await self._quote_at(signal, amount_in_raw, header)
@@ -378,7 +394,8 @@ class LiveQuoter:
             context["routes"].clear()
             context["swaps"].clear()
             context["refreshes"] += 1
-        header = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
+        header = await self._rpc_for(signal.chain_id).call(
+            "eth_getBlockByNumber", ["latest", False])
         if not isinstance(header, dict) or not isinstance(header.get("hash"), str):
             raise ValueError("quote block header missing")
         async def full_quote():
@@ -397,7 +414,8 @@ class LiveQuoter:
         results = await asyncio.gather(
             full_quote(),
             self._quote_at(signal, str(reference_amount), header),
-            self.rpc.call("eth_gasPrice"), return_exceptions=True)
+            self._rpc_for(signal.chain_id).call("eth_gasPrice"),
+            return_exceptions=True)
         for result in results:
             if isinstance(result, BaseException):
                 if context:
@@ -434,7 +452,8 @@ class LiveQuoter:
         token_out = _erc20(signal.token_out, chain)
         if token_in == token_out:
             raise ValueError("V3 route assets must differ")
-        header = await self.rpc.call("eth_getBlockByNumber", ["latest", False])
+        header = await self._rpc_for(signal.chain_id).call(
+            "eth_getBlockByNumber", ["latest", False])
         if (not isinstance(header, dict) or not isinstance(header.get("hash"), str)
                 or "number" not in header):
             raise ValueError("route discovery block header missing")
@@ -448,22 +467,23 @@ class LiveQuoter:
                     _selector("getPool(address,address,uint24)") + encode(
                         ["address", "address", "uint24"],
                         [token_in, token_out, fee]),
-                    block_tag)
+                    block_tag, signal.chain_id)
                 pool = address(decode(["address"], raw_pool)[0])
                 if pool == R.NATIVE:
                     continue
-                code = await self.rpc.call("eth_getCode", [pool, block_tag])
+                code = await self._rpc_for(signal.chain_id).call(
+                    "eth_getCode", [pool, block_tag])
                 if not isinstance(code, str) or code.lower() in {"0x", "0x0", "0x00"}:
                     continue
                 pool_token0 = address(decode(
                     ["address"], await self._call(
-                        pool, _selector("token0()"), block_tag))[0])
+                        pool, _selector("token0()"), block_tag, signal.chain_id))[0])
                 pool_token1 = address(decode(
                     ["address"], await self._call(
-                        pool, _selector("token1()"), block_tag))[0])
+                        pool, _selector("token1()"), block_tag, signal.chain_id))[0])
                 pool_fee = int(decode(
                     ["uint24"], await self._call(
-                        pool, _selector("fee()"), block_tag))[0])
+                        pool, _selector("fee()"), block_tag, signal.chain_id))[0])
                 if {pool_token0, pool_token1} != {token_in, token_out} or pool_fee != fee:
                     continue
                 evidence = deepcopy(signal.evidence)
@@ -543,8 +563,10 @@ class LiveQuoter:
                      signal.token_in, signal.token_out, amount_in_raw, str(output),
                      str(gas) if gas is not None else None)
 
-    async def _call(self, to: str, data: bytes, block_tag: str) -> bytes:
-        raw = await self.rpc.call("eth_call", [{"to": to, "data": "0x" + data.hex()}, block_tag])
+    async def _call(self, to: str, data: bytes, block_tag: str,
+                    chain_id: int | None = None) -> bytes:
+        reader = self.rpc if chain_id is None else self._rpc_for(chain_id)
+        raw = await reader.call("eth_call", [{"to": to, "data": "0x" + data.hex()}, block_tag])
         if not isinstance(raw, str) or not raw.startswith("0x"):
             raise ValueError("invalid quote RPC result")
         result = bytes.fromhex(raw[2:])
@@ -563,7 +585,7 @@ class LiveQuoter:
             raise ValueError("V2 quote route mismatch")
         data = _selector("getAmountsOut(uint256,address[])") + encode(
             ["uint256", "address[]"], [amount, route])
-        values = decode(["uint256[]"], await self._call(_venue(chain, "v2_router"), data, block_tag))[0]
+        values = decode(["uint256[]"], await self._call(_venue(chain, "v2_router"), data, block_tag, signal.chain_id))[0]
         if len(values) != len(route) or values[0] != amount:
             raise ValueError("invalid V2 quote path result")
         return int(values[-1]), None
@@ -592,7 +614,7 @@ class LiveQuoter:
             raise ValueError("V3 quote output mismatch")
         data = _selector("quoteExactInput(bytes,uint256)") + encode(
             ["bytes", "uint256"], [bytes(path), amount])
-        raw = await self._call(_venue(chain, "v3_quoter"), data, block_tag)
+        raw = await self._call(_venue(chain, "v3_quoter"), data, block_tag, signal.chain_id)
         if len(raw) < 32:
             raise ValueError("invalid V3 quote result")
         # Quoter v1 returns one word; Quoter v2's first return word is also amountOut.
@@ -627,7 +649,7 @@ class LiveQuoter:
             params_type = f"(address,{V4_PATH_KEY}[],uint128)"
             data = _selector(f"quoteExactInput({params_type})") + encode(
                 [params_type], [(signal.token_in, path, amount)])
-            raw = await self._call(_venue(chain, "v4_quoter"), data, block_tag)
+            raw = await self._call(_venue(chain, "v4_quoter"), data, block_tag, signal.chain_id)
             output, gas = decode(["uint256", "uint256"], raw)
             return int(output), int(gas)
         if not isinstance(key, list) or len(key) != 5:
@@ -641,6 +663,6 @@ class LiveQuoter:
         params = (key, signal.token_in == key[0], amount, bytes.fromhex(hook_data[2:]))
         data = _selector(f"quoteExactInputSingle(({POOL_KEY},bool,uint128,bytes))") + encode(
             [f"({POOL_KEY},bool,uint128,bytes)"], [params])
-        raw = await self._call(_venue(chain, "v4_quoter"), data, block_tag)
+        raw = await self._call(_venue(chain, "v4_quoter"), data, block_tag, signal.chain_id)
         output, gas = decode(["uint256", "uint256"], raw)
         return int(output), int(gas)
