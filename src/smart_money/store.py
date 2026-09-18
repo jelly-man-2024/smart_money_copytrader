@@ -1844,7 +1844,15 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
         self.connection.commit()
         return cursor.rowcount == 1
 
-    def claim_candidates(self, limit: int, now: float | None = None) -> list[Transaction]:
+    def claim_candidates(self, limit: int, now: float | None = None,
+                         chain_id: int | None = None) -> list[Transaction]:
+        """Claim work for one chain.
+
+        Candidates from every chain share this table, so a worker that claimed
+        blindly would fetch another chain's receipts from its own node, never
+        find them, and retry until the attempt budget ran out. Passing the chain
+        leaves the others for the worker that can actually read them.
+        """
         if limit <= 0:
             return []
         now = time.time() if now is None else now
@@ -1852,10 +1860,14 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             """SELECT tx_hash,payload FROM candidates
                WHERE status IN ('pending','retry') AND next_attempt_at<=?
                ORDER BY created_at,tx_hash LIMIT ?""",
-            (now, limit),
+            (now, limit if chain_id is None else limit * 4),
         ).fetchall()
         claimed = []
         for tx_hash, payload in rows:
+            if len(claimed) >= limit:
+                break
+            if chain_id is not None and self._transaction(payload).chain_id != chain_id:
+                continue
             cursor = self.connection.execute(
                 """UPDATE candidates SET status='queued', attempts=attempts+1,
                    updated_at=CURRENT_TIMESTAMP

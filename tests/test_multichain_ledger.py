@@ -149,3 +149,42 @@ class LedgerBudgetBucketScopeTests(unittest.TestCase):
         from smart_money.store import _paper_budget_buckets
         buckets = _paper_budget_buckets(R.NATIVE)
         self.assertEqual(buckets, frozenset({"ETH_WETH", "USDC"}))
+
+
+class CandidateChainScopeTests(unittest.TestCase):
+    """A worker claims only the chain whose receipts it can actually read."""
+
+    def store(self):
+        from smart_money.store import Store
+        store = Store(":memory:")
+        self.addCleanup(store.close)
+        return store
+
+    def transaction(self, chain_id, tag):
+        from smart_money.models import Transaction
+        return Transaction(hash="0x" + tag * 32, sender="0x" + "bb" * 20,
+                           to="0x" + "cc" * 20, data=b"\x01\x02\x03\x04",
+                           chain_id=chain_id, observation_source="test")
+
+    def test_a_worker_claims_only_its_own_chain(self):
+        store = self.store()
+        store.put_candidate(self.transaction(R.CHAIN_ID, "a1"))
+        store.put_candidate(self.transaction(R.ARC.chain_id, "a2"))
+        claimed = store.claim_candidates(10, chain_id=R.CHAIN_ID)
+        self.assertEqual([tx.chain_id for tx in claimed], [R.CHAIN_ID])
+        # The other chain's candidate is untouched and still claimable by its own
+        # worker; claiming it blindly burnt retries against the wrong node.
+        arc = store.claim_candidates(10, chain_id=R.ARC.chain_id)
+        self.assertEqual([tx.chain_id for tx in arc], [R.ARC.chain_id])
+
+    def test_without_a_chain_every_candidate_is_claimable(self):
+        store = self.store()
+        store.put_candidate(self.transaction(R.CHAIN_ID, "b1"))
+        store.put_candidate(self.transaction(R.ARC.chain_id, "b2"))
+        self.assertEqual(len(store.claim_candidates(10)), 2)
+
+    def test_the_limit_still_bounds_a_filtered_claim(self):
+        store = self.store()
+        for i in range(6):
+            store.put_candidate(self.transaction(R.CHAIN_ID, f"c{i}"))
+        self.assertEqual(len(store.claim_candidates(2, chain_id=R.CHAIN_ID)), 2)

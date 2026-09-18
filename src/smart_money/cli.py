@@ -452,7 +452,7 @@ def coverage_summary(stats) -> dict:
 def dispatch_pending(store, queue, stats) -> int:
     """Move only durable candidates into the bounded in-memory work queue."""
     available = queue.maxsize - queue.qsize()
-    candidates = store.claim_candidates(available)
+    candidates = store.claim_candidates(available, chain_id=CHAIN_ID)
     queued_at = time.monotonic()
     for tx in candidates:
         queue.put_nowait((tx, queued_at))
