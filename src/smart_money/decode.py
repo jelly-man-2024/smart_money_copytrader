@@ -494,7 +494,11 @@ class Decoder:
                     item.reasons.append("aggregator_call_not_linked_to_unique_relay_deposit")
                 continue
             trade, deposit = aggregators[0], deposits[0]
-            if (deposit.recipient != trade.wallet or deposit.token_in != C.usdg
+            # The deposit is denominated in the chain's settlement asset, which is
+            # USDG on Robinhood Chain and USDC on Arc; pinning it to USDG left
+            # every Arc relay sell unlinkable to its own deposit.
+            if (deposit.recipient != trade.wallet
+                    or deposit.token_in != C.settlement_asset
                     or deposit.evidence.get("relay_cleanup_token") != deposit.token_in
                     or trade.token_out not in (None, deposit.token_in)
                     or (trade.protocol == "kyber" and trade.recipient != C.relay_router)):

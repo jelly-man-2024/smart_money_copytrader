@@ -210,23 +210,35 @@ class ArcObserver:
         if len(self._processed_order) > MAX_SEEN_TRANSACTIONS:
             self._processed.remove(self._processed_order.popleft())
 
-    async def _decode(self, tx: Transaction) -> list[Signal]:
-        """Decode self-calls only from transaction-prestate delegation proof."""
-        self.decoder.delegations.pop(tx.sender, None)
-        account_state_source = "sender_direct_call_not_delegation_dependent"
-        if tx.to == tx.sender:
+    async def _decode(self, tx: Transaction,
+                      wallets: tuple[str, ...] = ()) -> list[Signal]:
+        """Decode after proving, from this transaction's prestate, which account
+        implementation each watched wallet was delegated to.
+
+        The watched wallet is not always the transaction sender: a bundled
+        ERC-4337 UserOperation is sent by a bundler to the EntryPoint, and the
+        wallet's own batched calls can only be read once its delegation is
+        proven. Proving only the sender left every bundled sell undecodable.
+        """
+        candidates = sorted({wallet for wallet in (*wallets, tx.sender)
+                             if wallet in self.watchlist})
+        for wallet in candidates:
+            self.decoder.delegations.pop(wallet, None)
+        account_state_source = "no_watched_delegation_candidate"
+        if candidates:
             account_state_source = "transaction_prestate_trace_unavailable"
             try:
                 implementations, _ = await prestate_implementations(
-                    self.rpc, tx.hash, [tx.sender])
+                    self.rpc, tx.hash, candidates)
             except (RpcError, TypeError, ValueError):
                 implementations = {}
             else:
                 account_state_source = "transaction_prestate_unsupported_or_absent"
-            implementation = implementations.get(tx.sender)
-            if implementation is not None:
-                self.decoder.delegations[tx.sender] = implementation
-                account_state_source = "transaction_prestate_trace"
+            for wallet in candidates:
+                implementation = implementations.get(wallet)
+                if implementation is not None:
+                    self.decoder.delegations[wallet] = implementation
+                    account_state_source = "transaction_prestate_trace"
         signals = self.decoder.decode(tx)
         for signal in signals:
             signal.evidence["account_state_source"] = account_state_source
@@ -410,7 +422,7 @@ class ArcObserver:
 
     async def observe(self, hint: dict,
                       raw_transaction: dict | None = None) -> list[Signal]:
-        hint, _wallets = validate_arc_transfer_log(hint, self.watchlist)
+        hint, matched_wallets = validate_arc_transfer_log(hint, self.watchlist)
         tx_hash = hint["transactionHash"].lower()
         self._relay_pending_now = False
         async with self._lock:
@@ -443,7 +455,7 @@ class ArcObserver:
                         or not self._receipt_contains_hint(receipt, hint)):
                     raise ArcCandidateRejected(
                         "Arc subscription log not confirmed by receipt")
-                signals = await self._decode(tx)
+                signals = await self._decode(tx, tuple(matched_wallets))
                 pool_checks = await verify_signal_pools(self.rpc, signals, receipt)
                 try:
                     native_checks = await verify_native_flows(
