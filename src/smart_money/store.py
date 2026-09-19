@@ -1203,11 +1203,17 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
     def fill_paper_buy(self, proposal_id: str, fill: dict) -> bool:
         """Atomically consume a reservation and create immutable paper order/fill/lot rows."""
         required = {
-            "order_id", "fill_id", "lot_id", "amount_out_raw", "fee_asset",
+            "order_id", "fill_id", "lot_id", "chain_id", "amount_out_raw", "fee_asset",
             "fee_amount_raw", "gas_cost_wei", "quote_observed_at", "filled_at",
         }
         if set(fill) != required:
             raise ValueError("invalid paper fill fields")
+        # The lot records the chain its buy ran on. That column carries a
+        # Robinhood default, so a caller that leaves the chain out silently
+        # files an Arc lot under Robinhood — eight were recorded that way. The
+        # caller always knows the chain, so it has to say which one.
+        if fill["chain_id"] not in R.CHAINS:
+            raise ValueError("invalid paper fill chain")
         for name in ("amount_out_raw", "fee_amount_raw", "gas_cost_wei"):
             value = fill[name]
             if not isinstance(value, str) or not value.isdecimal() or int(value) < 0:
@@ -1271,11 +1277,13 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
             self.connection.execute("""INSERT INTO paper_positions(
                 lot_id,wallet,token,budget_cycle_id,budget_bucket,principal_asset,
                 principal_initial_raw,principal_remaining_raw,token_initial_raw,
-                token_remaining_raw,source_event_id,buy_fill_id,attribution_payload,status)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'open')""", (
+                token_remaining_raw,source_event_id,buy_fill_id,attribution_payload,status,
+                chain_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'open',?)""", (
                     fill["lot_id"], row[2], row[4], row[9], row[5], row[3], row[6], row[6],
                     fill["amount_out_raw"], fill["amount_out_raw"], source_event_id,
                     fill["fill_id"], json.dumps(position_attribution, sort_keys=True),
+                    fill["chain_id"],
                 ))
             self.connection.execute("""UPDATE paper_budgets
                 SET reserved_raw=?,invested_raw=? WHERE cycle_id=? AND wallet=? AND bucket=?""",
@@ -1791,14 +1799,37 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
     def record_paper_decision(self, decision_id: str, source_event_id: str,
                               trigger_mode: str, strategy_version: str,
                               accepted: bool, reason: str | None, payload: dict) -> bool:
-        cursor = self.connection.execute("""INSERT OR IGNORE INTO paper_decisions(
+        """Record a decision, letting evidence that arrives late upgrade it.
+
+        The decision id is derived from the signal, so deciding the same signal
+        again writes the same row. An Arc sell was refused as asset_not_allowed
+        while its Relay order was still open, accepted two seconds later once
+        the retry closed it, and filled — but INSERT OR IGNORE kept the refusal,
+        so the ledger said the sell had been blocked and a reviewer read it that
+        way. Only a refusal may be replaced, and only by an acceptance: a
+        decision that already led to a proposal is never overwritten by a later
+        refusal. The superseded refusal stays in the runtime log.
+
+        Returns whether the statement wrote a row. The exact count differs
+        between SQLite and MySQL for a repeat that changes nothing, and no
+        caller depends on it.
+        """
+        # The assignment order matters: MySQL evaluates ON DUPLICATE KEY UPDATE
+        # left to right and a later assignment sees columns already updated, so
+        # `accepted` — the column every guard reads — is assigned last.
+        upgrade = "accepted=0 AND excluded.accepted=1"
+        cursor = self.connection.execute(f"""INSERT INTO paper_decisions(
             decision_id,source_event_id,trigger_mode,strategy_version,accepted,reason,payload)
-            VALUES(?,?,?,?,?,?,?)""", (
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(decision_id) DO UPDATE SET
+                reason=CASE WHEN {upgrade} THEN excluded.reason ELSE reason END,
+                payload=CASE WHEN {upgrade} THEN excluded.payload ELSE payload END,
+                accepted=CASE WHEN {upgrade} THEN excluded.accepted ELSE accepted END""", (
                 decision_id, source_event_id, trigger_mode, strategy_version,
                 int(accepted), reason, json.dumps(payload, sort_keys=True),
             ))
         self.connection.commit()
-        return cursor.rowcount == 1
+        return cursor.rowcount != 0
 
     def paper_decision(self, decision_id: str) -> dict | None:
         row = self.connection.execute("""SELECT source_event_id,trigger_mode,strategy_version,

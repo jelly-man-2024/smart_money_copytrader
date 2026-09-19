@@ -41,7 +41,7 @@ def pending_early_lot(db):
     assert db.fill_paper_buy("p", dict(
         order_id="o", fill_id="f", lot_id="lot", amount_out_raw="1000", fee_asset=R.USDG,
         fee_amount_raw="0", gas_cost_wei="0", quote_observed_at="2026-09-17T00:00:00Z",
-        filled_at="2026-09-17T00:00:01Z"))
+        filled_at="2026-09-17T00:00:01Z", chain_id=R.CHAIN_ID))
     assert db.paper_position("lot")["attribution"]["source_position_status"] == "pending"
 
 

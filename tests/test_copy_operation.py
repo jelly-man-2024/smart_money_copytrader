@@ -191,7 +191,8 @@ class OperationTests(unittest.TestCase):
         self.store.fill_paper_buy("buy", dict(
             order_id="buy-order", fill_id="buy-fill", lot_id="lot", amount_out_raw="1000",
             fee_asset=R.USDG, fee_amount_raw="0", gas_cost_wei="0",
-            quote_observed_at="2026-09-14T00:00:00Z", filled_at="2026-09-14T00:00:01Z"))
+            quote_observed_at="2026-09-14T00:00:00Z", filled_at="2026-09-14T00:00:01Z",
+            chain_id=R.CHAIN_ID))
         sell = proposal("sell-early", input_asset=TOKEN, output_asset=R.USDG)
         self.assertTrue(self.store.reserve_paper_sell(sell)[0])
         later = {**sell, "proposal_id": "sell-strict", "source_event_id": "later"}

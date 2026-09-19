@@ -91,6 +91,9 @@ async def settle_confirmed_execution(store, rpc, proposal_id: str,
     else:
         filled = store.fill_paper_buy(proposal_id, {
             **common, "lot_id": identity("lot"),
+            # For a confirmed live fill the signed transaction is the
+            # authority on which chain it ran: it is what the node accepted.
+            "chain_id": number(plan["transaction"]["chainId"]),
         })
     if not filled:
         raise ValueError("confirmed execution could not settle reserved proposal")

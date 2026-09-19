@@ -21,7 +21,8 @@ class SourcePositionTests(unittest.TestCase):
         self.assertTrue(self.store.fill_paper_buy("early", dict(
             order_id="o", fill_id="f", lot_id="lot", amount_out_raw="1000",
             fee_asset=R.USDG, fee_amount_raw="0", gas_cost_wei="0",
-            quote_observed_at="2026-09-14T00:00:00Z", filled_at="2026-09-14T00:00:01Z")))
+            quote_observed_at="2026-09-14T00:00:00Z", filled_at="2026-09-14T00:00:01Z",
+            chain_id=R.CHAIN_ID)))
         self.signal = Signal(TX, A, "third_party", "BUY", "strict", None, "",
             stage="relay_buy_evidenced", execution_status="success", execution_success=True,
             token_in=R.USDG, token_out=TOKEN,
@@ -92,7 +93,8 @@ class SourcePositionTests(unittest.TestCase):
         self.assertTrue(self.store.reserve_paper_proposal(p)[0])
         self.store.fill_paper_buy("second", dict(order_id="o2", fill_id="f2", lot_id="lot2",
             amount_out_raw="2000", fee_asset=R.USDG, fee_amount_raw="0", gas_cost_wei="0",
-            quote_observed_at="2026-09-14T00:00:00Z", filled_at="2026-09-14T00:00:01Z"))
+            quote_observed_at="2026-09-14T00:00:00Z", filled_at="2026-09-14T00:00:01Z",
+            chain_id=R.CHAIN_ID))
         attr = self.store.paper_position("lot2")["attribution"]
         self.assertEqual(attr["source_position_status"], "confirmed")
         self.assertEqual(attr["source_position_remaining_raw"], "7500")

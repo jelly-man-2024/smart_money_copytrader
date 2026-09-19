@@ -829,6 +829,9 @@ class PoolVerificationTests(unittest.IsolatedAsyncioTestCase):
         store.execution_plan.return_value = {
             "plan_id": "plan-1", "status": "signed",
             "unsigned_plan": {"quote_observed_at": 50.0},
+            # execution_plan() always resolves a transaction, and its chainId is
+            # the chain the node actually accepted this fill on.
+            "transaction": {"chainId": R.CHAIN_ID},
         }
         store.execution_attempts.return_value = [{
             "tx_hash": tx_hash, "status": "confirmed",
@@ -838,6 +841,9 @@ class PoolVerificationTests(unittest.IsolatedAsyncioTestCase):
         result = await settle_confirmed_execution(store, rpc, "proposal-1", tx_hash)
         self.assertEqual((result["actual_input_raw"], result["actual_output_raw"]),
                          ("100", "90"))
+        # The lot is filed under the chain the signed transaction ran on, not a
+        # column default: eight Arc lots were filed as Robinhood that way.
+        self.assertEqual(store.fill_paper_buy.call_args.args[1]["chain_id"], R.CHAIN_ID)
         self.assertEqual(wallet_erc20_deltas(execution_receipt, follower),
                          {R.USDG: -100, TOKEN: 90})
         store.fill_paper_buy.assert_called_once()
@@ -1160,6 +1166,7 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
             'gas_cost_wei': '20000000',
             'quote_observed_at': '2026-09-12T00:00:00Z',
             'filled_at': '2026-09-12T00:00:01Z',
+            'chain_id': R.CHAIN_ID,
         })
         sell = Signal(
             '0x' + '77' * 32, A, 'third_party', 'SELL', 'call', R.RELAY_ROUTER,
@@ -1235,6 +1242,7 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
             'fee_asset': R.USDG, 'fee_amount_raw': '0', 'gas_cost_wei': '1',
             'quote_observed_at': '2026-09-13T00:00:00Z',
             'filled_at': '2026-09-13T00:00:01Z',
+            'chain_id': R.CHAIN_ID,
         })
         sell = Signal(
             '0x' + '77' * 32, A, 'third_party', 'SELL', 'call', R.RELAY_ROUTER,
@@ -1679,6 +1687,7 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
             'gas_cost_wei': '20000000',
             'quote_observed_at': '2026-09-12T00:00:00Z',
             'filled_at': '2026-09-12T00:00:01Z',
+            'chain_id': R.CHAIN_ID,
         })
         reversed_signal = reverse_quote_signal(source, R.USDG)
         self.assertEqual(reversed_signal.evidence['route'], [TOKEN, R.USDG])
@@ -1745,6 +1754,7 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
             'fee_asset': R.NATIVE, 'fee_amount_raw': '0', 'gas_cost_wei': '20000000',
             'quote_observed_at': '2026-09-12T00:00:00Z',
             'filled_at': '2026-09-12T00:00:01Z',
+            'chain_id': R.CHAIN_ID,
         })
 
         class Quoter:
@@ -1815,6 +1825,7 @@ class QuoteTests(unittest.IsolatedAsyncioTestCase):
             'gas_cost_wei': '20000000',
             'quote_observed_at': '2026-09-12T00:00:00Z',
             'filled_at': '2026-09-12T00:00:01Z',
+            'chain_id': R.CHAIN_ID,
         })
         signal = Signal('0x' + '55' * 32, A, 'direct', 'SELL', 'call',
                         R.V2_ROUTER, '0x', stage='swap_evidenced',
@@ -3942,6 +3953,7 @@ class SafetyTests(unittest.TestCase):
             'fee_amount_raw': '2', 'gas_cost_wei': '20000000',
             'quote_observed_at': '2026-09-12T00:00:00Z',
             'filled_at': '2026-09-12T00:00:01Z',
+            'chain_id': R.CHAIN_ID,
         }
         self.assertTrue(store.fill_paper_buy('p1', fill))
         self.assertTrue(store.fill_paper_buy('p1', fill))
@@ -3973,6 +3985,7 @@ class SafetyTests(unittest.TestCase):
             'gas_cost_wei': '20000000',
             'quote_observed_at': '2026-09-12T00:00:00Z',
             'filled_at': '2026-09-12T00:00:01Z',
+            'chain_id': R.CHAIN_ID,
         })
         sell = {
             'proposal_id': 'sell-p', 'source_event_id': 'sell-event',
@@ -4037,6 +4050,7 @@ class SafetyTests(unittest.TestCase):
             'fee_amount_raw': '0', 'gas_cost_wei': '1',
             'quote_observed_at': '2026-09-13T00:00:00Z',
             'filled_at': '2026-09-13T00:00:01Z',
+            'chain_id': R.CHAIN_ID,
         })
         half, reason = store.paper_proportional_sell_amount(
             A, TOKEN, '34702886960332988393', 1_000_000)
@@ -5046,6 +5060,7 @@ class AggregatorExecutionTests(unittest.TestCase):
             'fee_amount_raw': '0', 'gas_cost_wei': '1',
             'quote_observed_at': '2026-09-13T00:00:00+00:00',
             'filled_at': '2026-09-13T00:00:01+00:00',
+            'chain_id': R.CHAIN_ID,
         }))
         route, status = store.paper_sell_execution_route(
             A, self.TOKEN_OUT, R.USDG, '150000000000000000000')

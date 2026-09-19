@@ -188,3 +188,70 @@ class CandidateChainScopeTests(unittest.TestCase):
         for i in range(6):
             store.put_candidate(self.transaction(R.CHAIN_ID, f"c{i}"))
         self.assertEqual(len(store.claim_candidates(2, chain_id=R.CHAIN_ID)), 2)
+
+
+class LotChainTests(unittest.TestCase):
+    """A lot records the chain its buy ran on, never a column default.
+
+    paper_positions.chain_id carries a Robinhood default and the insert never
+    set it, so all eight Arc lots were filed under chain 4663 and nothing in
+    the row could recover the truth. Lot selection matches on wallet and token
+    alone, so the wrong chain cost nothing yet — and would cost everything the
+    day one token address exists on both chains.
+    """
+
+    WALLET = "0x" + "a1" * 20
+    FOLLOWER = "0x" + "b2" * 20
+    TOKEN = "0x" + "c3" * 20
+
+    def proposal(self, name):
+        return dict(proposal_id=name, source_event_id=name, source_tx_hash=RH_HASH,
+                    wallet=self.WALLET, trigger_mode="feed_intent", strategy_version="v1",
+                    input_asset=R.USDG, output_asset=self.TOKEN, budget_bucket="USDG",
+                    amount_in_raw="100",
+                    attribution={"smart_wallet": self.WALLET,
+                                 "follower_wallet": self.FOLLOWER, "relationship_id": "1"})
+
+    def setUp(self):
+        A = self.WALLET
+        self.store = Store(":memory:")
+        self.addCleanup(self.store.close)
+        self.store.start_paper_budget_cycle("test", "synthetic")
+        self.store.configure_paper_budget(A, "USDG", "1000")
+
+    def fill(self, name, lot, **changes):
+        self.assertTrue(self.store.reserve_paper_proposal(self.proposal(name))[0])
+        payload = dict(order_id=f"o-{lot}", fill_id=f"f-{lot}", lot_id=lot,
+                       amount_out_raw="1000", fee_asset=R.USDG, fee_amount_raw="0",
+                       gas_cost_wei="0", quote_observed_at="2026-09-19T00:00:00Z",
+                       filled_at="2026-09-19T00:00:01Z", chain_id=R.CHAIN_ID)
+        payload.update(changes)
+        return self.store.fill_paper_buy(name, payload)
+
+    def stored_chain(self, lot):
+        return self.store.connection.execute(
+            "SELECT chain_id FROM paper_positions WHERE lot_id=?", (lot,)).fetchone()[0]
+
+    def test_an_arc_buy_is_filed_under_arc_not_the_default(self):
+        self.assertTrue(self.fill("arc-buy", "arc-lot", chain_id=R.ARC.chain_id))
+        self.assertEqual(self.stored_chain("arc-lot"), R.ARC.chain_id)
+        self.assertNotEqual(self.stored_chain("arc-lot"), R.CHAIN_ID)
+
+    def test_a_robinhood_buy_is_still_filed_under_robinhood(self):
+        self.assertTrue(self.fill("rh-buy", "rh-lot"))
+        self.assertEqual(self.stored_chain("rh-lot"), R.CHAIN_ID)
+
+    def test_a_fill_that_names_no_chain_is_refused_rather_than_defaulted(self):
+        self.assertTrue(self.store.reserve_paper_proposal(self.proposal("no-chain"))[0])
+        with self.assertRaisesRegex(ValueError, "invalid paper fill fields"):
+            self.store.fill_paper_buy("no-chain", dict(
+                order_id="o", fill_id="f", lot_id="lot", amount_out_raw="1000",
+                fee_asset=R.USDG, fee_amount_raw="0", gas_cost_wei="0",
+                quote_observed_at="2026-09-19T00:00:00Z",
+                filled_at="2026-09-19T00:00:01Z"))
+
+    def test_a_chain_the_registry_does_not_know_is_refused(self):
+        for value in (999999, "4663", None):
+            with self.subTest(chain_id=value):
+                with self.assertRaisesRegex(ValueError, "invalid paper fill chain"):
+                    self.fill(f"bad-{value}", f"bad-lot-{value}", chain_id=value)

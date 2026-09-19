@@ -756,6 +756,9 @@ class PaperExecutor:
         else:
             filled = self.store.fill_paper_buy(proposal_id, {
                 **common, "lot_id": self._id(proposal_id, "lot"),
+                # The lot belongs to the chain its own signal came from, the
+                # same source the plan, the signature and the broadcast use.
+                "chain_id": signal.chain_id,
             })
         return PaperExecution(proposal_id, "filled" if filled else "not_reserved",
                               None if filled else "proposal_not_reserved",
