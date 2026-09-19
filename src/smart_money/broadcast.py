@@ -29,6 +29,27 @@ class BroadcastResult:
     submitted: bool
 
 
+def _early_deadline(evidence, key):
+    """The deadline this evidence carries, or None for a lane with no clock.
+
+    A standing early channel has no expiry, so it records the deadline as an
+    explicit None. That is not the same as a missing or malformed field, which
+    stays a refusal: this is the last independent guard before a broadcast and
+    it re-derives the deadline from the review rather than trusting the store.
+    Conflating the two is what refused two standing-channel copies the moment
+    the lane was opened.
+    """
+    if key not in evidence:
+        raise ValueError("early execution evidence is missing its deadline")
+    value = evidence[key]
+    if value is None:
+        return None
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value)):
+        raise ValueError("early execution deadline is not a time")
+    return float(value)
+
+
 class MainnetBroadcaster:
     """Expose only eth_sendRawTransaction after all live controls are rechecked."""
 
@@ -97,13 +118,12 @@ class MainnetBroadcaster:
         require_mainnet_broadcast_enabled(
             follower_wallet, relationship_id, config_snapshot_hash)
         if "early_trial_id" in review.evidence:
-            expires = review.evidence.get("early_trial_expires_at")
-            if (isinstance(expires, bool) or not isinstance(expires, (int, float))
-                    or not math.isfinite(expires) or time.time() >= expires):
+            expires = _early_deadline(review.evidence, "early_trial_expires_at")
+            if expires is not None and time.time() >= expires:
                 raise ValueError("early trial expired before broadcast")
             if not callable(early_trial_check) or early_trial_check() is not True:
                 raise ValueError("early trial send fence not verified")
-            if time.time() >= expires:
+            if expires is not None and time.time() >= expires:
                 raise ValueError("early trial expired during final check")
         # A database gate can take time after review. Never reset the market
         # clock to the review time; approval reviews have no market quote.
@@ -137,7 +157,10 @@ class MainnetBroadcaster:
                     if not 0 <= now-q.observed_at <= review.evidence["quote_max_age_seconds"]:
                         raise ValueError("quote expired while waiting for broadcast connection")
                 for key in ("early_feed_expires_at", "early_trial_expires_at"):
-                    if key in review.evidence and now >= review.evidence[key]:
+                    if key not in review.evidence:
+                        continue
+                    deadline = _early_deadline(review.evidence, key)
+                    if deadline is not None and now >= deadline:
                         raise ValueError("early execution expired while waiting to send")
                 ticket.claim_send()
             returned_hash = await asyncio.to_thread(self._request, "0x"+raw_transaction.hex(), before_send)

@@ -2878,6 +2878,55 @@ class SafetyTests(unittest.TestCase):
                     config_snapshot_hash='ab' * 32))
             send.assert_not_called()
 
+        # A standing early channel has no expiry, so it records the deadline as
+        # an explicit None. This guard re-derives the deadline instead of
+        # trusting the store, and it used to treat None as a malformed field:
+        # opening the standing lane refused its first two copies right here.
+        standing_review = SimpleNamespace(
+            proposal_id=review.proposal_id, signed_tx_hash=tx_hash,
+            evidence={'broadcast_performed': False, 'early_trial_id': 'trial',
+                      'early_trial_expires_at': None})
+        with patch.dict(os.environ, live, clear=True), patch(
+                'smart_money.mysql_config.load_enabled_mainnet_acceptance',
+                return_value=accepted_mainnet_relationship(policy)), patch(
+                'smart_money.broadcast.asyncio.to_thread', new=AsyncMock(
+                    return_value=tx_hash)) as send:
+            result = asyncio.run(broadcaster.broadcast(
+                standing_review, raw, follower_wallet=follower, relationship_id='42',
+                config_snapshot_hash='ab' * 32, early_trial_check=lambda: True))
+            self.assertTrue(result.submitted)
+            send.assert_awaited_once()
+
+        # No clock is not the same as no evidence: a missing or malformed
+        # deadline is still a refusal, and the fence is still required.
+        for evidence, message in (
+                ({'early_trial_id': 'trial'}, 'missing its deadline'),
+                ({'early_trial_id': 'trial', 'early_trial_expires_at': 'soon'},
+                 'not a time'),
+                ({'early_trial_id': 'trial', 'early_trial_expires_at': True},
+                 'not a time')):
+            bad = SimpleNamespace(proposal_id=review.proposal_id, signed_tx_hash=tx_hash,
+                                  evidence={'broadcast_performed': False, **evidence})
+            with self.subTest(evidence=sorted(evidence)), patch(
+                    'smart_money.broadcast.require_mainnet_broadcast_enabled'), patch(
+                    'smart_money.broadcast.asyncio.to_thread', new=AsyncMock()) as send:
+                with self.assertRaisesRegex(ValueError, message):
+                    asyncio.run(broadcaster.broadcast(
+                        bad, raw, follower_wallet=follower, relationship_id='42',
+                        config_snapshot_hash='ab' * 32, early_trial_check=lambda: True))
+                send.assert_not_called()
+        standing_no_fence = SimpleNamespace(
+            proposal_id=review.proposal_id, signed_tx_hash=tx_hash,
+            evidence={'broadcast_performed': False, 'early_trial_id': 'trial',
+                      'early_trial_expires_at': None})
+        with patch('smart_money.broadcast.require_mainnet_broadcast_enabled'), patch(
+                'smart_money.broadcast.asyncio.to_thread', new=AsyncMock()) as send:
+            with self.assertRaisesRegex(ValueError, 'send fence not verified'):
+                asyncio.run(broadcaster.broadcast(
+                    standing_no_fence, raw, follower_wallet=follower,
+                    relationship_id='42', config_snapshot_hash='ab' * 32))
+            send.assert_not_called()
+
         with patch.dict(os.environ, live, clear=True), patch(
                 'smart_money.mysql_config.load_enabled_mainnet_acceptance',
                 return_value=accepted_mainnet_relationship(policy)), patch(
