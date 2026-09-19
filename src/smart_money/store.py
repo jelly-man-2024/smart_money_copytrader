@@ -148,8 +148,10 @@ class Store(CopyOperationStore, EarlyFeedJobStore, SourcePositionStore):
         self.connection.execute("""CREATE TABLE IF NOT EXISTS early_trials (
             trial_id TEXT PRIMARY KEY, follower_wallet TEXT NOT NULL UNIQUE,
             relationships_payload TEXT NOT NULL, started_at REAL NOT NULL,
-            expires_at REAL NOT NULL, consumed_slots INTEGER NOT NULL DEFAULT 0
-                CHECK(consumed_slots>=0 AND consumed_slots<=100),
+            -- NULL expiry is the standing channel; the count is telemetry, not
+            -- a gate, so no ceiling is enforced here.
+            expires_at REAL, consumed_slots INTEGER NOT NULL DEFAULT 0
+                CHECK(consumed_slots>=0),
             status TEXT NOT NULL CHECK(status IN ('active','stopped')))""")
         self.connection.execute("""CREATE TABLE IF NOT EXISTS early_trial_operations (
             operation_key TEXT PRIMARY KEY, trial_id TEXT NOT NULL,

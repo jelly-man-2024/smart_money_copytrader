@@ -11,7 +11,9 @@ from smart_money.store import Store
 from test_copy_operation import A, B, ORDER, TX, proposal
 
 
-class TrialTests(unittest.TestCase):
+class TrialFixture(unittest.TestCase):
+    """Shared fixture only; the bounded and standing cases each own their tests."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -47,6 +49,8 @@ class TrialTests(unittest.TestCase):
     def status(self):
         return self.db.early_trial_status("trial")
 
+
+class TrialTests(TrialFixture):
     def test_restart_and_repeated_start_never_reset_window_or_count(self):
         self.reserve()
         self.db.mark_copy_operation_broadcast_attempted("p1")
@@ -188,3 +192,82 @@ class TrialTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trial_expired"):
             self.reserve(signed=False)
         self.assertEqual(self.db.paper_budget(A, "USDG")["reserved_raw"], "0")
+
+
+class StandingChannelTests(TrialFixture):
+    """The early lane with no clock and no counter that can run out.
+
+    The bounded trial was a one-shot: 24 hours, 100 slots, and no renewal path
+    at all — start_early_trial refuses both to reopen an expired id and to
+    start a second one for the same follower. It expired after 88 copies and
+    the lane sat dead for a day before anyone looked. What still bounds the
+    standing channel is its scope, the per-operation send fence, and an
+    explicit stop.
+    """
+
+    def open_standing(self, relationships=(1, 2)):
+        return self.db.open_standing_early_channel("trial", B, list(relationships))
+
+    def test_a_standing_channel_outlives_the_window_that_ended_the_trial(self):
+        self.assertEqual(self.status()["expires_at"], 100 + TRIAL_SECONDS)
+        self.now = 100 + TRIAL_SECONDS
+        self.assertEqual(self.status()["reason"], "trial_expired")
+        result = self.open_standing()
+        self.assertTrue(result["standing"])
+        self.assertIsNone(result["expires_at"])
+        self.assertIsNone(result["limit"])
+        self.now = 100 + TRIAL_SECONDS * 3650        # ten years on
+        self.assertTrue(self.status()["eligible"])
+        self.assertIsNone(self.status()["reason"])
+
+    def test_reopening_keeps_the_id_and_does_not_reset_the_count(self):
+        # early_trial_operations holds a foreign key to this row, so the id
+        # cannot change; the count keeps accumulating as telemetry.
+        self.reserve()
+        self.db.mark_copy_operation_broadcast_attempted("p1")
+        self.assertEqual(self.status()["consumed_slots"], 1)
+        self.now = 100 + TRIAL_SECONDS
+        self.assertEqual(self.open_standing()["consumed_slots"], 1)
+        self.assertEqual(self.status()["trial_id"], "trial")
+
+    def test_a_second_id_for_the_same_follower_is_still_refused(self):
+        with self.assertRaisesRegex(ValueError, "enrolled under another trial id"):
+            self.db.open_standing_early_channel("other-trial", B, [1, 2])
+
+    def test_a_standing_channel_consumes_slots_past_the_trial_ceiling(self):
+        self.open_standing()
+        self.db.connection.execute(
+            "UPDATE early_trials SET consumed_slots=? WHERE trial_id='trial'", (500,))
+        self.db.connection.commit()
+        self.assertTrue(self.status()["eligible"])
+        self.reserve()
+        self.db.mark_copy_operation_broadcast_attempted("p1")
+        self.assertEqual(self.status()["consumed_slots"], 501)
+
+    def test_stopping_is_the_remaining_way_to_close_it(self):
+        self.open_standing()
+        self.now = 100 + TRIAL_SECONDS * 30
+        self.assertTrue(self.status()["eligible"])
+        already_reserved = self.reserve()
+        self.db.stop_early_trial("trial")
+        self.assertEqual(self.status()["reason"], "trial_stopped")
+        self.assertFalse(self.status()["eligible"])
+        # A stop closes both ends: work already reserved cannot reach the wire,
+        # and nothing new may be reserved behind it.
+        with self.assertRaisesRegex(ValueError, "trial_stopped"):
+            self.db.mark_copy_operation_broadcast_attempted(already_reserved["proposal_id"])
+        with self.assertRaisesRegex(ValueError, "trial_stopped"):
+            self.reserve(2)
+
+    def test_the_scope_fence_is_not_relaxed_by_going_standing(self):
+        for bad in ([], [1, 1], ["x"], [0]):
+            with self.subTest(relationships=bad):
+                with self.assertRaises(ValueError):
+                    self.db.open_standing_early_channel("trial", B, bad)
+
+    def test_a_bounded_trial_still_expires_exactly_as_before(self):
+        # The standing path must not quietly disarm the bounded one.
+        self.now = 100 + TRIAL_SECONDS - 1
+        self.assertTrue(self.status()["eligible"])
+        self.now = 100 + TRIAL_SECONDS
+        self.assertEqual(self.status()["reason"], "trial_expired")

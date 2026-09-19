@@ -2190,6 +2190,22 @@ def parser():
     trial_start_parser.add_argument("--relationships", nargs="+", required=True)
     trial_start_parser.add_argument("--confirm-risk-checklist", action="store_true")
     trial_start_parser.set_defaults(ledger_mysql=True)
+    channel_open_parser = commands.add_parser(
+        "early-channel-open",
+        help="Operator-only: open the early lane with no window and no slot budget")
+    channel_open_parser.add_argument("--trial-id", required=True)
+    channel_open_parser.add_argument("--follower", required=True)
+    channel_open_parser.add_argument("--relationships", nargs="+", required=True)
+    channel_open_parser.add_argument("--confirm-risk-checklist", action="store_true")
+    channel_open_parser.add_argument(
+        "--confirm-standing-early-channel", action="store_true", dest="confirm_standing",
+        help="Acknowledge that neither a clock nor a count will stop this lane")
+    channel_open_parser.set_defaults(ledger_mysql=True)
+    channel_stop_parser = commands.add_parser(
+        "early-channel-stop",
+        help="Stop new early entries; never cancels pending trades or sells lots")
+    channel_stop_parser.add_argument("--trial-id", required=True)
+    channel_stop_parser.set_defaults(ledger_mysql=True)
     for command_parser in (
             replay_parser, monitor_parser, reconcile_parser, cycle_parser,
             mark_parser, paper_export_parser, export_parser,
@@ -2270,6 +2286,44 @@ def main():
                 result = store.start_early_trial(args.trial_id, args.follower, args.relationships)
                 print(json.dumps({**result, "broadcast_performed": False,
                                   "stop_file_cleared": False, "budget_reset": False}))
+            finally:
+                store.close()
+        elif args.command == "early-channel-open":
+            # Same scope proof the bounded trial demands. Opening a lane that
+            # no clock and no count will ever close is a larger commitment than
+            # a 24-hour trial, not a smaller one, so nothing here is relaxed.
+            if not args.confirm_risk_checklist or not args.confirm_standing:
+                raise ValueError("operator risk-checklist and standing-channel "
+                                 "confirmation required")
+            from pathlib import Path
+            from .execution_controls import _risk_acceptance
+            if not Path(os.environ.get("SMART_MONEY_EMERGENCY_STOP_FILE", "var/EXECUTION_STOP")).exists():
+                raise ValueError("stop file must remain active while opening the early channel")
+            config = load_mysql_paper_config()
+            selected = [p for p in config.relationships if p.relationship_id in args.relationships]
+            if (len(selected) != len(set(args.relationships))
+                    or len(set(args.relationships)) != len(args.relationships)
+                    or any(p.follower_wallet != args.follower or p.execution_providers not in
+                           (("kyber",), ("zeroex",), ("zeroex", "kyber"))
+                           or p.trigger_mode != "evidenced" or p.run_mode != "mainnet_live"
+                           for p in selected)):
+                raise ValueError("operator channel scope must match current enabled aggregator-only live policies")
+            for p in selected:
+                _risk_acceptance(p.follower_wallet, p.relationship_id, p.snapshot_hash)
+            store = runtime_store(args)
+            try:
+                result = store.open_standing_early_channel(
+                    args.trial_id, args.follower, args.relationships)
+                print(json.dumps({**result, "broadcast_performed": False,
+                                  "stop_file_cleared": False, "budget_reset": False}))
+            finally:
+                store.close()
+        elif args.command == "early-channel-stop":
+            store = runtime_store(args)
+            try:
+                store.stop_early_trial(args.trial_id)
+                print(json.dumps({**(store.early_trial_status(args.trial_id) or {}),
+                                  "broadcast_performed": False}))
             finally:
                 store.close()
         elif args.command == "reconcile-reorg":

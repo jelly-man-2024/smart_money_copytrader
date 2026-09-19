@@ -26,19 +26,24 @@ def _id(value):
     return value
 
 
+def _scope_payload(follower, relationships):
+    """The enrolled scope, validated identically however the channel is opened."""
+    if follower == NATIVE or not isinstance(relationships, (list, tuple)) or not 1 <= len(relationships) <= 64:
+        raise ValueError("invalid early trial scope")
+    if any(isinstance(r, bool) or not isinstance(r, (str, int))
+           or not re.fullmatch(r"[1-9][0-9]{0,19}", str(r)) for r in relationships):
+        raise ValueError("invalid early trial relationships")
+    scope = sorted(str(r) for r in relationships)
+    if len(set(scope)) != len(scope):
+        raise ValueError("duplicate early trial relationships")
+    return json.dumps(scope, separators=(",", ":"))
+
+
 class EarlyTrialStore:
     def start_early_trial(self, trial_id, follower, relationships, now=None):
         """Explicit operator call only. Reusing an ID never resets time or count."""
         trial_id, follower, now = _id(trial_id), address(follower), _now(now)
-        if follower == NATIVE or not isinstance(relationships, (list, tuple)) or not 1 <= len(relationships) <= 64:
-            raise ValueError("invalid early trial scope")
-        if any(isinstance(r, bool) or not isinstance(r, (str, int))
-               or not re.fullmatch(r"[1-9][0-9]{0,19}", str(r)) for r in relationships):
-            raise ValueError("invalid early trial relationships")
-        scope = sorted(str(r) for r in relationships)
-        if len(set(scope)) != len(scope):
-            raise ValueError("duplicate early trial relationships")
-        payload = json.dumps(scope, separators=(",", ":"))
+        payload = _scope_payload(follower, relationships)
         try:
             self.connection.execute("BEGIN IMMEDIATE")
             existing = self.connection.execute("""SELECT follower_wallet,relationships_payload
@@ -63,6 +68,46 @@ class EarlyTrialStore:
             raise
         return self.early_trial_status(trial_id, now)
 
+    def open_standing_early_channel(self, trial_id, follower, relationships, now=None):
+        """Open the early lane with no window and no slot budget.
+
+        The bounded trial was a one-shot by construction: 24 hours, 100 slots,
+        and start_early_trial refuses both to renew one and to start a second
+        for the same follower, so an expired lane could never be reopened. It
+        expired after 88 copies and the lane sat dead for a day before anyone
+        looked at it. A standing channel has no clock and no counter that can
+        run out. What still bounds it is its enrolled scope, the per-operation
+        send fence, and stop_early_trial.
+
+        Converting reuses the existing row on purpose: early_trial_operations
+        holds a foreign key to this trial, so the id may not change and its
+        consumed count keeps accumulating as telemetry rather than resetting.
+        """
+        trial_id, follower, now = _id(trial_id), address(follower), _now(now)
+        payload = _scope_payload(follower, relationships)
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            existing = self.connection.execute(
+                "SELECT trial_id FROM early_trials WHERE follower_wallet=?",
+                (follower,)).fetchone()
+            if existing and existing[0] != trial_id:
+                raise ValueError("follower is enrolled under another trial id")
+            if existing:
+                self.connection.execute("""UPDATE early_trials
+                    SET relationships_payload=?,expires_at=NULL,status='active'
+                    WHERE trial_id=?""", (payload, trial_id))
+            else:
+                self.connection.execute("""INSERT INTO early_trials
+                    (trial_id,follower_wallet,relationships_payload,started_at,
+                     expires_at,consumed_slots,status)
+                    VALUES(?,?,?,?,NULL,0,'active')""",
+                    (trial_id, follower, payload, now))
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return self.early_trial_status(trial_id, now)
+
     def early_trial_status(self, trial_id, now=None):
         now = _now(now)
         row = self.connection.execute("""SELECT follower_wallet,relationships_payload,
@@ -70,15 +115,22 @@ class EarlyTrialStore:
             (_id(trial_id),)).fetchone()
         if row is None:
             return None
-        if (row[3] - row[2] != TRIAL_SECONDS or not 0 <= row[4] <= TRIAL_LIMIT):
+        # A NULL expiry is the standing channel: no clock and no counter to run
+        # out. A bounded trial must still match the one shape it was created
+        # with, so a tampered window or count is refused rather than honoured.
+        standing = row[3] is None
+        if row[4] < 0 or (not standing and (row[3] - row[2] != TRIAL_SECONDS
+                                            or row[4] > TRIAL_LIMIT)):
             raise ValueError("early trial limits are inconsistent")
         reason = ("trial_stopped" if row[5] != "active" else
                   "trial_clock_before_start" if now < row[2] else
+                  None if standing else
                   "trial_expired" if now >= row[3] else
                   "trial_limit_reached" if row[4] >= TRIAL_LIMIT else None)
         return {"trial_id": trial_id, "follower_wallet": row[0],
                 "relationships": json.loads(row[1]), "started_at": row[2],
-                "expires_at": row[3], "consumed_slots": row[4], "limit": TRIAL_LIMIT,
+                "expires_at": row[3], "consumed_slots": row[4],
+                "limit": None if standing else TRIAL_LIMIT, "standing": standing,
                 "eligible": reason is None, "reason": reason,
                 "count_basis": "durable_broadcast_attempt_upper_bound"}
 
@@ -110,10 +162,13 @@ class EarlyTrialStore:
         self.connection.execute("""INSERT INTO early_trial_operations
             (operation_key,trial_id,proposal_id,attempted_at) VALUES(?,?,?,?)""",
             (operation_key, trial["trial_id"], proposal_id, now))
+        # The standing channel still counts, for telemetry, but neither the
+        # clock nor the count may refuse it; a bounded trial keeps both gates.
         changed = self.connection.execute("""UPDATE early_trials
             SET consumed_slots=consumed_slots+1 WHERE trial_id=?
-            AND status='active' AND started_at<=? AND expires_at>?
-            AND consumed_slots<?""", (trial["trial_id"], now, now, TRIAL_LIMIT)).rowcount
+            AND status='active' AND started_at<=?
+            AND (expires_at IS NULL OR (expires_at>? AND consumed_slots<?))""",
+            (trial["trial_id"], now, now, TRIAL_LIMIT)).rowcount
         if changed != 1:
             raise ValueError("early trial changed or exhausted")
 
