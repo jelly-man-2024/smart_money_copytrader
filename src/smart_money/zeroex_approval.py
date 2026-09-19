@@ -1,7 +1,13 @@
-"""Operator-run, one-shot 10 USDG approval. Default is public read-only checks.
+"""Operator-run, one-shot USDG approval. Default is public read-only checks.
 
 Never imported by the monitor. Signing uses the existing gated key DB source;
-only --execute --confirm-approve-10-usdg permits signing and one broadcast.
+only --execute --confirm-approve-100-usdg permits signing and one broadcast.
+
+An allowance is a cumulative spending budget, not a per-trade cap: the first
+grant of 10 USDG paid for exactly 100 copied buys of 0.1 USDG and then read
+zero, after which every buy fell back to Kyber without a word. The journal
+path carries the amount so a later, larger grant is a new one-shot rather
+than a blocked repeat.
 """
 import argparse
 import asyncio
@@ -31,8 +37,8 @@ from .runtime_safety import runtime_instance_lock
 FOLLOWER = "0x3004ab92565deeea0a2eaa27e40e297bb457e1a6"
 # Verified against official 0x Contracts docs and this chain's quote response.
 SPENDER = "0x0000000000001ff3684f28c67538d4d072c22734"
-AMOUNT = 10000000
-JOURNAL = Path("var/zeroex-usdg-approval-10000000.jsonl")
+AMOUNT = 100000000
+JOURNAL = Path(f"var/zeroex-usdg-approval-{AMOUNT}.jsonl")
 
 # Plan status is a preparation/signing lifecycle, NOT the receipt lifecycle.
 # A signed plan is resolved only with exactly one terminal attempt and no live
@@ -205,13 +211,13 @@ async def run(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="One-shot approval: total 10 USDG to 0x on Robinhood. Default: check only.")
+    parser = argparse.ArgumentParser(description="One-shot approval: total 100 USDG to 0x on Robinhood. Default: check only.")
     parser.add_argument("--relationship", required=True)
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--confirm-approve-10-usdg", action="store_true", dest="confirm")
+    parser.add_argument("--confirm-approve-100-usdg", action="store_true", dest="confirm")
     args = parser.parse_args()
     if args.execute != args.confirm:
-        parser.error("execution requires both --execute and --confirm-approve-10-usdg")
+        parser.error("execution requires both --execute and --confirm-approve-100-usdg")
     try:
         print(json.dumps(asyncio.run(run(args)), sort_keys=True))
     except Exception as exc:

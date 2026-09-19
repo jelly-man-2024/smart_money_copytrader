@@ -45,14 +45,14 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tx['value'], 0)
         self.assertEqual(tx['to'].lower(), z.USDG)
         spender, amount = decode(['address','uint256'], bytes.fromhex(tx['data'][10:]))
-        self.assertEqual((spender,amount),(z.SPENDER,10000000))
+        self.assertEqual((spender,amount),(z.SPENDER,z.AMOUNT))
         # This operator path once held the ONLY route to a 0x allowance. Copy
         # trading broke that: a sell needs an allowance for whichever token was
         # just bought, with no operator in the loop, so the executor now grants
         # 0x allowances through the bounded relationship path as well. This
         # script remains for a deliberate standing grant like the first one.
         self.assertIn(z.SPENDER, APPROVAL_SPENDERS)
-        self.allowance=10000000
+        self.allowance=z.AMOUNT
         tx,result=await z.inspect(self.policy,self.rpc)
         self.assertIsNone(tx)
         self.assertEqual(result['status'],'already_sufficient')
@@ -86,7 +86,7 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
         broadcast=SimpleNamespace(broadcast=AsyncMock())
         with tempfile.TemporaryDirectory() as tmp, patch.object(z,'FOLLOWER',account.address.lower()), \
                 patch.object(z,'require_mainnet_signing_enabled'), \
-                patch.object(z,'confirm_relationship_token_approval',new=AsyncMock(return_value={'allowance_raw':'10000000'})):
+                patch.object(z,'confirm_relationship_token_approval',new=AsyncMock(return_value={'allowance_raw':str(z.AMOUNT)})):
             journal=Path(tmp)/'attempt.jsonl'
             result=await z.execute(self.policy,self.rpc,broadcast,journal=journal,signer_factory=factory)
             self.assertEqual(result['status'],'confirmed')
@@ -131,9 +131,11 @@ class ApprovalTests(unittest.IsolatedAsyncioTestCase):
         tx,evidence=await z.inspect(self.policy,self.rpc)
         self.assertEqual(evidence['allowance_raw'],'100000')
         spender,amount=decode(['address','uint256'],bytes.fromhex(tx['data'][10:]))
-        self.assertEqual((spender,amount),(z.SPENDER,10000000))
-        self.assertEqual(evidence['amount_raw'],'10000000')
-        self.assertIn('10000000',str(z.JOURNAL))
+        self.assertEqual((spender,amount),(z.SPENDER,z.AMOUNT))
+        self.assertEqual(evidence['amount_raw'],str(z.AMOUNT))
+        # The journal is named after the amount, so raising the grant is a new
+        # one-shot instead of a repeat the FileExistsError guard would refuse.
+        self.assertIn(str(z.AMOUNT),str(z.JOURNAL))
 
     async def test_original_cap_still_enforces_gas_balance_and_policy(self):
         tx,_=await z.inspect(self.policy,self.rpc)
